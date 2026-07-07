@@ -1,0 +1,26 @@
+diff --git a/meson.build b/meson.build
+index 4a69d6d..062ea00 100644
+--- a/meson.build
++++ b/meson.build
+@@ -93,16 +93,11 @@ gobject_dep = dependency('gobject-2.0', required: get_option('gobject'))
+ graphite2_dep = dependency('graphite2', required: get_option('graphite2'))
+ graphite_dep = dependency('graphite2', required: get_option('graphite'))
+ 
+-if cpp.get_argument_syntax() == 'msvc'
+-  icu_dep = dependency('ICU',
+-                       required: get_option('icu'),
+-                       components: 'uc',
+-                       method: 'cmake')
+-else
+-  icu_dep = dependency('icu-uc',
+-                       required: get_option('icu'),
+-                       method: 'pkg-config')
+-endif
++# W10M ARM UWP: static ICU 77.1 has no CMake config, only our hand-written
++# icu-uc.pc — use pkg-config for msvc too (the default cmake method has no cmake).
++icu_dep = dependency('icu-uc',
++                     required: get_option('icu'),
++                     method: 'pkg-config')
+ 
+ if icu_dep.found() and icu_dep.type_name() == 'pkgconfig'
+   icu_defs = icu_dep.get_variable(pkgconfig: 'DEFS', default_value: '').split()

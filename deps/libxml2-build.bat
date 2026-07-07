@@ -1,0 +1,14 @@
+@echo off
+set CM=Z:\w10m-webengine\tools\cmake\bin\cmake.exe
+set SRC=Z:\w10m-webengine\deps\libxml2
+set BLD=Z:\w10m-webengine\deps\libxml2\build-armuwp
+"%CM%" -S %SRC% -B %BLD% -G "Visual Studio 17 2022" -A ARM -T v142,host=x64 ^
+  -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0.16299.0 ^
+  -DCMAKE_TOOLCHAIN_FILE=Z:\w10m-webengine\cmake\Toolchain-W10M-ARM32-UWP.cmake ^
+  -DBUILD_SHARED_LIBS=OFF ^
+  -DLIBXML2_WITH_PYTHON=OFF -DLIBXML2_WITH_ICONV=OFF -DLIBXML2_WITH_LZMA=OFF ^
+  -DLIBXML2_WITH_ZLIB=OFF -DLIBXML2_WITH_HTTP=OFF -DLIBXML2_WITH_PROGRAMS=OFF ^
+  -DLIBXML2_WITH_TESTS=OFF -DLIBXML2_WITH_THREADS=ON -DLIBXML2_WITH_MODULES=OFF
+echo CFG_EXIT=%ERRORLEVEL%
+"%CM%" --build %BLD% --config Release
+echo BUILD_EXIT=%ERRORLEVEL%

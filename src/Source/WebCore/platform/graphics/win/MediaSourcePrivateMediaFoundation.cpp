@@ -1,0 +1,117 @@
+#include "config.h"
+#include "MediaSourcePrivateMediaFoundation.h"
+
+#if ENABLE(MEDIA_SOURCE)
+
+#include "ContentType.h"
+#include "MediaSourcePrivateClient.h"
+#include "ShellMseBridge.h"
+#include "SourceBufferPrivateMediaFoundation.h"
+
+extern void PortImgLog(const char*);
+
+namespace WebCore {
+
+Ref<MediaSourcePrivateMediaFoundation> MediaSourcePrivateMediaFoundation::create(MediaPlayerPrivateMediaFoundation& player, MediaSourcePrivateClient& client)
+{
+    return adoptRef(*new MediaSourcePrivateMediaFoundation(player, client));
+}
+
+MediaSourcePrivateMediaFoundation::MediaSourcePrivateMediaFoundation(MediaPlayerPrivateMediaFoundation& player, MediaSourcePrivateClient& client)
+    : m_player(player)
+    , m_client(client)
+{
+    m_srcHandle = PortMseCreate(this);
+}
+
+MediaSourcePrivateMediaFoundation::~MediaSourcePrivateMediaFoundation()
+{
+    for (auto& sb : m_sourceBuffers)
+        sb->clearMediaSource();
+    if (m_srcHandle)
+        PortMseDestroy(m_srcHandle);
+}
+
+MediaSourcePrivate::AddStatus MediaSourcePrivateMediaFoundation::addSourceBuffer(const ContentType& contentType, bool, RefPtr<SourceBufferPrivate>& outPrivate)
+{
+    if (!m_srcHandle)
+        return AddStatus::NotSupported;
+    auto typeString = contentType.raw().utf8();
+    if (!PortMseIsTypeSupported(m_srcHandle, typeString.data())) {
+        { char b[160]; snprintf(b, sizeof b, "mse: addSourceBuffer REJECTED type=%s", typeString.data()); PortImgLog(b); }
+        return AddStatus::NotSupported;
+    }
+
+    auto sourceBuffer = SourceBufferPrivateMediaFoundation::create(*this, nullptr);
+    // Give the SourceBufferPrivate its track kind + codec so it can synthesize the init segment
+    // WebKit MSE requires (one track per buffer). YouTube uses separate audio/video buffers.
+    bool isVideo = contentType.containerType().startsWith("video");
+    sourceBuffer->setTrackInfo(isVideo, contentType.parameter(ContentType::codecsParameter()));
+    void* handle = PortMseAddSourceBuffer(m_srcHandle, typeString.data(), sourceBuffer.ptr());
+    { char b[160]; snprintf(b, sizeof b, "mse: addSourceBuffer type=%s handle=%p", typeString.data(), handle); PortImgLog(b); }
+    if (!handle)
+        return AddStatus::NotSupported;
+    sourceBuffer->setHandle(handle);
+
+    m_sourceBuffers.append(sourceBuffer.copyRef());
+    outPrivate = WTFMove(sourceBuffer);
+    return AddStatus::Ok;
+}
+
+void MediaSourcePrivateMediaFoundation::durationChanged(const MediaTime& duration)
+{
+    if (m_srcHandle && duration.isValid())
+        PortMseSetDuration(m_srcHandle, duration.toDouble());
+}
+
+void MediaSourcePrivateMediaFoundation::markEndOfStream(EndOfStreamStatus status)
+{
+    m_isEnded = true;
+    if (m_srcHandle) {
+        int s = (status == EosNetworkError) ? 1 : (status == EosDecodeError) ? 2 : 0;
+        PortMseEndOfStream(m_srcHandle, s);
+    }
+}
+
+void MediaSourcePrivateMediaFoundation::unmarkEndOfStream()
+{
+    m_isEnded = false;
+}
+
+void MediaSourcePrivateMediaFoundation::setReadyState(MediaPlayer::ReadyState state)
+{
+    m_readyState = state;
+}
+
+void* MediaSourcePrivateMediaFoundation::copyMFMediaSource() const
+{
+    return m_srcHandle ? PortMseGetMFMediaSource(m_srcHandle) : nullptr;
+}
+
+void MediaSourcePrivateMediaFoundation::onOpened()
+{
+    // The WinRT MseStreamSource pipeline opened. WebCore's MediaSource was already opened via
+    // setPrivateAndOpen(); nothing else required here for the first cut.
+}
+
+void MediaSourcePrivateMediaFoundation::onEnded()
+{
+    m_isEnded = true;
+}
+
+} // namespace WebCore
+
+// ---- C ABI callbacks from the shell's WinRT MseStreamSource events ----
+extern "C" void WebCoreMseSourceOpened(void* srcCtx)
+{
+    if (srcCtx)
+        static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onOpened();
+}
+
+extern "C" void WebCoreMseSourceEnded(void* srcCtx)
+{
+    if (srcCtx)
+        static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onEnded();
+}
+
+#endif // ENABLE(MEDIA_SOURCE)

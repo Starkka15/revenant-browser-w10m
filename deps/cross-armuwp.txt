@@ -1,0 +1,21 @@
+[binaries]
+c = 'cl'
+pkg-config = 'C:/Users/Starkka15/AppData/Local/Programs/Python/Python314/Lib/site-packages/pkgconf/.bin/pkgconf.exe'
+cpp = 'cl'
+ar = 'lib'
+c_ld = 'link'
+cpp_ld = 'link'
+
+[properties]
+pkg_config_libdir = 'Z:/w10m-webengine/deps/_install/lib/pkgconfig'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'arm'
+cpu = 'armv7'
+endian = 'little'
+
+[built-in options]
+default_library = 'static'
+c_args = ['/Zc:preprocessor-', '/DWINAPI_FAMILY=2', '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00', '/DWIN32']
+cpp_args = ['/Zc:preprocessor-', '/DWINAPI_FAMILY=2', '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00', '/DWIN32']

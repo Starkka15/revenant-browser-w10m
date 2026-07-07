@@ -1,0 +1,5 @@
+# This repo is a build recipe, not a full source tree.
+*.appx
+*.appxbundle
+build-*/
+_install/
