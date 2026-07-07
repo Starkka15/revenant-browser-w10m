@@ -87,19 +87,30 @@ differences are real and cut both ways:
 | **JSC LLInt** | **custom hand-written MSVC-ARM32 (armasm) LLInt backend** (WebKit's offline-asm targets GCC/clang; a pure-MSVC build needed one from scratch) | existing offline-asm path (clang) |
 | **Render resolution** | renders at the panel's **native pixel density** — `setDeviceScaleFactor(DPR)`, presented **1:1** (sharper) | renders a **fixed 720×1080** engine surface and **stretches** it to fill the panel (softer on non-720×1080 screens) |
 | **Viewport / screen fit** | CSS viewport, `screen.*`, `@media` width all derived from the **real panel size ÷ DPR** (`view->resize`, `setPlatformScreenBounds`) — the page is laid out to the actual device | fixed 720×1080 logical space regardless of device |
+| **WebCrypto (`crypto.subtle`)** | **implemented** — WebKit's OpenSSL backend, patched for OpenSSL 3.x opaque structs (RSA/EC/ECDSA/ECDH/AES/HMAC/HKDF/PBKDF2) | **stubbed** — SubtleCrypto unavailable (real SHA digests kept for Subresource Integrity) |
 | **Browser shell** | minimal (address bar) | fuller: tabs, address bar, find-in-page |
 | **Media** | experimental MSE/adaptive video via a WinRT `MediaPlayer` frame-server | — |
 | **Test device** | Lumia 640 XL (Adreno 305) | Lumia 950 |
 
 **Where Revenant is stronger:** it renders at the device's native resolution and ties the page's
 viewport/`screen`/`@media` metrics to the real panel dimensions, so text and layout are crisp and
-sized correctly per device. Apotheosis's fixed-720×1080-then-stretch approach is simpler (and pairs
-with a readback-free direct-present fast path), but non-native scaling looks softer and the page isn't
-sized to the actual screen.
+sized correctly per device (Apotheosis's fixed-720×1080-then-stretch approach is simpler but non-native
+scaling looks softer and the page isn't sized to the actual screen). It also ships a **working
+`crypto.subtle`** — which real sites (logins, banking, modern web apps) increasingly need — where
+Apotheosis stubs WebCrypto out. And it has an experimental MSE/adaptive-video path.
 
 **Where Apotheosis is stronger:** a **newer engine** (2.52.4 vs 2.36.8), a **more complete browser
-shell** (tabs / find-in-page), and a **clang-cl** toolchain that's more conventional and likely easier
-to keep current. If you're choosing a base to build on, both are worth a look.
+shell** (tabs / find-in-page), a **clang-cl** toolchain that's more conventional and easier to keep
+current, and a clean **readback-free direct-present** fast path.
+
+### If you actually want to ship a browser: combine the two
+
+Neither project is the whole answer — but between them, most of the hard parts are solved. A
+genuinely usable W10M browser would most likely take **Apotheosis's newer engine + fuller shell +
+clang-cl toolchain** as the base, and fold in **Revenant's native-resolution/DPR rendering,
+real-screen viewport, and working WebCrypto** (and the MSE video groundwork). We each do a few things
+well; the fastest path to a real browser is putting those pieces together rather than either of us
+starting over. PRs and cross-pollination between the projects are genuinely welcome.
 
 ## Contributing
 
