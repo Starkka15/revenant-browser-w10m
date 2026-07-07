@@ -71,30 +71,35 @@ binaries — you fetch those from upstream and apply our changes (see [BUILD.md]
 - CMake (Visual Studio 17 2022 generator, `-A ARM -T v142,host=x64`, `CMAKE_SYSTEM_NAME=WindowsStore`).
 - Python 3 (+`pkgconf`), Ruby (JSC offlineasm), gperf / bison / flex.
 
-## Related projects
+## Related projects — and how Revenant differs
 
-The kindred effort here is **[Project-Apotheosis](https://github.com/Jimmyxiao2009/Project-Apotheosis)** —
-same goal (a modern WebKit/WebCore engine running on Windows 10 Mobile ARM32), and in several respects
-further along than Revenant (a newer engine, a fuller browser shell). This isn't a "we're better"
-comparison — it's a different set of engineering choices toward the same end, and anyone reviving W10M
-web browsing should know about both.
-
-How Revenant differs (not better — *different*):
+The other effort in this space is **[Project-Apotheosis](https://github.com/Jimmyxiao2009/Project-Apotheosis)** —
+same goal (a modern WebKit/WebCore engine on Windows 10 Mobile ARM32). Revenant is **independent work**
+(we studied their public approach, but didn't fork it — we're on WebKit 2.36.8, they're on 2.52.4), and
+this is meant as an objective "different choices" comparison, not a ranking. Both use ANGLE (D3D11) +
+WebCore's TextureMapper and present into a `SwapChainPanel` — that part is common ground. The
+differences are real and cut both ways:
 
 | | Revenant | Project-Apotheosis |
 |---|---|---|
-| **WebKit version** | 2.36.8 (last C++17-era release) | 2.52.4 (much newer) |
-| **Toolchain** | **MSVC v142** (VS2019 toolset), no clang | **clang-cl + MSVC v143** |
-| **JSC LLInt** | **custom hand-written MSVC-ARM32 (armasm) LLInt backend** — WebKit's offline-asm targets GCC/clang syntax, so an MSVC-only build needed one written from scratch | uses the existing offline-asm path (clang) |
-| **Patch style** | direct edits captured as a flat patch | `#if defined(WK_WINUWP)` guards (cleaner for upstreaming) |
-| **Test device** | Lumia 640 XL (Adreno 305 — lower-end) | Lumia 950 |
-| **Shell** | minimal | tabs, address bar, find-in-page (v0.1.8) |
-| **Focus explored** | MSE/adaptive video via a WinRT `MediaPlayer` frame-server (experimental) | — |
+| **WebKit version** | 2.36.8 (last C++17-era release) | 2.52.4 (newer engine) |
+| **Toolchain** | **MSVC v142**, no clang | clang-cl + MSVC v143 |
+| **JSC LLInt** | **custom hand-written MSVC-ARM32 (armasm) LLInt backend** (WebKit's offline-asm targets GCC/clang; a pure-MSVC build needed one from scratch) | existing offline-asm path (clang) |
+| **Render resolution** | renders at the panel's **native pixel density** — `setDeviceScaleFactor(DPR)`, presented **1:1** (sharper) | renders a **fixed 720×1080** engine surface and **stretches** it to fill the panel (softer on non-720×1080 screens) |
+| **Viewport / screen fit** | CSS viewport, `screen.*`, `@media` width all derived from the **real panel size ÷ DPR** (`view->resize`, `setPlatformScreenBounds`) — the page is laid out to the actual device | fixed 720×1080 logical space regardless of device |
+| **Browser shell** | minimal (address bar) | fuller: tabs, address bar, find-in-page |
+| **Media** | experimental MSE/adaptive video via a WinRT `MediaPlayer` frame-server | — |
+| **Test device** | Lumia 640 XL (Adreno 305) | Lumia 950 |
 
-The headline difference is the **toolchain**: Revenant went the pure-MSVC (v142) route, which is why
-it carries its own MSVC-ARM32 LLInt assembler backend. Apotheosis's clang-cl path and newer engine
-are, honestly, the more conventional and probably more sustainable choices. If you're picking a base
-to build on, look at both.
+**Where Revenant is stronger:** it renders at the device's native resolution and ties the page's
+viewport/`screen`/`@media` metrics to the real panel dimensions, so text and layout are crisp and
+sized correctly per device. Apotheosis's fixed-720×1080-then-stretch approach is simpler (and pairs
+with a readback-free direct-present fast path), but non-native scaling looks softer and the page isn't
+sized to the actual screen.
+
+**Where Apotheosis is stronger:** a **newer engine** (2.52.4 vs 2.36.8), a **more complete browser
+shell** (tabs / find-in-page), and a **clang-cl** toolchain that's more conventional and likely easier
+to keep current. If you're choosing a base to build on, both are worth a look.
 
 ## Contributing
 
