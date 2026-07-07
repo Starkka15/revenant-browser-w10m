@@ -71,6 +71,13 @@ binaries — you fetch those from upstream and apply our changes (see [BUILD.md]
 - CMake (Visual Studio 17 2022 generator, `-A ARM -T v142,host=x64`, `CMAKE_SYSTEM_NAME=WindowsStore`).
 - Python 3 (+`pkgconf`), Ruby (JSC offlineasm), gperf / bison / flex.
 
+## Contributing
+
+A modern browser is a community-scale effort — this is opened in that spirit. Forks, patches, and PRs
+welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the (patch-based) workflow and dev loop, and
+**[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for open problems with file pointers so you can pick something
+scoped rather than cold-starting on a WebKit port.
+
 ## Credits / license
 
 Revenant is derived from [WebKit](https://webkit.org/) (BSD/LGPL) and links the dependencies listed
