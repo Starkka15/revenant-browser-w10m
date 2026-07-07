@@ -71,6 +71,31 @@ binaries — you fetch those from upstream and apply our changes (see [BUILD.md]
 - CMake (Visual Studio 17 2022 generator, `-A ARM -T v142,host=x64`, `CMAKE_SYSTEM_NAME=WindowsStore`).
 - Python 3 (+`pkgconf`), Ruby (JSC offlineasm), gperf / bison / flex.
 
+## Related projects
+
+The kindred effort here is **[Project-Apotheosis](https://github.com/Jimmyxiao2009/Project-Apotheosis)** —
+same goal (a modern WebKit/WebCore engine running on Windows 10 Mobile ARM32), and in several respects
+further along than Revenant (a newer engine, a fuller browser shell). This isn't a "we're better"
+comparison — it's a different set of engineering choices toward the same end, and anyone reviving W10M
+web browsing should know about both.
+
+How Revenant differs (not better — *different*):
+
+| | Revenant | Project-Apotheosis |
+|---|---|---|
+| **WebKit version** | 2.36.8 (last C++17-era release) | 2.52.4 (much newer) |
+| **Toolchain** | **MSVC v142** (VS2019 toolset), no clang | **clang-cl + MSVC v143** |
+| **JSC LLInt** | **custom hand-written MSVC-ARM32 (armasm) LLInt backend** — WebKit's offline-asm targets GCC/clang syntax, so an MSVC-only build needed one written from scratch | uses the existing offline-asm path (clang) |
+| **Patch style** | direct edits captured as a flat patch | `#if defined(WK_WINUWP)` guards (cleaner for upstreaming) |
+| **Test device** | Lumia 640 XL (Adreno 305 — lower-end) | Lumia 950 |
+| **Shell** | minimal | tabs, address bar, find-in-page (v0.1.8) |
+| **Focus explored** | MSE/adaptive video via a WinRT `MediaPlayer` frame-server (experimental) | — |
+
+The headline difference is the **toolchain**: Revenant went the pure-MSVC (v142) route, which is why
+it carries its own MSVC-ARM32 LLInt assembler backend. Apotheosis's clang-cl path and newer engine
+are, honestly, the more conventional and probably more sustainable choices. If you're picking a base
+to build on, look at both.
+
 ## Contributing
 
 A modern browser is a community-scale effort — this is opened in that spirit. Forks, patches, and PRs
