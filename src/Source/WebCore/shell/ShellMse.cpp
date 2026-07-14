@@ -20,6 +20,7 @@
 #include <robuffer.h>       // IBufferByteAccess
 #include <wrl/client.h>
 #include <d3d11.h>
+#include <ppltasks.h>       // concurrency::create_task/create_async — progressive HTTP byte stream
 #include <windows.graphics.directx.direct3d11.interop.h> // CreateDirect3D11SurfaceFromDXGISurface
 
 using namespace Platform;
@@ -41,6 +42,7 @@ extern "C" void WebCoreMsePlayerError(void* playerCtx, int hr);
 extern "C" void WebCoreMsePlayerDurationChanged(void* playerCtx, double seconds);
 extern "C" void WebCoreMsePlayerSizeChanged(void* playerCtx, int width, int height);
 extern "C" void WebCoreMsePlayerTimeUpdate(void* playerCtx, double seconds);
+extern "C" void WebCoreMsePlayerSeekCompleted(void* playerCtx);
 extern "C" void WebCoreBrowserKeepCompositing(unsigned frames); // GPU-offload gate: keep compositing N frames
 extern void PortImgLog(const char*);
 
@@ -57,6 +59,7 @@ struct MseSource {
     bool closing { false }; // set before teardown so in-flight WinRT events stop calling into freed WebCore
     Microsoft::WRL::ComPtr<ID3D11Device> d3d;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3dCtx;
+    Windows::Foundation::EventRegistrationToken frameToken {}; // VideoFrameAvailable, unhooked at stop
     Microsoft::WRL::ComPtr<ID3D11Texture2D> rt;      // BGRA render target CopyFrameToVideoSurface writes into
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging; // CPU-readable copy we hand to WebCore
     UINT texW { 0 };
@@ -67,6 +70,19 @@ struct MseBuffer {
     MseSourceBuffer^ buffer;
     void* sbCtx { nullptr };
 };
+
+// Platform::String^ -> UTF-8 std::string (the C ABI into WebCore's curl fetcher speaks UTF-8).
+static std::string toUtf8(Platform::String^ s)
+{
+    if (s == nullptr || s->IsEmpty())
+        return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, s->Data(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1)
+        return std::string();
+    std::string out(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s->Data(), -1, &out[0], len, nullptr, nullptr);
+    return out;
+}
 
 static String^ toPlatformString(const char* utf8)
 {
@@ -164,9 +180,9 @@ void* PortMseCreate(void* srcCtx)
     h->source = ref new MseStreamSource();
     h->srcCtx = srcCtx;
     h->source->Opened += ref new TypedEventHandler<MseStreamSource^, Object^>(
-        [srcCtx](MseStreamSource^, Object^) { WebCoreMseSourceOpened(srcCtx); });
+        [srcCtx](MseStreamSource^, Object^) { PortImgLog("mse: MseStreamSource Opened"); WebCoreMseSourceOpened(srcCtx); });
     h->source->Ended += ref new TypedEventHandler<MseStreamSource^, Object^>(
-        [srcCtx](MseStreamSource^, Object^) { WebCoreMseSourceEnded(srcCtx); });
+        [srcCtx](MseStreamSource^, Object^) { PortImgLog("mse: MseStreamSource Ended"); WebCoreMseSourceEnded(srcCtx); });
     return h;
 }
 
@@ -233,6 +249,26 @@ void PortMseAbort(void* sbH)
     try { b->buffer->Abort(); } catch (...) { }
 }
 
+// Coded-frame removal, forwarded to the WinRT buffer (it owns the demuxed frames). Async: completion
+// arrives as UpdateEnded on sbCtx. endSeconds < 0 = unbounded (to end of stream).
+void PortMseRemove(void* sbH, double startSeconds, double endSeconds)
+{
+    auto b = static_cast<MseBuffer*>(sbH);
+    try {
+        TimeSpan start { static_cast<long long>(startSeconds * 1e7) };
+        if (endSeconds < 0)
+            b->buffer->Remove(start, nullptr);
+        else
+            b->buffer->Remove(start, ref new Platform::Box<TimeSpan>(TimeSpan { static_cast<long long>(endSeconds * 1e7) }));
+    } catch (Platform::Exception^ ex) {
+        char m[96]; snprintf(m, sizeof m, "mse: Remove THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(m);
+        WebCoreMseSbUpdateEnded(b->sbCtx); // still complete WebCore's removal (ranges just refresh as-is)
+    } catch (...) {
+        PortImgLog("mse: Remove THREW (unknown)");
+        WebCoreMseSbUpdateEnded(b->sbCtx);
+    }
+}
+
 void PortMseSetTimestampOffset(void* sbH, double seconds)
 {
     auto b = static_cast<MseBuffer*>(sbH);
@@ -260,7 +296,9 @@ int PortMseGetBuffered(void* sbH, double* starts, double* ends, int maxN)
 void PortMseSetDuration(void* srcH, double seconds)
 {
     auto h = static_cast<MseSource*>(srcH);
-    try { h->source->Duration = TimeSpan { static_cast<long long>(seconds * 1e7) }; } catch (...) { }
+    try { h->source->Duration = TimeSpan { static_cast<long long>(seconds * 1e7) }; }
+    catch (Platform::Exception^ ex) { char b[80]; snprintf(b, sizeof b, "mse: setDuration THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b); }
+    catch (...) { }
 }
 
 // status: 0 = success, 1 = network error, 2 = decode error.
@@ -296,21 +334,21 @@ void* PortMseGetMFMediaSource(void* srcH)
 }
 
 // ---- WinRT MediaPlayer frame-server playback (Option B) ----
-void PortMsePlayerStart(void* srcH, void* playerCtx)
+// Shared player wiring for BOTH sources we play through the frame server: an MSE MseStreamSource
+// and an HLS AdaptiveMediaSource (below). Expects h->mediaSource set; wires all session events.
+// All handlers capture `h` and read h->playerCtx live (guarded by h->closing) so a WinRT event
+// that fires during/after teardown can't call into a freed WebCore MediaPlayerPrivate.
+static void startFrameServerPlayer(MseSource* h)
 {
-    auto h = static_cast<MseSource*>(srcH);
-    h->playerCtx = playerCtx;
-    h->closing = false;
-    // All handlers capture `h` and read h->playerCtx live (guarded by h->closing) so a WinRT event
-    // that fires during/after teardown can't call into a freed WebCore MediaPlayerPrivate.
-    try {
-        h->mediaSource = MediaSource::CreateFromMseStreamSource(h->source);
+    {
         h->player = ref new MediaPlayer();
         h->player->IsVideoFrameServerEnabled = true;
         h->player->AutoPlay = true;
         h->player->Source = h->mediaSource;
-        h->player->VideoFrameAvailable += ref new TypedEventHandler<MediaPlayer^, Object^>(
+        h->frameToken = h->player->VideoFrameAvailable += ref new TypedEventHandler<MediaPlayer^, Object^>(
             [h](MediaPlayer^, Object^) { onVideoFrame(h); });
+        h->player->MediaOpened += ref new TypedEventHandler<MediaPlayer^, Object^>(
+            [h](MediaPlayer^, Object^) { if (!h->closing) PortImgLog("mse: player MediaOpened"); });
         h->player->MediaEnded += ref new TypedEventHandler<MediaPlayer^, Object^>(
             [h](MediaPlayer^, Object^) { try { if (!h->closing && h->playerCtx) WebCoreMsePlayerStateChanged(h->playerCtx, 5); } catch (...) { } });
         h->player->MediaFailed += ref new TypedEventHandler<MediaPlayer^, MediaPlayerFailedEventArgs^>(
@@ -324,13 +362,368 @@ void PortMsePlayerStart(void* srcH, void* playerCtx)
             [h](MediaPlaybackSession^ s, Object^) { try { if (!h->closing && h->playerCtx) WebCoreMsePlayerSizeChanged(h->playerCtx, (int)s->NaturalVideoWidth, (int)s->NaturalVideoHeight); } catch (...) { } });
         sess->BufferingStarted += ref new TypedEventHandler<MediaPlaybackSession^, Object^>(
             [h](MediaPlaybackSession^, Object^) { if (!h->closing) PortImgLog("mse: player BufferingStarted"); });
+        sess->BufferingEnded += ref new TypedEventHandler<MediaPlaybackSession^, Object^>(
+            [h](MediaPlaybackSession^, Object^) { if (!h->closing) PortImgLog("mse: player BufferingEnded"); });
         sess->PositionChanged += ref new TypedEventHandler<MediaPlaybackSession^, Object^>(
             [h](MediaPlaybackSession^ s, Object^) { try { if (!h->closing && h->playerCtx) WebCoreMsePlayerTimeUpdate(h->playerCtx, s->Position.Duration / 1e7); } catch (...) { } });
+        // Seek completion. Without this the port had no way to tell WebCore a seek had FINISHED, so
+        // it used to just call timeChanged() straight out of seek() -- which re-entered
+        // HTMLMediaElement mid-seek and recursed until the render thread's 16MB stack was gone.
+        sess->SeekCompleted += ref new TypedEventHandler<MediaPlaybackSession^, Object^>(
+            [h](MediaPlaybackSession^, Object^) {
+                try {
+                    if (h->closing || !h->playerCtx)
+                        return;
+                    PortImgLog("mse: player SeekCompleted");
+                    WebCoreMsePlayerSeekCompleted(h->playerCtx);
+                } catch (...) { }
+            });
         PortImgLog("mse: MediaPlayer frame-server started (AutoPlay)");
+    }
+}
+
+void PortMsePlayerStart(void* srcH, void* playerCtx)
+{
+    auto h = static_cast<MseSource*>(srcH);
+    h->playerCtx = playerCtx;
+    h->closing = false;
+    try {
+        h->mediaSource = MediaSource::CreateFromMseStreamSource(h->source);
+        startFrameServerPlayer(h);
     } catch (Platform::Exception^ ex) {
         char b[128]; snprintf(b, sizeof b, "mse: MediaPlayer start FAILED hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
         WebCoreMsePlayerError(playerCtx, ex->HResult);
     }
+}
+
+// ---- HLS playback via the platform's adaptive-streaming stack ----
+// W10M's IMFMediaEngine cannot play an HLS manifest from this AppContainer (SetSource succeeds,
+// LOADSTART fires, then nothing — no metadata, no error). The platform-blessed HLS path on UWP is
+// Windows.Media.Streaming.Adaptive.AdaptiveMediaSource -> MediaSource -> MediaPlayer, which is the
+// SAME frame-server pipeline the MSE path already uses (audio auto-routes, video frames arrive on
+// VideoFrameAvailable). We present as iOS Safari, so sites (YouTube) hand us native HLS constantly —
+// this is a first-class path, not an edge case. Creation is async; playerCtx callbacks report state.
+void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx)
+{
+    auto h = new MseSource(); // same handle type: player wiring + teardown are shared
+    h->playerCtx = playerCtx;
+    try {
+        auto uri = ref new Windows::Foundation::Uri(toPlatformString(url));
+        // Fetch the manifest/segments with the BROWSER'S identity. AMS's default HTTP stack sends a
+        // Windows media UA; googlevideo (and most CDNs doing UA-based gating) then never serves the
+        // playlist — AMS retried silently forever (no state change, no MediaFailed, 90s of nothing).
+        // A browser fetches media subresources with its own UA; give AMS an HttpClient that does too.
+        auto httpClient = ref new Windows::Web::Http::HttpClient();
+        if (userAgent && *userAgent) {
+            if (!httpClient->DefaultRequestHeaders->UserAgent->TryParseAdd(toPlatformString(userAgent)))
+                PortImgLog("hls: UA TryParseAdd rejected (sending default UA)");
+        }
+        auto op = Windows::Media::Streaming::Adaptive::AdaptiveMediaSource::CreateFromUriAsync(uri, httpClient);
+        op->Completed = ref new AsyncOperationCompletedHandler<Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationResult^>(
+            [h](IAsyncOperation<Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationResult^>^ a, AsyncStatus s) {
+                try {
+                    if (h->closing)
+                        return;
+                    if (s != AsyncStatus::Completed) {
+                        PortImgLog("hls: CreateFromUriAsync did not complete");
+                        if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, -1);
+                        return;
+                    }
+                    auto res = a->GetResults();
+                    if (res->Status != Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationStatus::Success) {
+                        char b[112]; snprintf(b, sizeof b, "hls: AMS create FAILED status=%d hr=0x%08x",
+                            (int)res->Status, (unsigned)res->ExtendedError.Value); PortImgLog(b);
+                        if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, (int)res->ExtendedError.Value);
+                        return;
+                    }
+                    auto ams = res->MediaSource;
+                    // Failures inside AMS are otherwise INVISIBLE (it retries internally; the player
+                    // just never leaves Opening). Log every failed fetch with type + HTTP status.
+                    ams->DownloadFailed += ref new TypedEventHandler<Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadFailedEventArgs^>(
+                        [h](Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadFailedEventArgs^ e) {
+                            try {
+                                int status = 0;
+                                if (e->HttpResponseMessage)
+                                    status = (int)e->HttpResponseMessage->StatusCode;
+                                std::wstring wu = e->ResourceUri ? std::wstring(e->ResourceUri->RawUri->Data()) : L"(null)";
+                                std::string uu(wu.begin(), wu.end());
+                                char b[400]; snprintf(b, sizeof b, "hls: DownloadFailed type=%d http=%d extErr=0x%08x uri=%.280s",
+                                    (int)e->ResourceType, status, (unsigned)e->ExtendedError.Value, uu.c_str());
+                                PortImgLog(b);
+                                // FairPlay (skd:// key URI): unsatisfiable off Apple hardware. AMS
+                                // retries the key fetch forever, burning CPU behind a black player.
+                                // Fail the element once so the page can react (and we stop spinning).
+                                if (uu.rfind("skd://", 0) == 0 && !h->closing && h->playerCtx) {
+                                    PortImgLog("hls: FairPlay DRM key required (skd://) - UNPLAYABLE, failing element");
+                                    void* ctx = h->playerCtx;
+                                    h->playerCtx = nullptr; // report once
+                                    h->closing = true;      // stop the retry storm from reaching us
+                                    WebCoreMsePlayerError(ctx, (int)0x8004025E /* DRM not supported */);
+                                }
+                            } catch (...) { PortImgLog("hls: DownloadFailed (no detail)"); }
+                        });
+                    // Log the first requests AMS issues (type + URI) so a refused scheme or a
+                    // mis-resolved relative URI is visible without guessing.
+                    ams->DownloadRequested += ref new TypedEventHandler<Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadRequestedEventArgs^>(
+                        [](Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadRequestedEventArgs^ e) {
+                            try {
+                                static int s_reqLogged = 0;
+                                if (s_reqLogged >= 16 && (int)e->ResourceType != 3)
+                                    return;
+                                if (s_reqLogged < 40) {
+                                    ++s_reqLogged;
+                                    std::wstring wu = e->ResourceUri ? std::wstring(e->ResourceUri->RawUri->Data()) : L"(null)";
+                                    std::string uu(wu.begin(), wu.end());
+                                    char b[400]; snprintf(b, sizeof b, "hls: DownloadRequested type=%d uri=%.300s",
+                                        (int)e->ResourceType, uu.c_str());
+                                    PortImgLog(b);
+                                }
+                            } catch (...) { }
+                        });
+                    // Constrained device (390MB AppContainer cap, 720x1280 panel): start on the
+                    // LOWEST rung and cap the ladder. Uncapped, AMS buffers the top variant
+                    // (1080p+) and its download+decode buffers OOM-killed the app the moment the
+                    // content pipeline spun up on top of a ~340MB heavy YouTube page.
+                    try {
+                        unsigned lowest = 0;
+                        auto rates = ams->AvailableBitrates;
+                        for (unsigned i = 0; i < rates->Size; ++i) {
+                            unsigned r = rates->GetAt(i);
+                            if (!lowest || r < lowest)
+                                lowest = r;
+                        }
+                        if (lowest)
+                            ams->InitialBitrate = lowest;
+                        ams->DesiredMaxBitrate = ref new Platform::Box<unsigned int>(1500000u); // ~480-720p H.264
+                        char b[96]; snprintf(b, sizeof b, "hls: bitrate initial=%u max=1500000 (of %u rungs)",
+                            lowest, rates->Size); PortImgLog(b);
+                    } catch (...) { PortImgLog("hls: bitrate caps not applied"); }
+                    h->mediaSource = MediaSource::CreateFromAdaptiveMediaSource(ams);
+                    startFrameServerPlayer(h);
+                    PortImgLog("hls: AdaptiveMediaSource OK -> frame-server started");
+                } catch (Platform::Exception^ ex) {
+                    char b[96]; snprintf(b, sizeof b, "hls: start THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
+                    if (!h->closing && h->playerCtx) WebCoreMsePlayerError(h->playerCtx, ex->HResult);
+                } catch (...) { PortImgLog("hls: start THREW (unknown)"); }
+            });
+        PortImgLog("hls: AdaptiveMediaSource create requested");
+    } catch (Platform::Exception^ ex) {
+        char b[96]; snprintf(b, sizeof b, "hls: create THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
+        WebCoreMsePlayerError(playerCtx, ex->HResult);
+    }
+    return h;
+}
+
+// Tear down an HLS player handle (stop first via PortMsePlayerStop, which is shared).
+void PortHlsPlayerDestroy(void* srcH)
+{
+    PortMseDestroy(srcH); // shared teardown: closing flag, player Close, handle free (source is null)
+}
+
+// ============================ PROGRESSIVE (<video src="...mp4">) ============================
+//
+// IMFMediaEngine::SetSource(url) makes the ENGINE fetch the URL with the legacy Windows Media network
+// source: its own UA, its own cookie jar (empty), no Referer. SetSource returns S_OK and then the
+// engine fails asynchronously -- exactly what the log shows on nearly every CDN:
+//   mf: SetSource hr=0x00000000 -> mf: EVENT_ERROR code=4 (SRC_NOT_SUPPORTED) extHr=0xc00d001a / 0xc00d0035
+// on ew.phncdn.com, ht-cdn.trafficjunky.net, ht-cdn2.adtng.com ... while a plain unguarded MP4 from
+// evtubescms.phncdn.com plays fine. Same container, same codecs => it is the FETCH being refused, not
+// the media. And even when it does play, IMFMediaEngine gives us no per-frame callback, so the video
+// only repainted on TIMEUPDATE (~4/sec) -- the choppiness.
+//
+// Fix both by owning the transport: read the URL through Windows.Web.Http with the BROWSER'S identity,
+// hand MF a stream instead of a URL, and play it on the SAME frame-server MediaPlayer that MSE/HLS use
+// (VideoFrameAvailable per decoded frame).
+// Ranged fetch over the browser's own curl stack (DoH resolver + our TLS profile + Referer/UA).
+// Blocking; only ever called from worker threads. See port/PortMediaFetch.cpp for why this cannot
+// go through Windows.Web.Http: the OS resolver cannot resolve these media hosts (0x80072ee7), curl can.
+extern "C" int WebCoreMediaFetchRange(const char* url, const char* userAgent, const char* referer,
+    unsigned long long start, unsigned long long count,
+    uint8_t* out, unsigned long long* outRead,
+    unsigned long long* outTotal, char* outType, int outTypeLen, int* outStatus);
+
+namespace RevenantMedia {
+
+// Raw bytes behind an IBuffer, so a range response can be written straight into it.
+static uint8_t* bufferBytes(IBuffer^ buffer)
+{
+    Microsoft::WRL::ComPtr<IInspectable> insp(reinterpret_cast<IInspectable*>(buffer));
+    Microsoft::WRL::ComPtr<Windows::Storage::Streams::IBufferByteAccess> access;
+    if (FAILED(insp.As(&access)))
+        return nullptr;
+    uint8_t* bytes = nullptr;
+    if (FAILED(access->Buffer(&bytes)))
+        return nullptr;
+    return bytes;
+}
+
+// A seekable byte stream MF can demux from, served by ranged curl GETs -- so the whole file is never
+// buffered in memory (a 390MB-cap device cannot afford that) and seeking works.
+private ref class HttpRandomAccessStream sealed : public IRandomAccessStreamWithContentType {
+internal:
+    HttpRandomAccessStream(Platform::String^ url, Platform::String^ userAgent, Platform::String^ referer,
+        unsigned long long size, Platform::String^ contentType)
+        : m_url(url), m_userAgent(userAgent), m_referer(referer), m_size(size), m_contentType(contentType) { }
+
+public:
+    virtual Windows::Foundation::IAsyncOperationWithProgress<IBuffer^, unsigned int>^ ReadAsync(
+        IBuffer^ buffer, unsigned int count, InputStreamOptions options)
+    {
+        (void)buffer; (void)options;
+        std::string url = toUtf8(m_url);
+        std::string ua = toUtf8(m_userAgent);
+        std::string rf = toUtf8(m_referer);
+        unsigned long long start = m_pos;
+        unsigned long long size = m_size;
+        auto self = this;
+        return concurrency::create_async(
+            [url, ua, rf, start, count, size, self](concurrency::progress_reporter<unsigned int> reporter)
+                -> IBuffer^ {
+                unsigned long long want = count;
+                if (size && start >= size)
+                    return ref new Windows::Storage::Streams::Buffer(0);
+                if (size && start + want > size)
+                    want = size - start;
+
+                auto data = ref new Windows::Storage::Streams::Buffer(static_cast<unsigned int>(want));
+                uint8_t* dst = bufferBytes(data);
+                if (!dst)
+                    return ref new Windows::Storage::Streams::Buffer(0);
+
+                unsigned long long got = 0;
+                int status = 0;
+                int rc = WebCoreMediaFetchRange(url.c_str(), ua.c_str(), rf.c_str(), start, want,
+                    dst, &got, nullptr, nullptr, 0, &status);
+                if (rc != 0)
+                    got = 0;
+
+                data->Length = static_cast<unsigned int>(got);
+                self->m_pos = start + got;
+                reporter.report(static_cast<unsigned int>(got));
+                return data;
+            });
+    }
+
+    virtual Windows::Foundation::IAsyncOperationWithProgress<unsigned int, unsigned int>^ WriteAsync(IBuffer^)
+    {
+        throw ref new Platform::NotImplementedException(); // read-only stream
+    }
+    virtual Windows::Foundation::IAsyncOperation<bool>^ FlushAsync()
+    {
+        throw ref new Platform::NotImplementedException();
+    }
+    virtual IInputStream^ GetInputStreamAt(unsigned long long position)
+    {
+        auto s = ref new HttpRandomAccessStream(m_url, m_userAgent, m_referer, m_size, m_contentType);
+        s->m_pos = position;
+        return s;
+    }
+    virtual IOutputStream^ GetOutputStreamAt(unsigned long long)
+    {
+        throw ref new Platform::NotImplementedException();
+    }
+    virtual void Seek(unsigned long long position) { m_pos = position; }
+    virtual IRandomAccessStream^ CloneStream()
+    {
+        auto s = ref new HttpRandomAccessStream(m_url, m_userAgent, m_referer, m_size, m_contentType);
+        s->m_pos = m_pos;
+        return s;
+    }
+    // C++/CX projects IClosable::Close as Platform::IDisposable::Dispose, and the way to implement it
+    // is a public destructor -- a Close() method does NOT satisfy the interface. Nothing to release:
+    // the HttpClient and Uri are ref-counted and each range request owns its own response.
+    virtual ~HttpRandomAccessStream() { }
+
+    property bool CanRead { virtual bool get() { return true; } }
+    property bool CanWrite { virtual bool get() { return false; } }
+    property unsigned long long Position { virtual unsigned long long get() { return m_pos; } }
+    property unsigned long long Size {
+        virtual unsigned long long get() { return m_size; }
+        virtual void set(unsigned long long v) { m_size = v; }
+    }
+    property Platform::String^ ContentType { virtual Platform::String^ get() { return m_contentType; } }
+
+private:
+    Platform::String^ m_url;
+    Platform::String^ m_userAgent;
+    Platform::String^ m_referer;
+    unsigned long long m_pos { 0 };
+    unsigned long long m_size { 0 };
+    Platform::String^ m_contentType;
+};
+
+} // namespace RevenantMedia
+
+// Probe the URL (range request for the first byte) to learn its length + content type, then play it
+// off an HttpRandomAccessStream on the frame-server pipeline. Async: playerCtx callbacks report state.
+void* PortProgressivePlayerStart(const char* url, const char* userAgent, const char* referer, void* playerCtx)
+{
+    auto h = new MseSource(); // same handle type: player wiring + teardown are shared with MSE/HLS
+    h->playerCtx = playerCtx;
+    std::string u = url ? url : "";
+    std::string ua = userAgent ? userAgent : "";
+    std::string rf = referer ? referer : "";
+    try {
+        // The probe is a blocking curl GET, so it must not run on the WebCore main thread.
+        concurrency::create_task([h, u, ua, rf] {
+            try {
+                if (h->closing)
+                    return;
+                uint8_t first = 0;
+                unsigned long long got = 0, total = 0;
+                char ctype[128] = { 0 };
+                int status = 0;
+                int rc = WebCoreMediaFetchRange(u.c_str(), ua.c_str(), rf.c_str(), 0, 1,
+                    &first, &got, &total, ctype, sizeof ctype, &status);
+                {
+                    char b[240];
+                    snprintf(b, sizeof b, "prog: probe rc=%d http=%d len=%llu type=%s", rc, status, total, ctype);
+                    PortImgLog(b);
+                }
+                if (h->closing)
+                    return;
+                if (rc != 0) {
+                    // Names the refusal outright (403/404/curl code) instead of laundering it through
+                    // MediaFoundation as "SRC_NOT_SUPPORTED".
+                    if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, status ? status : -1);
+                    return;
+                }
+                if (!total) {
+                    PortImgLog("prog: no content length -> cannot seek, failing element");
+                    if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, -1);
+                    return;
+                }
+
+                auto ctypeStr = toPlatformString(ctype);
+                auto stream = ref new RevenantMedia::HttpRandomAccessStream(
+                    toPlatformString(u.c_str()), toPlatformString(ua.c_str()), toPlatformString(rf.c_str()),
+                    total, ctypeStr);
+                h->mediaSource = MediaSource::CreateFromStream(stream, ctypeStr);
+                startFrameServerPlayer(h);
+                PortImgLog("prog: stream OK -> frame-server started");
+            } catch (Platform::Exception^ ex) {
+                char b[112];
+                snprintf(b, sizeof b, "prog: probe THREW hr=0x%08lx", (unsigned long)ex->HResult);
+                PortImgLog(b);
+                if (!h->closing && h->playerCtx) WebCoreMsePlayerError(h->playerCtx, ex->HResult);
+            } catch (...) {
+                PortImgLog("prog: probe THREW (unknown)");
+                if (!h->closing && h->playerCtx) WebCoreMsePlayerError(h->playerCtx, -1);
+            }
+        });
+        PortImgLog("prog: probe requested (curl/DoH)");
+    } catch (Platform::Exception^ ex) {
+        char b[96];
+        snprintf(b, sizeof b, "prog: create THREW hr=0x%08lx", (unsigned long)ex->HResult);
+        PortImgLog(b);
+        WebCoreMsePlayerError(playerCtx, ex->HResult);
+    }
+    return h;
+}
+
+void PortProgressivePlayerDestroy(void* srcH)
+{
+    PortMseDestroy(srcH); // shared teardown
 }
 
 // Detach + close the player synchronously. Called from WebCore's MediaPlayerPrivate destructor
@@ -341,15 +734,58 @@ void PortMsePlayerStop(void* srcH)
     h->closing = true;
     h->playerCtx = nullptr;
     if (h->player) {
-        try { h->player->Pause(); } catch (...) { }
-        try { delete h->player; } catch (...) { } // IClosable::Close — tears down the pipeline + stops events
+        // Take ownership so we can null h->player immediately (no dangling events) and outlive `h`.
+        MediaPlayer^ player = h->player;
         h->player = nullptr;
+        // Stop the frame server FIRST: unhook VideoFrameAvailable so no CopyFrameToVideoSurface can
+        // run against a player mid-teardown (an in-flight handler racing Close is a deadlock vector).
+        try { if (h->frameToken.Value) player->VideoFrameAvailable -= h->frameToken; } catch (...) { }
+        // Tear down ENTIRELY on a threadpool thread, in stages: Pause -> detach the source (this is
+        // what actually stops the MF decode pipeline + frame server, synchronously but off the UI
+        // thread) -> Close. The previous shape (Pause on the UI thread, one-shot Close on the pool)
+        // still froze the UI thread: right after "player stop" the XAML frame commit blocked forever
+        // in a system wait (stage=f:present-done, zero WebCore frames on the stack, cpuDelta=0) and
+        // the W10M watchdog killed the app ~60s later. Detaching Source before Close makes Close
+        // trivial instead of a full-pipeline teardown racing DWM composition.
+        try {
+            Windows::System::Threading::ThreadPool::RunAsync(
+                ref new Windows::System::Threading::WorkItemHandler(
+                    [player](Windows::Foundation::IAsyncAction^) {
+                        try { player->Pause(); } catch (...) { }
+                        try { player->Source = nullptr; } catch (...) { }
+                        try { delete player; } catch (...) { }
+                        PortImgLog("mse: player closed (worker)");
+                    }));
+        } catch (...) {
+            try { delete player; } catch (...) { } // fallback: close inline if dispatch fails
+        }
     }
-    PortImgLog("mse: player stopped");
+    PortImgLog("mse: player stop (async close)");
 }
 
-void PortMsePlayerPlay(void* srcH)  { auto h = static_cast<MseSource*>(srcH); try { if (h->player) h->player->Play();  } catch (...) { } }
-void PortMsePlayerPause(void* srcH) { auto h = static_cast<MseSource*>(srcH); try { if (h->player) h->player->Pause(); } catch (...) { } }
+// Play/Pause used to swallow every exception silently, so a refused Play() was invisible in the log.
+void PortMsePlayerPlay(void* srcH)
+{
+    auto h = static_cast<MseSource*>(srcH);
+    if (!h->player) { PortImgLog("mse: Play() SKIPPED - no player"); return; }
+    try {
+        int before = (int)h->player->PlaybackSession->PlaybackState;
+        h->player->Play();
+        int after = (int)h->player->PlaybackSession->PlaybackState;
+        char b[80]; snprintf(b, sizeof b, "mse: Play() called (state %d -> %d)", before, after); PortImgLog(b);
+    } catch (Platform::Exception^ ex) {
+        char b[80]; snprintf(b, sizeof b, "mse: Play() THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
+    } catch (...) { PortImgLog("mse: Play() THREW (unknown)"); }
+}
+
+void PortMsePlayerPause(void* srcH)
+{
+    auto h = static_cast<MseSource*>(srcH);
+    if (!h->player) return;
+    try { h->player->Pause(); PortImgLog("mse: Pause() called"); }
+    catch (Platform::Exception^ ex) { char b[80]; snprintf(b, sizeof b, "mse: Pause() THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b); }
+    catch (...) { }
+}
 void PortMsePlayerSetRate(void* srcH, double rate)   { auto h = static_cast<MseSource*>(srcH); try { if (h->player) h->player->PlaybackSession->PlaybackRate = rate; } catch (...) { } }
 void PortMsePlayerSetVolume(void* srcH, double vol)  { auto h = static_cast<MseSource*>(srcH); try { if (h->player) h->player->Volume = vol; } catch (...) { } }
 void PortMsePlayerSetMuted(void* srcH, int muted)    { auto h = static_cast<MseSource*>(srcH); try { if (h->player) h->player->IsMuted = muted != 0; } catch (...) { } }

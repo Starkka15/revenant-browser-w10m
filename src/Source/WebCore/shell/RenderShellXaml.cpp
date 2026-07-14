@@ -42,8 +42,15 @@ extern "C" void WebCoreBrowserRenderFrameSafe();
 extern "C" void WebCoreBrowserLog(const char*);
 extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale);
 extern "C" void WebCoreBrowserTap(int x, int y);
-extern "C" void WebCoreBrowserScrollBy(int dx, int dy);
+extern "C" void WebCoreBrowserTouch(int identifier, int phase, int x, int y); // 0=down 1=move 2=up 3=cancel
+extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y);
 extern "C" void WebCoreBrowserNavigate(const char* url);
+extern "C" void WebCoreBrowserKeepCompositing(unsigned frames);
+extern "C" void WebCoreBrowserReleaseMemory(int critical); // release WebKit caches on memory pressure
+extern "C" void WebCoreBrowserSetMemStats(unsigned long long usedBytes, unsigned long long limitBytes,
+    unsigned long long pct, int level); // publish app memory to WebKit (footprint + gate line)
+extern "C" void WebCoreBrowserForceRepaint();
+extern "C" void WebCoreBrowserStage(const char*); // stall-detector breadcrumb (string literals only)
 extern "C" void WebCoreBrowserGoBack();
 extern "C" void WebCoreBrowserReload();
 extern "C" void WebCoreBrowserStop();
@@ -73,7 +80,38 @@ static SolidColorBrush^ brush(unsigned char r, unsigned char g, unsigned char b,
 
 ref class RevenantApp sealed : public Application {
 public:
-    RevenantApp() { }
+    RevenantApp()
+    {
+        // XAML's own exception + background hooks. UnhandledErrorDetected (installed in main) covers
+        // WinRT errors that fail-fast; this covers exceptions XAML dispatches and swallows, and the
+        // EnteredBackground transition that precedes a shell-driven kill.
+        UnhandledException += ref new UnhandledExceptionEventHandler(
+            [](Platform::Object^, UnhandledExceptionEventArgs^ e) {
+                char b[192];
+                snprintf(b, sizeof b, "app: XAML-UNHANDLED hr=0x%08X msg=%ls",
+                    static_cast<unsigned>(e->Exception.Value),
+                    e->Message ? e->Message->Data() : L"");
+                WebCorePort::portLog(b);
+            });
+        EnteredBackground += ref new Windows::UI::Xaml::EnteredBackgroundEventHandler(
+            [](Platform::Object^, Windows::ApplicationModel::EnteredBackgroundEventArgs^) {
+                WebCorePort::portLog("app: ENTERED-BACKGROUND");
+            });
+        LeavingBackground += ref new Windows::UI::Xaml::LeavingBackgroundEventHandler(
+            [](Platform::Object^, Windows::ApplicationModel::LeavingBackgroundEventArgs^) {
+                WebCorePort::portLog("app: LEAVING-BACKGROUND");
+            });
+        Suspending += ref new Windows::UI::Xaml::SuspendingEventHandler(
+            [](Platform::Object^, Windows::ApplicationModel::SuspendingEventArgs^) {
+                // SHRINK BEFORE WE SLEEP. A suspended app is kept in memory only if the OS can afford
+                // it; W10M terminates the fat ones to reclaim RAM. We were being suspended holding
+                // 206MB and getting reclaimed -- the log shows ENTERED-BACKGROUND -> SUSPENDING ->
+                // (no RESUMING) -> a cold relaunch. The suspends where we held less all resumed fine.
+                // This hook existed and did nothing; dropping the caches here is the entire point of it.
+                WebCorePort::portLog("app: XAML-SUSPENDING -> releaseMemory(critical) before sleep");
+                WebCoreBrowserReleaseMemory(1);
+            });
+    }
 
 protected:
     virtual void OnLaunched(LaunchActivatedEventArgs^) override
@@ -116,6 +154,15 @@ protected:
 
         Window::Current->Content = root;
         Window::Current->Activate();
+
+        // Resume-from-background repaint. The GPU-offload gate skips the clear/paint/swap on any
+        // frame WebCore reports as unchanged. When the app is backgrounded (Home / task switch) the
+        // OS invalidates the swapchain backbuffers, but a now-static page produces no scene change,
+        // so every post-resume frame is skipped and the black backbuffer is never redrawn (app looks
+        // dead even though navigation still works). On becoming visible again, force a window of full
+        // composites so the layer tree is re-painted and re-presented into the fresh buffers.
+        Window::Current->VisibilityChanged +=
+            ref new WindowVisibilityChangedEventHandler(this, &RevenantApp::onVisibilityChanged);
 
         // Keyboard for WEB PAGE inputs. The URL TextBox handles its own keys; for text fields
         // inside the page (rendered in the SwapChainPanel) there is no native control, so route
@@ -287,6 +334,17 @@ private:
         } catch (...) { }
     }
 
+    void onVisibilityChanged(Object^, Windows::UI::Core::VisibilityChangedEventArgs^ e)
+    {
+        if (e->Visible) {
+            // Full re-raster, not just re-composite: suspend discards the GPU backing textures, so
+            // re-presenting them shows black. ForceRepaint marks the RenderView + composited layers
+            // dirty so the content is re-rastered into fresh textures, then holds the compose window.
+            WebCoreBrowserForceRepaint();
+            WebCorePort::portLog("revenant: visible -> force repaint (resume)");
+        }
+    }
+
     void onSizeChanged(Object^, SizeChangedEventArgs^)
     {
         if (m_panel->ActualWidth < 1.0 || m_panel->ActualHeight < 1.0)
@@ -306,7 +364,7 @@ private:
             } catch (...) { }
             // Hold the property set in a ^ local across the InitPanel call — a bare temporary
             // would be released before ANGLE finishes using it (freed native window -> crash).
-            auto props = makeSizedPanel(pxW, pxH);
+            auto props = makeScaledPanel(raw);
             void* insp = reinterpret_cast<void*>(props);
             int rc = WebCoreBrowserInitPanel(insp, pxW, pxH, raw, "https://www.google.com/");
             char b[160];
@@ -339,35 +397,97 @@ private:
         }
     }
 
-    // Build the ANGLE configured property set (panel + explicit physical render size).
-    Windows::Foundation::Collections::PropertySet^ makeSizedPanel(int pxW, int pxH)
+    // Build the ANGLE configured property set (panel + render RESOLUTION SCALE).
+    //
+    // We deliberately pass EGLRenderResolutionScaleProperty (a scale) and NOT
+    // EGLRenderSurfaceSizeProperty (a fixed size). A fixed size pins ANGLE's backbuffer to the
+    // initial (portrait) dimensions forever: on rotation ANGLE's SwapChainPanelNativeWindow takes
+    // the size-specified branch of setNewClientSize, which only sets a stretch matrix
+    // (scaleSwapChain) and never flags mClientRectChanged — so the portrait backbuffer is just
+    // distorted to fill the landscape panel (the squished, black-barred landscape we saw).
+    // With a scale instead, mSwapChainSizeSpecified is false, so every SizeChanged (rotation)
+    // recomputes clientRect = panelSize x scale and ResizeBuffers the backbuffer to the new
+    // orientation, at full physical resolution. The two properties are mutually exclusive.
+    // Init render is unchanged: the composite matrix is 1/scale either way.
+    Windows::Foundation::Collections::PropertySet^ makeScaledPanel(double scale)
     {
         auto props = ref new Windows::Foundation::Collections::PropertySet();
         props->Insert(L"EGLNativeWindowTypeProperty", m_panel);
-        props->Insert(L"EGLRenderSurfaceSizeProperty",
-            PropertyValue::CreateSize(Size(static_cast<float>(pxW), static_cast<float>(pxH))));
+        props->Insert(L"EGLRenderResolutionScaleProperty",
+            PropertyValue::CreateSingle(static_cast<float>(scale <= 0.0 ? 1.0 : scale)));
         return props;
     }
 
     void onRendering(Object^, Object^)
     {
         WebCoreBrowserRenderFrameSafe();
+        WebCoreBrowserStage("x1:shell-mem");
 
         // Periodic memory-usage sample (every ~120 frames ≈ 2s). Uses the UWP app-memory API so we
         // can see the trend leading into a freeze/slowdown (climbing usage → GC thrash / hitting the
         // app cap). AppMemoryUsageLevel: 0=Low 1=Medium 2=High 3=OverLimit.
-        if ((++m_memSampleFrame % 120) == 0) {
+        // Check the AppContainer memory level EVERY frame (cheap WinRT property read) so we can release
+        // WebKit caches the moment the main thread is free after a memory-ballooning burst — a heavy page
+        // can jump 80MB -> 290MB fast, and the OverLimit cap triggers the memory-manager thrash (60s hang).
+        // level: 0=Low 1=Medium 2=High 3=OverLimit. Release runs HERE on the main thread (WebCore-safe).
+        // Throttle so we don't call releaseMemory every frame while sitting at Medium: act on a rise, or
+        // at most every ~45 frames if still elevated.
+        {
+            // Read the REAL numbers every frame, not just the coarse level. This whole block used to
+            // throttle on a FRAME counter (every 120 frames): fine at 60fps, useless at the 1fps the
+            // heavy pages collapse to, where 120 frames is two minutes. The last appUsage reading
+            // before the app died was 97MB, taken ages earlier -- so the climb into the OS kill was
+            // completely unmeasured. Everything here is now wall-clock based.
             uint64 used = Windows::System::MemoryManager::AppMemoryUsage;
             uint64 limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
             int level = (int)Windows::System::MemoryManager::AppMemoryUsageLevel;
-            char b[192];
-            sprintf_s(b, sizeof b, "mem: appUsage=%lluMB / limit=%lluMB (%llu%%) level=%d",
-                (unsigned long long)(used / (1024 * 1024)),
-                (unsigned long long)(limit / (1024 * 1024)),
-                limit ? (unsigned long long)(used * 100 / limit) : 0ULL, level);
-            WebCoreBrowserLog(b);
+            unsigned long long pct = limit ? (unsigned long long)(used * 100 / limit) : 0ULL;
+
+            // Publish to the driver. This is not just for the log line: WebKit's memoryFootprint()
+            // is a hard 0 on this port (PSAPI is desktop-only), so this call is the ONLY way the
+            // engine learns how much memory it is using -- and without it RenderLayerCompositor never
+            // leaves CompositingPolicy::Normal and promotes layers until the OS kills us. Bytes, not
+            // MB: the pressure thresholds are computed from it.
+            WebCoreBrowserSetMemStats((unsigned long long)used, (unsigned long long)limit, pct, level);
+
+            ULONGLONG now = GetTickCount64();
+            if (!m_lastMemLogTick || now - m_lastMemLogTick >= 2000) {
+                m_lastMemLogTick = now;
+                char b[192];
+                sprintf_s(b, sizeof b, "mem: appUsage=%lluMB / limit=%lluMB (%llu%%) level=%d",
+                    (unsigned long long)(used / (1024 * 1024)),
+                    (unsigned long long)(limit / (1024 * 1024)), pct, level);
+                WebCoreBrowserLog(b);
+            }
+
+            // Release on a level RISE immediately. Do NOT re-release on a sustained Medium: a heavy
+            // page sits at Medium for its whole life under the 390MB cap, and a synchronous full GC +
+            // cache wipe every couple of seconds is jank, not relief.
+            //
+            // But the LEVEL is too coarse to keep us alive on its own -- it has read Medium at 89% of
+            // the cap while the OS was about to kill us. The percentage is the real guard, and it must
+            // be checked on WALL TIME: it lived inside the 120-frame block, so on the pages that
+            // actually approach the cap (1fps) it never ran at all.
+            // 85% was too late AND too slow. chaturbate (a React SPA whose JSC heap alone hits 45MB)
+            // climbed 73% -> 76% -> 81% -> KILLED in about six seconds, stepping straight over the
+            // threshold without ever tripping it -- and the coarse AppMemoryUsageLevel sat at Medium
+            // the whole way, so `rose` never fired either. Guard at 70%, and re-release every 5s while
+            // we stay above it, so a fast climber gets shrunk before it reaches the cap.
+            bool rose = level > m_lastMemLevel;
+            bool sustainedCritical = level >= 2 && (!m_lastMemReleaseTick || now - m_lastMemReleaseTick >= 5000);
+            bool overPct = pct >= 70 && (!m_lastMemReleaseTick || now - m_lastMemReleaseTick >= 5000);
+            if ((level >= 1 && (rose || sustainedCritical)) || overPct) {
+                char rb[96];
+                sprintf_s(rb, sizeof rb, "mem: pressure level=%d pct=%llu%% -> releaseMemory(%s)",
+                    level, pct, (level >= 2 || pct >= 85) ? "critical" : "normal");
+                WebCoreBrowserLog(rb);
+                WebCoreBrowserReleaseMemory((level >= 2 || pct >= 70) ? 1 : 0);
+                m_lastMemReleaseTick = GetTickCount64();
+            }
+            m_lastMemLevel = level;
         }
 
+        WebCoreBrowserStage("x2:shell-chrome");
         // Reflect load state in the chrome (blue bar + refresh/stop + URL).
         bool loading = WebCoreBrowserIsLoading() != 0;
         if (loading != m_lastLoading) {
@@ -378,6 +498,7 @@ private:
         if (loading)
             m_progress->Value = WebCoreBrowserProgress();
 
+        WebCoreBrowserStage("x3:shell-url");
         // Keep the address bar in sync with the committed URL (unless the user is editing it).
         if (!m_urlEditing) {
             const char* u = WebCoreBrowserCurrentURL();
@@ -387,6 +508,9 @@ private:
                     m_urlBox->Text = s;
             }
         }
+        // Last marker before returning to XAML: a stall showing x9 means the freeze is in XAML's own
+        // frame commit / DWM present, not in any of our code.
+        WebCoreBrowserStage("x9:xaml-commit");
     }
 
     FontIcon^ reloadIcon() { return safe_cast<FontIcon^>(m_reloadBtn->Content); }
@@ -488,6 +612,14 @@ private:
         x = static_cast<int>(pt->Position.X + 0.5f);
         y = static_cast<int>(pt->Position.Y + 0.5f);
     }
+    static bool isTouch(PointerRoutedEventArgs^ e)
+    {
+        return e->Pointer->PointerDeviceType == Windows::Devices::Input::PointerDeviceType::Touch;
+    }
+    static int pointerId(PointerRoutedEventArgs^ e)
+    {
+        return static_cast<int>(e->Pointer->PointerId);
+    }
     void onPointerPressed(Object^, PointerRoutedEventArgs^ e)
     {
         toDip(e, m_pressX, m_pressY);
@@ -496,22 +628,31 @@ private:
         // Tapping the web view moves interaction to the page: stop treating keys as address-bar
         // input so typed characters reach web inputs (the URL box may still hold XAML focus).
         m_urlFocused = false;
+        // Real touch: fire a genuine touchstart so touch-driven sites + fingerprinters (Cloudflare)
+        // see actual touch behind navigator.maxTouchPoints=5. Mouse tap/scroll below still runs.
+        if (isTouch(e)) WebCoreBrowserTouch(pointerId(e), 0, m_pressX, m_pressY);
     }
     void onPointerMoved(Object^, PointerRoutedEventArgs^ e)
     {
         if (!m_pressed) return;
         int x = m_lastX, y = m_lastY;
         toDip(e, x, y);
+        if (isTouch(e)) WebCoreBrowserTouch(pointerId(e), 1, x, y); // touchmove (each finger, per id)
         int dx = x - m_lastX, dy = y - m_lastY;
         if (dx || dy) {
             if (std::abs(x - m_pressX) > 8 || std::abs(y - m_pressY) > 8)
                 m_moved = true;
-            WebCoreBrowserScrollBy(m_lastX - x, m_lastY - y);
+            WebCoreBrowserScrollBy(m_lastX - x, m_lastY - y, x, y); // scroll element under the finger
             m_lastX = x; m_lastY = y;
         }
     }
-    void onPointerReleased(Object^, PointerRoutedEventArgs^)
+    void onPointerReleased(Object^, PointerRoutedEventArgs^ e)
     {
+        if (isTouch(e)) {
+            int x = m_lastX, y = m_lastY;
+            toDip(e, x, y);
+            WebCoreBrowserTouch(pointerId(e), 2, x, y); // touchend
+        }
         if (!m_moved) WebCoreBrowserTap(m_pressX, m_pressY);
         m_pressed = false;
     }
@@ -525,6 +666,10 @@ private:
     bool m_urlFocused = false;
     bool m_lastLoading = false;
     unsigned m_memSampleFrame = 0;
+    int m_lastMemLevel = 0;            // last AppMemoryUsageLevel seen (release on a rise)
+    unsigned m_lastMemReleaseFrame = 0; // frame of last memory release (throttle)
+    unsigned long long m_lastMemLogTick = 0;     // wall-clock throttles: the frame-counted
+    unsigned long long m_lastMemReleaseTick = 0; // ones never fired at the 1fps that matters
     bool m_urlEditing = false;
     double m_deviceScale = 1.0;
     bool m_pressed = false, m_moved = false;
@@ -547,11 +692,75 @@ extern "C" void PortShowKeyboard(int show)
     } catch (...) { }
 }
 
+extern "C" void RevenantProbeMark(const char*);
+
 [Platform::MTAThread]
 int main(Array<String^>^)
 {
+    RevenantProbeMark("=== main() entered ===");
+    // Revenant ARM32-UWP diag: the debug-log path is normally set deep inside OnLaunched
+    // (PortSetDebugLogPathW), so any startup failure BEFORE that point left debug.log empty
+    // and masqueraded as a pre-main death. Set it here first so the app's own portLog trail
+    // through OnLaunched persists. Also hook CoreApplication::UnhandledErrorDetected: a C++/CX
+    // unhandled WinRT exception fails-fast PAST std::set_terminate / SetUnhandledExceptionFilter,
+    // which is why the crash probe's handlers never fired.
+    try {
+        auto path = Windows::Storage::ApplicationData::Current->LocalFolder->Path + L"\\debug.log";
+        PortSetDebugLogPathW(path->Data());
+        WebCorePort::portLog("main: log path set; installing UnhandledErrorDetected hook");
+    } catch (...) { }
+
+    Windows::ApplicationModel::Core::CoreApplication::UnhandledErrorDetected +=
+        ref new Windows::Foundation::EventHandler<Windows::ApplicationModel::Core::UnhandledErrorDetectedEventArgs^>(
+            [](Platform::Object^, Windows::ApplicationModel::Core::UnhandledErrorDetectedEventArgs^ e) {
+                try {
+                    e->UnhandledError->Propagate();
+                } catch (Platform::Exception^ pe) {
+                    char b[128];
+                    snprintf(b, sizeof b, "UNHANDLED WinRT error HRESULT=0x%08X", static_cast<unsigned>(pe->HResult));
+                    WebCorePort::portLog(b);
+                } catch (...) {
+                    WebCorePort::portLog("UNHANDLED startup error (non-WinRT)");
+                }
+            });
+
+    // HOW DOES THE PROCESS END? Every "the app just closes" log so far simply STOPS: no fault, no
+    // unhandled exception, no OOM, memory at 81MB of a 390MB cap. That leaves the platform ending us,
+    // and the platform announces itself before it does -- but nothing was listening. Hook the whole
+    // Process Lifetime Management surface so the log states the exit path instead of implying it:
+    //
+    //   app: SUSPENDING          -> PLM is suspending us (deferral has ~5s; if the UI thread is pegged
+    //                               at 1 fps we will blow that deadline and get terminated)
+    //   app: EXITING             -> orderly CoreApplication::Exiting
+    //   app: ENTERED-BACKGROUND  -> we lost the foreground (screen off / shell took over)
+    //   app: XAML-UNHANDLED      -> a XAML-dispatched exception nobody caught
+    //
+    // If the next crash log ends with NONE of these, the process was hard-killed with no notification
+    // at all, and that is itself the answer (resource-policy kill / fail-fast), not a gap in the log.
+    try {
+        Windows::ApplicationModel::Core::CoreApplication::Suspending +=
+            ref new Windows::Foundation::EventHandler<Windows::ApplicationModel::SuspendingEventArgs^>(
+                [](Platform::Object^, Windows::ApplicationModel::SuspendingEventArgs^) {
+                    WebCorePort::portLog("app: SUSPENDING (PLM suspend requested)");
+                });
+        Windows::ApplicationModel::Core::CoreApplication::Resuming +=
+            ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                [](Platform::Object^, Platform::Object^) {
+                    WebCorePort::portLog("app: RESUMING");
+                });
+        Windows::ApplicationModel::Core::CoreApplication::Exiting +=
+            ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                [](Platform::Object^, Platform::Object^) {
+                    WebCorePort::portLog("app: EXITING (CoreApplication::Exiting)");
+                });
+    } catch (...) {
+        WebCorePort::portLog("app: PLM hook install FAILED");
+    }
+
+    WebCorePort::portLog("main: entering Application::Start");
     Application::Start(ref new ApplicationInitializationCallback([](ApplicationInitializationCallbackParams^) {
         ref new RevenantApp();
     }));
+    WebCorePort::portLog("main: Application::Start returned");
     return 0;
 }

@@ -19,6 +19,28 @@ namespace WebCore {
 class PortChromeClient : public ChromeClient {
     WTF_MAKE_FAST_ALLOCATED;
 public:
+    // WHAT THIS GPU CAN AFFORD TO COMPOSITE.
+    //
+    // The default is AllTriggers, and on an Adreno 305 under a ~390MB AppContainer cap that is fatal.
+    // Measured on pornhub's video page: every thumbnail carries a CSS filter, so
+    // requiresCompositingForFilters() promoted 66 layers -- and then OVERLAP cascaded, because
+    // anything painting on top of a composited layer must itself be composited to keep paint order:
+    //
+    //     66 [filters]  RenderImage / RenderIFrame / RenderBody
+    //    197 [overlap]  RenderBlock / RenderListItem / RenderFlexibleBox
+    //    ------------------------------------------------------------
+    //    266 composited layers, ~1.1MB of GPU tile each = 248MB -> the OS killed the process.
+    //
+    // CompositingPolicy::Conservative does not help here: it gates will-change and transform, not
+    // filters or overlap. Dropping FilterTrigger does not disable CSS filters -- they still render,
+    // in software (cairo) inside their parent's layer -- it only stops each filtered element from
+    // demanding its own GPU texture, which also collapses the overlap cascade that follows it.
+    // Every other trigger (video, canvas, 3D transform, animation, opacity) stays on.
+    CompositingTriggerFlags allowedCompositingTriggers() const override
+    {
+        return static_cast<CompositingTriggerFlags>(AllTriggers & ~FilterTrigger);
+    }
+
     // Root of the composited layer tree (captured when accelerated compositing
     // turns on); the driver renders it via TextureMapperGL. Null = not composited.
     GraphicsLayer* rootGraphicsLayer() const { return m_rootGraphicsLayer; }
@@ -174,6 +196,22 @@ private:
     void scrollMainFrameToRevealRect(const IntRect&) const final { }
 
     void attachRootGraphicsLayer(Frame&, GraphicsLayer* layer) final { m_rootGraphicsLayer = layer; m_needsCompositingFlush = true; }
+
+#if ENABLE(FULLSCREEN_API)
+    // Fullscreen API. WebCore's FullscreenManager does ALL the real work (fullscreen element stack,
+    // :fullscreen / ::backdrop styles, the fullscreen layout that makes the element fill the viewport,
+    // and the fullscreenchange/fullscreenerror events). It only needs the embedder to say "yes, you may"
+    // and to acknowledge the transition. Without these hooks the base ChromeClient returns false, every
+    // Element::requestFullscreen() FAILS, and a player like YouTube's is left mid-transition with its
+    // scrim overlay still in the DOM — swallowing every tap (the grey, dead screen).
+    //
+    // Our window IS the screen (the SwapChainPanel is the whole app surface), so "entering fullscreen"
+    // needs no native window change at all: WebCore's fullscreen layout expands the element to the
+    // viewport and we composite it as usual. We just have to drive the manager's state machine.
+    bool supportsFullScreenForElement(const Element&, bool) final { return true; }
+    void enterFullScreenForElement(Element&) final;
+    void exitFullScreenForElement(Element*) final;
+#endif
     void attachViewOverlayGraphicsLayer(GraphicsLayer*) final { }
     void setNeedsOneShotDrawingSynchronization() final { m_needsCompositingFlush = true; }
     // WebCore's RenderingUpdateScheduler calls this when a rendering update is due (its WTF-timer

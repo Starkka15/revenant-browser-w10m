@@ -28,6 +28,12 @@ public:
     void onOpened();
     void onEnded();
 
+    // Called from MediaPlayerPrivateMediaFoundation's destructor. This object is RefCounted and ALSO
+    // referenced by WebCore's MediaSource (setPrivateAndOpen), so it can outlive the player — some
+    // element-teardown paths invalidate the player without detaching the MediaSource first, and a late
+    // MediaSource::monitorSourceBuffers()/durationChanged() would then call into a freed player.
+    void clearPlayer() { m_player = nullptr; }
+
 private:
     MediaSourcePrivateMediaFoundation(MediaPlayerPrivateMediaFoundation&, MediaSourcePrivateClient&);
 
@@ -42,7 +48,7 @@ private:
     void waitForSeekCompleted() final { }
     void seekCompleted() final { }
 
-    MediaPlayerPrivateMediaFoundation& m_player;
+    MediaPlayerPrivateMediaFoundation* m_player; // nulled by clearPlayer() when the player dies first
     MediaSourcePrivateClient& m_client;
     void* m_srcHandle { nullptr }; // MseStreamSource (shell side)
     Vector<RefPtr<SourceBufferPrivateMediaFoundation>> m_sourceBuffers;

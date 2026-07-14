@@ -8,12 +8,18 @@
 
 namespace WebCore {
 
-// Monitors whose notification mechanism is currently STARTED (WebCore wants refresh ticks). WebCore
-// idle-throttles by calling stopNotificationMechanism() when there's no pending animation/rAF work,
-// which removes the monitor here so we stop ticking it until it re-registers. Created/destroyed and
-// ticked on the main thread; the lock guards against the (rare) off-thread displayLinkFired contract.
+// ALL live monitors (constructed but not yet destroyed). We drive the display link ALWAYS-ON: every
+// monitor is ticked every frame, exactly like a real 60Hz hardware display link. WebCore's
+// start/stopNotificationMechanism is only a power hint — but our tick already runs every frame via
+// CompositionTarget::Rendering at zero extra cost, and DisplayRefreshMonitor::displayLinkFired
+// self-throttles (it dispatches for maxUnscheduledFireCount idle frames, then early-returns). The old
+// design fired ONLY started monitors; when the page went idle WebCore stopped the mechanism, and a
+// subsequent JS-driven rendering update (e.g. YouTube's client-side route change to /shorts) failed
+// to reliably resume ticks, so the new content never laid out/composited (blank until a full reload).
+// Ticking every live monitor closes that gap. Created/destroyed + ticked on the main thread; the lock
+// guards the (rare) off-thread displayLinkFired contract.
 static Lock s_activeLock;
-static HashSet<PortDisplayRefreshMonitor*>& activeMonitors()
+static HashSet<PortDisplayRefreshMonitor*>& allMonitors()
 {
     static NeverDestroyed<HashSet<PortDisplayRefreshMonitor*>> set;
     return set.get();
@@ -28,25 +34,25 @@ PortDisplayRefreshMonitor::PortDisplayRefreshMonitor(PlatformDisplayID displayID
     : DisplayRefreshMonitor(displayID)
     , m_currentUpdate({ 0, 60 }) // 60 fps display
 {
+    Locker locker { s_activeLock };
+    allMonitors().add(this);
 }
 
 PortDisplayRefreshMonitor::~PortDisplayRefreshMonitor()
 {
     Locker locker { s_activeLock };
-    activeMonitors().remove(this);
+    allMonitors().remove(this);
 }
 
+// start/stop are WebCore's power hints only; we tick every live monitor regardless (always-on link).
+// displayLinkFired self-throttles idle frames, so this costs nothing on a static page.
 bool PortDisplayRefreshMonitor::startNotificationMechanism()
 {
-    Locker locker { s_activeLock };
-    activeMonitors().add(this);
     return true;
 }
 
 void PortDisplayRefreshMonitor::stopNotificationMechanism()
 {
-    Locker locker { s_activeLock };
-    activeMonitors().remove(this);
 }
 
 void PortDisplayRefreshMonitor::fireVsync()
@@ -80,8 +86,8 @@ extern "C" void WebCoreBrowserVsyncTick()
     Vector<RefPtr<PortDisplayRefreshMonitor>> monitors;
     {
         Locker locker { s_activeLock };
-        monitors.reserveInitialCapacity(activeMonitors().size());
-        for (auto* monitor : activeMonitors())
+        monitors.reserveInitialCapacity(allMonitors().size());
+        for (auto* monitor : allMonitors())
             monitors.append(monitor);
     }
     for (auto& monitor : monitors)

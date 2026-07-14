@@ -41,6 +41,20 @@ private:
     void setReadyState(MediaPlayer::ReadyState state) final { m_readyState = state; }
     void setActive(bool) final;
 
+    // Track buffers are ALWAYS EMPTY on this backend (the WinRT MseSourceBuffer demuxes internally;
+    // WebCore never sees samples), so every base-class algorithm that derives state from them must be
+    // overridden or it clobbers the real state:
+    //  - updateBufferedFromTrackBuffers: called from SourceBuffer::readyStateChanged (MediaSource
+    //    open/ended!), appendCompleted and removeCodedFrames. The base wiped .buffered to EMPTY, so
+    //    MediaSource::endOfStream() computed duration=0 -> the 'ended' event never fired -> YouTube
+    //    hung forever at the ad -> content splice. Reassert the WinRT buffer's real ranges instead.
+    //  - removeCodedFrames: forward to the WinRT buffer's own Remove() (async; completes on its
+    //    UpdateEnded), then refresh ranges.
+    //  - evictCodedFrames: no-op; the WinRT source manages its own buffer memory.
+    void updateBufferedFromTrackBuffers(bool sourceIsEnded) final;
+    void removeCodedFrames(const MediaTime& start, const MediaTime& end, const MediaTime& currentMediaTime, bool isEnded, CompletionHandler<void()>&&) final;
+    void evictCodedFrames(uint64_t newDataSize, uint64_t maximumBufferSize, const MediaTime& currentTime, const MediaTime& duration, bool isEnded) final;
+
     void pushBufferedRanges();
 
     MediaSourcePrivateMediaFoundation* m_mediaSource { nullptr };
@@ -50,6 +64,10 @@ private:
     bool m_isVideo { false };
     String m_codecs;
     bool m_initReported { false }; // report the synthetic init segment exactly once (first append)
+    int m_appendSeq { 0 };         // diag: count appends we forward to the WinRT buffer
+    bool m_appendInFlight { false }; // diag: distinguish a real post-append UpdateEnded from a spurious one
+    bool m_removeInFlight { false }; // a WinRT Remove() is pending; its UpdateEnded completes it
+    CompletionHandler<void()> m_removeCompletion; // WebCore's coded-frame-removal completion
 };
 
 } // namespace WebCore

@@ -12,6 +12,9 @@
 
 #include "config.h"
 
+#if ENABLE(WEB_AUDIO)
+#include "AudioDestination.h"
+#endif
 #include "BlobRegistry.h"
 #include "BlobRegistryImpl.h"
 #include "LoaderStrategy.h"
@@ -78,7 +81,20 @@ class PortPlatformStrategies final : public PlatformStrategies {
     // subresources so never touches it; URL loads (WebCoreRenderUrl) drive it.
     LoaderStrategy* createLoaderStrategy() final { return new WebResourceLoadScheduler; }
     PasteboardStrategy* createPasteboardStrategy() final { return nullptr; } // render never touches the pasteboard
-    MediaStrategy* createMediaStrategy() final { class PortMediaStrategy final : public MediaStrategy { }; return new PortMediaStrategy; }
+    MediaStrategy* createMediaStrategy() final
+    {
+        class PortMediaStrategy final : public MediaStrategy {
+#if ENABLE(WEB_AUDIO)
+            // WEB_AUDIO adds a pure-virtual createAudioDestination to MediaStrategy;
+            // forward to the WASAPI backend (platform/audio/win/AudioDestinationWinUWP).
+            Ref<AudioDestination> createAudioDestination(AudioIOCallback& callback, const String& inputDeviceId, unsigned numberOfInputChannels, unsigned numberOfOutputChannels, float sampleRate) final
+            {
+                return AudioDestination::create(callback, inputDeviceId, numberOfInputChannels, numberOfOutputChannels, sampleRate);
+            }
+#endif
+        };
+        return new PortMediaStrategy;
+    }
     BlobRegistry* createBlobRegistry() final { return new PortBlobRegistry; }
 };
 

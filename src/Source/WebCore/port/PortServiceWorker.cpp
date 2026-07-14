@@ -742,8 +742,12 @@ PageIdentifier PortSWContextManagerConnection::pageIdentifier() const
 
 // ---------------------------------------------------------------------------
 // PortServiceWorkerFetchClient — SW FetchEvent result -> WebCore ResourceLoader.
-// The SW runs on the main thread (shouldRunServiceWorkersOnMainThreadForTesting),
-// so these callbacks arrive on the main thread and can drive the loader directly.
+// The SW runs on its own worker thread, so ServiceWorkerFetch invokes these
+// callbacks ON THE WORKER THREAD. m_loader is a main-thread-only ResourceLoader,
+// so every callback marshals to the main thread via callOnMainThread. The base
+// (ServiceWorkerFetch::Client) is ThreadSafeRefCounted with main-thread
+// destruction, so Ref { *this } is safe to carry across the hop, and m_loader is
+// only ever touched inside the main-thread lambdas (no cross-thread races).
 // ---------------------------------------------------------------------------
 PortServiceWorkerFetchClient::PortServiceWorkerFetchClient(ResourceLoader& loader)
     : m_loader(&loader)
@@ -752,9 +756,11 @@ PortServiceWorkerFetchClient::PortServiceWorkerFetchClient(ResourceLoader& loade
 
 void PortServiceWorkerFetchClient::didReceiveResponse(const ResourceResponse& response)
 {
-    ASSERT(isMainThread());
-    if (m_loader)
-        m_loader->didReceiveResponse(response, [] { });
+    // ResourceResponse has no isolatedCopy(); use crossThreadData()/fromCrossThreadData().
+    callOnMainThread([protectedThis = Ref { *this }, responseData = response.crossThreadData()]() mutable {
+        if (protectedThis->m_loader)
+            protectedThis->m_loader->didReceiveResponse(ResourceResponse::fromCrossThreadData(WTFMove(responseData)), [] { });
+    });
 }
 
 void PortServiceWorkerFetchClient::didReceiveRedirection(const ResourceResponse&)
@@ -766,9 +772,11 @@ void PortServiceWorkerFetchClient::didReceiveRedirection(const ResourceResponse&
 
 void PortServiceWorkerFetchClient::didReceiveData(const SharedBuffer& buffer)
 {
-    ASSERT(isMainThread());
-    if (m_loader)
-        m_loader->didReceiveBuffer(buffer, buffer.size(), DataPayloadBytes);
+    // SharedBuffer is immutable + ThreadSafeRefCounted, so a Ref carries safely to main.
+    callOnMainThread([protectedThis = Ref { *this }, protectedBuffer = Ref { const_cast<SharedBuffer&>(buffer) }] {
+        if (protectedThis->m_loader)
+            protectedThis->m_loader->didReceiveBuffer(protectedBuffer.get(), protectedBuffer->size(), DataPayloadBytes);
+    });
 }
 
 void PortServiceWorkerFetchClient::didReceiveFormDataAndFinish(Ref<FormData>&&)
@@ -779,16 +787,18 @@ void PortServiceWorkerFetchClient::didReceiveFormDataAndFinish(Ref<FormData>&&)
 
 void PortServiceWorkerFetchClient::didFail(const ResourceError& error)
 {
-    ASSERT(isMainThread());
-    if (auto loader = std::exchange(m_loader, nullptr))
-        loader->didFail(error);
+    callOnMainThread([protectedThis = Ref { *this }, error = error.isolatedCopy()] {
+        if (auto loader = std::exchange(protectedThis->m_loader, nullptr))
+            loader->didFail(error);
+    });
 }
 
 void PortServiceWorkerFetchClient::didFinish(const NetworkLoadMetrics& metrics)
 {
-    ASSERT(isMainThread());
-    if (auto loader = std::exchange(m_loader, nullptr))
-        loader->didFinishLoading(metrics);
+    callOnMainThread([protectedThis = Ref { *this }, metrics = metrics.isolatedCopy()] {
+        if (auto loader = std::exchange(protectedThis->m_loader, nullptr))
+            loader->didFinishLoading(metrics);
+    });
 }
 
 void PortServiceWorkerFetchClient::didNotHandle()
@@ -799,8 +809,10 @@ void PortServiceWorkerFetchClient::didNotHandle()
 
 void PortServiceWorkerFetchClient::cancel()
 {
-    if (auto loader = std::exchange(m_loader, nullptr))
-        loader->cancel();
+    callOnMainThread([protectedThis = Ref { *this }] {
+        if (auto loader = std::exchange(protectedThis->m_loader, nullptr))
+            loader->cancel();
+    });
 }
 
 void PortServiceWorkerFetchClient::continueDidReceiveResponse()
@@ -811,15 +823,18 @@ void PortServiceWorkerFetchClient::continueDidReceiveResponse()
 void PortServiceWorkerFetchClient::convertFetchToDownload()
 {
     // Downloads from a SW-intercepted fetch are not supported in this port.
-    if (auto loader = std::exchange(m_loader, nullptr))
-        loader->cancel();
+    callOnMainThread([protectedThis = Ref { *this }] {
+        if (auto loader = std::exchange(protectedThis->m_loader, nullptr))
+            loader->cancel();
+    });
 }
 
 void PortServiceWorkerFetchClient::fallThroughToNetwork()
 {
-    ASSERT(isMainThread());
-    if (auto loader = std::exchange(m_loader, nullptr))
-        loader->start();
+    callOnMainThread([protectedThis = Ref { *this }] {
+        if (auto loader = std::exchange(protectedThis->m_loader, nullptr))
+            loader->start();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +912,7 @@ void installPortServiceWorkerProvider()
     // s_portSWServer (file scope) lets the SWServer callbacks + the loader fetch hook
     // reach the server without a dangling capture.
     s_portSWServer = new SWServer(makeUniqueRef<PortSWOriginStore>(), /* processTerminationDelayEnabled */ true, String { }, sessionID,
-        /* shouldRunServiceWorkersOnMainThreadForTesting */ true, /* hasServiceWorkerEntitlement */ true,
+        /* shouldRunServiceWorkersOnMainThreadForTesting */ false, /* hasServiceWorkerEntitlement */ true,
         // SoftUpdateCallback — soft update not wired yet.
         [](ServiceWorkerJobData&&, bool, ResourceRequest&&, CompletionHandler<void(const WorkerFetchResult&)>&& completionHandler) {
             completionHandler(WorkerFetchResult { });

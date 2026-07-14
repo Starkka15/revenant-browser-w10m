@@ -11,6 +11,7 @@
 #include "VideoTrackPrivate.h"
 #include "InbandTextTrackPrivate.h"
 #include "MediaDescription.h"
+#include <wtf/MainThread.h>
 #include <wtf/text/AtomString.h>
 
 extern void PortImgLog(const char*);
@@ -70,12 +71,34 @@ void SourceBufferPrivateMediaFoundation::append(Vector<uint8_t>&& data)
     // Log the top-level fMP4 box type (bytes 4..8) so we can tell init (ftyp/moov) from media (moof/mdat/sidx/styp).
     { char box[5] = "----";
       if (data.size() >= 8) { box[0] = data[4]; box[1] = data[5]; box[2] = data[6]; box[3] = data[7]; }
-      char b[80]; snprintf(b, sizeof b, "mse: append %d bytes box=%s", (int)data.size(), box); PortImgLog(b); }
+      char b[96]; snprintf(b, sizeof b, "mse: append#%d %d bytes box=%s isVideo=%d", ++m_appendSeq, (int)data.size(), box, m_isVideo ? 1 : 0); PortImgLog(b); }
+    m_appendInFlight = true;
     PortMseAppend(m_sbHandle, data.data(), static_cast<int>(data.size()));
 }
 
 void SourceBufferPrivateMediaFoundation::onUpdateEnded()
 {
+    // A WinRT Remove() we issued (removeCodedFrames) completes with an UpdateEnded too: refresh the
+    // (now smaller) real ranges and run WebCore's removal completion (fires updateend on the JS side).
+    if (m_removeInFlight) {
+        m_removeInFlight = false;
+        pushBufferedRanges();
+        if (auto completion = WTFMove(m_removeCompletion))
+            completion();
+        return;
+    }
+    // Every other legitimate WinRT UpdateEnded is the completion of an AppendBuffer WE issued. A
+    // UpdateEnded with NO append in flight is therefore not an append completion — it's the
+    // MediaEngine's own activity (e.g. the autoplay seek-to-0 flushing the MseSourceBuffer), during
+    // which Buffered momentarily reads 0. If we ran pushBufferedRanges() here we would overwrite
+    // WebCore's valid .buffered (0..6s) with EMPTY — which is exactly what froze YouTube ads: the page
+    // sees its buffer vanish a frame after playback starts, the MediaEngine starves, and it never
+    // resumes. Ignore it: do NOT push ranges and do NOT fire appendComplete (nothing is awaiting one).
+    if (!m_appendInFlight) {
+        PortImgLog("mse: ignoring spurious UpdateEnded (no append in flight) - preserving buffered ranges");
+        return;
+    }
+    m_appendInFlight = false;
     // On the first append (the init segment), report the track to WebCore so the element reaches
     // HAVE_METADATA / fires loadedmetadata. Without this, players like YouTube append the init
     // segment then wait forever, never sending media. We synthesize the InitializationSegment from
@@ -135,6 +158,7 @@ void SourceBufferPrivateMediaFoundation::pushBufferedRanges()
 
 void SourceBufferPrivateMediaFoundation::abort()
 {
+    PortImgLog("mse: abort() -> PortMseAbort (may clear buffered)");
     if (m_sbHandle)
         PortMseAbort(m_sbHandle);
 }
@@ -143,12 +167,14 @@ void SourceBufferPrivateMediaFoundation::resetParserState()
 {
     // WinRT MseSourceBuffer has no explicit parser-reset; Abort() discards the pending append,
     // which is the closest equivalent.
+    PortImgLog("mse: resetParserState() -> PortMseAbort (may clear buffered)");
     if (m_sbHandle)
         PortMseAbort(m_sbHandle);
 }
 
 void SourceBufferPrivateMediaFoundation::removedFromMediaSource()
 {
+    PortImgLog("mse: removedFromMediaSource()");
     m_sbHandle = nullptr; // owned by the MseStreamSource; just drop our borrowed handle
 }
 
@@ -157,19 +183,64 @@ void SourceBufferPrivateMediaFoundation::setActive(bool active)
     m_active = active;
 }
 
+void SourceBufferPrivateMediaFoundation::updateBufferedFromTrackBuffers(bool)
+{
+    // The base recomputes .buffered from WebCore track buffers — always empty here (the WinRT source
+    // demuxes internally), so it wiped the real ranges to EMPTY. Called from SourceBuffer::
+    // readyStateChanged when the MediaSource transitions to 'ended': endOfStream() then computed
+    // duration = highest buffered end = 0 and the element could never fire 'ended' (endedPlayback()
+    // requires duration > 0) — the YouTube ad -> content splice hang. The WinRT buffer is the single
+    // source of truth for buffered ranges; reassert it.
+    pushBufferedRanges();
+}
+
+void SourceBufferPrivateMediaFoundation::removeCodedFrames(const MediaTime& start, const MediaTime& end, const MediaTime&, bool, CompletionHandler<void()>&& completionHandler)
+{
+    { char b[96]; snprintf(b, sizeof b, "mse: remove %.2f..%.2f", start.toDouble(), end.isPositiveInfinite() ? -1.0 : end.toDouble()); PortImgLog(b); }
+    if (!m_sbHandle) {
+        completionHandler();
+        return;
+    }
+    // Real removal happens in the WinRT MseSourceBuffer (it owns the demuxed frames). Async: its
+    // UpdateEnded fires when done; onUpdateEnded() refreshes ranges and runs this completion.
+    m_removeInFlight = true;
+    m_removeCompletion = WTFMove(completionHandler);
+    PortMseRemove(m_sbHandle, start.toDouble(), end.isPositiveInfinite() ? -1.0 : end.toDouble());
+}
+
+void SourceBufferPrivateMediaFoundation::evictCodedFrames(uint64_t, uint64_t, const MediaTime&, const MediaTime&, bool)
+{
+    // The WinRT MseStreamSource manages its own buffer memory; the base implementation evicts from
+    // WebCore track buffers (empty) and would wipe .buffered via updateBufferedFromTrackBuffers.
+}
+
 } // namespace WebCore
 
 // ---- C ABI callbacks from the shell's WinRT MseSourceBuffer events ----
+// These fire on a WinRT threadpool/MTA thread (the async decode completion), NOT the
+// WebCore main thread. onUpdateEnded/onErrored drive track setup -> DOM event queueing
+// -> WindowEventLoop -> TimerBase::setNextFireTime, which RELEASE_ASSERTs main-thread
+// affinity (abort otherwise — YouTube crashed here right after the audio init segment).
+// Marshal to the main thread; the raw ctx is valid because an append is in flight (WebCore
+// won't destroy the SourceBuffer until we call sourceBufferPrivateAppendComplete), and the
+// protectedThis Ref is taken on the main thread inside the handler (SourceBufferPrivate is
+// RefCounted, not thread-safe — no cross-thread ref/deref).
 extern "C" void WebCoreMseSbUpdateEnded(void* sbCtx)
 {
-    if (sbCtx)
+    if (!sbCtx)
+        return;
+    callOnMainThread([sbCtx] {
         static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onUpdateEnded();
+    });
 }
 
 extern "C" void WebCoreMseSbErrored(void* sbCtx, int hr)
 {
-    if (sbCtx)
+    if (!sbCtx)
+        return;
+    callOnMainThread([sbCtx, hr] {
         static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onErrored(hr);
+    });
 }
 
 #endif // ENABLE(MEDIA_SOURCE)

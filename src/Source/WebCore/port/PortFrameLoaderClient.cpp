@@ -11,6 +11,32 @@
 // ============================================================================
 
 #include "config.h"
+#include <atomic>
+#include "Document.h"
+
+#include <wtf/URL.h>
+
+// Per-site identity (defined below, next to userAgent): YouTube gets a Chrome/Android identity so it
+// serves CLEAR MSE instead of FairPlay-DRM HLS; everything else keeps iOS Safari.
+namespace WebCorePort {
+
+bool urlWantsChromeIdentity(const WTF::URL& url)
+{
+    auto host = url.host();
+    auto is = [&](const char* domain) {
+        return equalIgnoringASCIICase(host, domain) || host.endsWithIgnoringASCIICase(makeString('.', domain));
+    };
+    return is("youtube.com") || is("youtu.be") || is("googlevideo.com") || is("youtube-nocookie.com");
+}
+
+// The identity of the CURRENT PAGE, for the JS-visible surface (navigator.platform/vendor), which has
+// no URL argument to key off. Set when the main frame commits a load.
+static std::atomic<bool> g_pageUsesChromeIdentity { false };
+void setPageUsesChromeIdentity(bool v) { g_pageUsesChromeIdentity.store(v, std::memory_order_relaxed); }
+bool pageUsesChromeIdentity() { return g_pageUsesChromeIdentity.load(std::memory_order_relaxed); }
+
+} // namespace WebCorePort
+
 #include "PortFrameLoaderClient.h"
 
 // Implemented in the C++/CX shell: shows/hides the on-screen keyboard via Windows InputPane.
@@ -22,6 +48,7 @@ extern "C" void PortShowKeyboard(int show);
 #include "FrameView.h"
 #include "FrameLoader.h"
 #include "FrameTree.h"
+#include "ScriptController.h"
 #include "HTMLFrameOwnerElement.h"
 #include "FrameLoaderClient.h"
 #include "CookieJarDB.h"
@@ -344,6 +371,16 @@ void PortFrameLoaderClient::dispatchDidReceiveTitle(const StringWithDirection&)
 void PortFrameLoaderClient::dispatchDidCommitLoad(std::optional<HasInsecureContent>, std::optional<UsedLegacyTLS>)
 {
     { int m = (m_frame && m_frame->isMainFrame()) ? 1 : 0; char b[64]; snprintf(b, sizeof b, "client: didCommitLoad isMain=%d", m); portLog(b); }
+    // Keep the JS-visible identity (navigator.platform/vendor) coherent with the UA we send for this
+    // site. Main frame only: subframes must not flip the whole page's identity.
+    if (m_frame && m_frame->isMainFrame()) {
+        if (RefPtr document = m_frame->document()) {
+            bool chrome = WebCorePort::urlWantsChromeIdentity(document->url());
+            WebCorePort::setPageUsesChromeIdentity(chrome);
+            char b[80]; snprintf(b, sizeof b, "identity: %s", chrome ? "Chrome/Android (YouTube: clear MSE, no FairPlay)" : "iOS 15.4 Safari");
+            portLog(b);
+        }
+    }
 }
 
 void PortFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceError& error, WillContinueLoading willContinue)
@@ -583,17 +620,50 @@ void PortFrameLoaderClient::setTitle(const StringWithDirection&, const URL&)
 {
 }
 
+// ---- Per-site identity ----------------------------------------------------------------------
+// Revenant's default identity is iOS 15.4 Safari (see the note in userAgent below) — the honest match
+// for this engine, and what solved Cloudflare Turnstile.
+//
+// But YouTube keys its DELIVERY FORMAT off that identity: to an iPhone it serves the main video as
+// native HLS whose manifest carries #EXT-X-KEY with a FairPlay key URI (skd://www.youtube.com/api/drm/
+// fps). FairPlay keys are only ever issued to genuine Apple hardware — no CDM exists on Windows, the
+// skd:// fetch returns E_NOTIMPL — so the decoder never gets its key and the player stays BLACK forever.
+// (Verified on-device: the ads, which are delivered as CLEAR MSE fMP4, play perfectly; only the main
+// video takes the HLS+FairPlay path.) Refusing HLS via canPlayType does NOT help: YouTube's iOS player
+// sets video.src to the .m3u8 without ever consulting canPlayType.
+//
+// So on YouTube (and its media hosts) we present as Chrome on Android instead — the client YouTube
+// serves CLEAR fMP4 over MSE, the exact path that already plays end-to-end here. Everywhere else keeps
+// the iOS identity. Identity means UA *plus* the JS surface: navigator.platform and navigator.vendor
+// are switched to match (see Navigator::platform / NavigatorBase::vendor), because a Chrome UA paired
+// with an Apple vendor is an incoherent combo no real device reports — exactly the bot-tell we avoid
+// everywhere else. TLS/JA3 is unaffected (the BoringSSL ClientHello profile is orthogonal, and Google
+// does not gate youtube.com on it).
+
 String PortFrameLoaderClient::userAgent(const URL& url) const
 {
-    // Revenant identity: Chromium-on-ANDROID mobile UA with our own product token. A "Windows NT"
-    // UA (even with a "Mobile" hint) makes UA-sniffing sites serve DESKTOP layout — no good on a
-    // phone. An Android/Mobile UA reliably triggers mobile layout AND is fingerprint-consistent with
-    // our real GPU (Qualcomm Adreno = an Android-class GPU), which also helps Cloudflare Turnstile.
-    // NOTE: Chrome normally sends Sec-CH-UA client hints; we don't yet — if strict fingerprinters
-    // flag that, adding matching Sec-CH-UA request headers is the follow-up.
-    // TODO: make UA a user-configurable per-site setting (mobile/desktop toggle) in the UI phase.
+    // YouTube: Chrome/Android, to be served CLEAR MSE instead of FairPlay-DRM HLS (see note above).
+    if (WebCorePort::urlWantsChromeIdentity(url))
+        return "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"_s;
+
+    // Revenant identity: iOS 15.4 Safari — the HONEST reflection of our actual engine. WebKit 2.36.8
+    // IS the Safari-15.4 branch (AppleWebKit/605.1.15, Version/15.4); on iOS that engine ships with the
+    // exact fingerprint our port already produces with ZERO spoofing: navigator.vendor="Apple Computer,
+    // Inc.", no window.chrome, no navigator.userAgentData, no navigator.oscpu, maxTouchPoints=5. So this
+    // is not a costume — it is what the engine genuinely is. Coherence is the whole point: a fingerprint
+    // whose UA, platform (navigator.platform="iPhone", see NavigatorBase), vendor and JS-surface all agree
+    // is what passes Cloudflare Turnstile's bot-scoring and Google's support gate.
+    //
+    // History: we previously tried (a) X11/Linux desktop — but navigator.platform="Linux x86_64" with an
+    // Apple vendor + a Mobile UA is a combo no real device reports, a dead bot-tell; (b) a Windows-Phone/
+    // Lumia envelope to dodge the Cloudflare Private Access Token (PAT) challenge — but on-device logs
+    // showed CF issues PAT (401 WWW-Authenticate: PrivateToken) REGARDLESS of UA, and WP+Safari is itself
+    // an impossible combo Google flags as unsupported. Neither cohered. iOS Safari is the one identity
+    // that matches the engine end-to-end. PAT stays unanswerable (we can't mint Apple DeviceCheck tokens),
+    // but PAT is opportunistic — CF falls back to the interactive Turnstile path when it goes unanswered.
+    // The "Mobile/15E148" build token + Safari/604.1 are the real iOS-15.4 constants (not inflated).
     UNUSED_PARAM(url);
-    return "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36 Revenant/1.0"_s;
+    return "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Mobile/15E148 Safari/604.1"_s;
 }
 
 void PortFrameLoaderClient::savePlatformDataToCachedFrame(CachedFrame*)
@@ -690,6 +760,71 @@ void PortFrameLoaderClient::redirectDataToPlugin(Widget&)
 
 void PortFrameLoaderClient::dispatchDidClearWindowObjectInWorld(DOMWrapperWorld&)
 {
+    // FPDIAG (diagnostic — keep until CF challenge passes): dump the JS-visible fingerprint surface
+    // that Cloudflare Turnstile scores, from inside each frame's own JS world, so we can diff our
+    // engine's values against a real WebKit/Safari and close every "not a real browser" tell. Uses
+    // console.warn because the port's console bridge only forwards Error/Warning (PortChromeClient).
+    // The dedupe flag is defined non-enumerable so it doesn't itself become a fingerprint signal.
+    if (!m_frame)
+        return;
+    m_frame->script().executeScriptIgnoringException(String::fromUTF8(R"FPJS(
+(function(){try{
+ if(window.__fpd)return;try{Object.defineProperty(window,'__fpd',{value:1,enumerable:false,configurable:false,writable:false});}catch(e){window.__fpd=1;}
+ var h=(location&&location.hostname)||'?';
+ if(location&&/^(about:|data:|blob:)/.test(location.protocol||'')){return;}
+ var W=function(m){try{console.warn('FPDIAG['+h+']: '+m)}catch(e){}};
+ function nav(){var n=navigator,s=screen;
+  W('ua='+n.userAgent);
+  W('platform='+n.platform+' vendor='+n.vendor+' vendorSub='+n.vendorSub+' product='+n.product+' productSub='+n.productSub+' oscpu='+n.oscpu);
+  W('appName='+n.appName+' appCodeName='+n.appCodeName+' appVersion='+n.appVersion);
+  W('webdriver='+n.webdriver+' lang='+n.language+' langs='+((n.languages||[]).join(','))+' hwc='+n.hardwareConcurrency+' devmem='+n.deviceMemory+' maxTouch='+n.maxTouchPoints+' cookieEnabled='+n.cookieEnabled+' dnt='+n.doNotTrack+' pdfViewer='+n.pdfViewerEnabled);
+  W('plugins='+(n.plugins?n.plugins.length:'?')+' mimeTypes='+(n.mimeTypes?n.mimeTypes.length:'?'));
+  W('uaData='+(n.userAgentData?('mobile='+n.userAgentData.mobile+' platform='+n.userAgentData.platform):'undefined'));
+  W('screen='+s.width+'x'+s.height+' avail='+s.availWidth+'x'+s.availHeight+' depth='+s.colorDepth+'/'+s.pixelDepth+' dpr='+window.devicePixelRatio+' inner='+window.innerWidth+'x'+window.innerHeight+' outer='+window.outerWidth+'x'+window.outerHeight);
+  W('typeofChrome='+(typeof window.chrome)+' RTC='+(typeof window.RTCPeerConnection)+' webkitRTC='+(typeof window.webkitRTCPeerConnection)+' Notif='+(typeof window.Notification)+(window.Notification?(' perm='+Notification.permission):''));
+  try{W('tz='+Intl.DateTimeFormat().resolvedOptions().timeZone+' tzoff='+(new Date()).getTimezoneOffset())}catch(e){W('tz-ERR '+e)}
+  try{W('alertNative='+/\[native code\]/.test(window.alert.toString())+' fnToStr='+(function(){}).toString().slice(0,40))}catch(e){W('tostr-ERR '+e)}
+  try{W('errstack0='+((new Error('x')).stack||'').split('\n')[0])}catch(e){}
+ }
+ function gl(){try{
+  var c=document.createElement('canvas');var g=c.getContext('webgl')||c.getContext('experimental-webgl');
+  if(!g){W('webgl=NULL');return;}
+  W('webgl VENDOR='+g.getParameter(g.VENDOR)+' RENDERER='+g.getParameter(g.RENDERER));
+  W('webgl VERSION='+g.getParameter(g.VERSION)+' GLSL='+g.getParameter(g.SHADING_LANGUAGE_VERSION));
+  var d=g.getExtension('WEBGL_debug_renderer_info');
+  if(d)W('webgl UNMASKED_VENDOR='+g.getParameter(d.UNMASKED_VENDOR_WEBGL)+' UNMASKED_RENDERER='+g.getParameter(d.UNMASKED_RENDERER_WEBGL));
+  else W('webgl UNMASKED=NOEXT');
+  W('webgl MAXTEX='+g.getParameter(g.MAX_TEXTURE_SIZE)+' extCount='+((g.getSupportedExtensions()||[]).length));
+ }catch(e){W('webgl-ERR '+e)}}
+ function cv(){try{
+  var c=document.createElement('canvas');c.width=220;c.height=30;var x=c.getContext('2d');
+  x.textBaseline='top';x.font='14px Arial';x.fillStyle='#f60';x.fillRect(0,0,110,20);x.fillStyle='#069';x.fillText('Revenant fp',2,15);
+  var u=c.toDataURL();var k=0;for(var i=0;i<u.length;i++){k=((k<<5)-k+u.charCodeAt(i))|0;}
+  W('canvas2d len='+u.length+' hash='+k);
+ }catch(e){W('canvas2d-ERR '+e)}}
+ function rtc(){try{
+  if(typeof RTCPeerConnection!=='function'){W('RTC: NO RTCPeerConnection ctor (typeof='+(typeof RTCPeerConnection)+')');return;}
+  var pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  W('RTC: pc created ok signalingState='+pc.signalingState+' iceGatheringState='+pc.iceGatheringState);
+  var cands=[];
+  pc.onicecandidate=function(e){
+    if(e&&e.candidate&&e.candidate.candidate){cands.push(e.candidate.candidate);}
+    else{W('RTC: ICE onicecandidate=null (end-of-candidates) count='+cands.length);}
+  };
+  pc.onicegatheringstatechange=function(){W('RTC: gatheringState='+pc.iceGatheringState+' count='+cands.length);};
+  try{pc.createDataChannel('probe');W('RTC: dataChannel created');}catch(e){W('RTC dc-ERR '+e);}
+  pc.createOffer().then(function(o){W('RTC: offer created type='+o.type+' sdpLen='+(o.sdp?o.sdp.length:0)+' hasIceUfrag='+(/a=ice-ufrag/.test(o.sdp||'')));return pc.setLocalDescription(o);})
+    .then(function(){W('RTC: setLocalDescription ok, gathering...');})
+    .catch(function(e){W('RTC offer-ERR '+e);});
+  setTimeout(function(){W('RTC: +8s candidates='+cands.length+' gatheringState='+pc.iceGatheringState);
+    for(var i=0;i<cands.length&&i<6;i++)W('RTC cand#'+i+'='+cands[i]);},8000);
+ }catch(e){W('RTC-ERR '+e)}}
+ function run(){nav();gl();cv();rtc();W('END');}
+ if(document&&document.readyState!=='loading')run();
+ else if(document)document.addEventListener('DOMContentLoaded',run);
+ else setTimeout(run,50);
+}catch(e){try{console.warn('FPDIAG-FATAL '+e)}catch(_){}}})();
+)FPJS"), false);
 }
 
 #if PLATFORM(COCOA)

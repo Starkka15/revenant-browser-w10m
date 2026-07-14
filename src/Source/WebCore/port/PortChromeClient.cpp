@@ -10,8 +10,14 @@
 #include "CookieConsentDecisionResult.h"
 #include "DataListSuggestionPicker.h"
 #include "DateTimeChooser.h"
+#include "Document.h"
 #include "Element.h"
+#include "FullscreenManager.h"
 #include "ModalContainerTypes.h"
+
+namespace WebCorePort { void portLog(const char*); }
+using WebCorePort::portLog;
+extern "C" void WebCoreBrowserKeepCompositing(unsigned frames);
 
 // Implemented in the C++/CX shell: shows/hides the on-screen keyboard via Windows InputPane.
 extern "C" void PortShowKeyboard(int show);
@@ -58,6 +64,41 @@ DisplayRefreshMonitorFactory* PortChromeClient::displayRefreshMonitorFactory() c
 
 void PortChromeClient::runOpenPanel(Frame&, FileChooser&) { }
 void PortChromeClient::showShareSheet(ShareDataWithParsedURL&, CompletionHandler<void(bool)>&& callback) { callback(false); }
+
+#if ENABLE(FULLSCREEN_API)
+// Drive WebCore's FullscreenManager state machine. The manager has already done the spec checks
+// (user gesture, fullscreen-enabled, element eligibility) before calling us; our job is to perform
+// the "transition" and report back. Our window is already the whole screen, so there is nothing
+// native to do — willEnterFullscreen() applies the fullscreen element/styles (the element is laid
+// out at viewport size, with the ::backdrop behind it), and didEnterFullscreen() fires
+// fullscreenchange so the page's JS (YouTube's player) completes its own transition and tears down
+// its scrim. Calling these SYNCHRONOUSLY is correct: there is no async native animation to await.
+void PortChromeClient::enterFullScreenForElement(Element& element)
+{
+    portLog("fullscreen: enter");
+    auto& manager = element.document().fullscreenManager();
+    if (!manager.willEnterFullscreen(element)) {
+        portLog("fullscreen: willEnterFullscreen REFUSED");
+        return;
+    }
+    manager.didEnterFullscreen();
+    WebCoreBrowserKeepCompositing(30); // repaint the relaid-out page
+}
+
+void PortChromeClient::exitFullScreenForElement(Element* element)
+{
+    if (!element)
+        return;
+    portLog("fullscreen: exit");
+    auto& manager = element->document().fullscreenManager();
+    if (!manager.willExitFullscreen()) {
+        portLog("fullscreen: willExitFullscreen REFUSED");
+        return;
+    }
+    manager.didExitFullscreen();
+    WebCoreBrowserKeepCompositing(30);
+}
+#endif
 
 void PortChromeClient::requestCookieConsent(CompletionHandler<void(CookieConsentDecisionResult)>&& completion) { completion(CookieConsentDecisionResult::NotSupported); }
 void PortChromeClient::classifyModalContainerControls(Vector<String>&&, CompletionHandler<void(Vector<ModalContainerControlType>&&)>&& completion) { completion({ }); }

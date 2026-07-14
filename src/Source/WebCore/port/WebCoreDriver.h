@@ -31,7 +31,7 @@ int WebCoreBrowserInit(void* coreWindow, const char* url, double deviceScale);
 // Pump WebCore + present the current page state to the CoreWindow (call per frame).
 void WebCoreBrowserRenderFrame();
 // Input: scroll by device pixels (touch drag); tap = synthetic click at device pixels.
-void WebCoreBrowserScrollBy(int dx, int dy);
+void WebCoreBrowserScrollBy(int dx, int dy, int x, int y);
 void WebCoreBrowserTap(int x, int y);
 
 #ifdef __cplusplus

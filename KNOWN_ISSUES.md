@@ -8,11 +8,24 @@ File paths are relative to the WebKit tree (`WebKit-2.36.8/`) after applying the
 
 ---
 
-## 1. Fetch `NetworkError` on streaming responses  ·  impact: high  ·  difficulty: medium
-**Symptom:** large / long-lived streaming `response.body` fetches intermittently fail with a JS
-`NetworkError: A network error occurred`, even when the underlying transfer reports success. This is
-the main thing making video (and other streaming/heavy sites) unreliable — YouTube's media reader
-gives up when its stream ends early/wrong.
+## 1. Some videos may not play (native HLS)  ·  impact: high  ·  difficulty: medium
+**State:** progressive MP4 and MSE fMP4 now play (ads, direct `<video src=…mp4>`, and MSE sites).
+The remaining gap is **native HLS** (`application/vnd.apple.mpegurl`): we now advertise it in
+`canPlayType` and route `master.m3u8` to WinRT `AdaptiveMediaSource`, but AMS creation currently
+fails on-device (`hls: AMS create FAILED status=1 hr=0x8019019c`). Sites that only serve HLS to our
+iOS-Safari identity (e.g. Pornhub main videos) therefore stay blank while their MP4 ads play.
+
+**Where:**
+- `Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp` — `load()` HLS branch
+  (`hls: load via AdaptiveMediaSource`), and `supportsType`/`mfSupportsTypeImpl` (HLS now advertised).
+- `Source/WebCore/shell/ShellMse.cpp` — `PortHlsPlayerStart` builds the `AdaptiveMediaSource`; the
+  `AMS create FAILED hr=0x8019019c` is thrown here. Start by decoding that HRESULT and checking the
+  manifest fetch (it must go over our curl/DoH stack, not the OS resolver).
+
+**Also related — streaming fetch:** large / long-lived streaming `response.body` fetches can still
+fail with a JS `NetworkError` even when the transfer succeeds; see `FetchResponse.cpp`
+(`BodyLoader::didFail`, `fetchfail-webcore:` log) and the curl BUFFER→FLUSH delivery in
+`CurlRequest.cpp` (`len=-1` streamed bodies).
 
 **Where:**
 - `Source/WebCore/Modules/fetch/FetchResponse.cpp` — `BodyLoader::didFail()` has a `fetchfail-webcore:`
@@ -28,10 +41,11 @@ gives up when its stream ends early/wrong.
 ---
 
 ## 2. MSE video: zero-copy compositing  ·  impact: high  ·  difficulty: hard
-**State:** MSE plumbing works and has decoded+painted under lab conditions, but the live path is a
-CPU readback (choppy). A zero-copy path (decode → ANGLE-shared D3D texture → GL composite) exists in
-the tree but is **dormant** because enabling it regressed stability (the app hard-closed before the
-first frame).
+**State:** MSE plumbing works and plays; the live path is a CPU readback (choppy). A zero-copy path
+(decode → ANGLE-shared D3D texture → GL composite) exists in the tree but is **dormant** because
+enabling it regressed stability. (The earlier "app hard-closes before the first frame" reports were
+largely a separate memory kill + a synchronous seek-recursion stack overflow, both since fixed —
+see the git history — so this is worth revisiting.)
 
 **Where:**
 - `Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp` — `paintCurrentFrameToTextureMapper()`

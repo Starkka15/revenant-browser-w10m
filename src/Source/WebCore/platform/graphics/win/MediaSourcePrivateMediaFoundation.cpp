@@ -4,6 +4,7 @@
 #if ENABLE(MEDIA_SOURCE)
 
 #include "ContentType.h"
+#include "MediaPlayerPrivateMediaFoundation.h"
 #include "MediaSourcePrivateClient.h"
 #include "ShellMseBridge.h"
 #include "SourceBufferPrivateMediaFoundation.h"
@@ -18,7 +19,7 @@ Ref<MediaSourcePrivateMediaFoundation> MediaSourcePrivateMediaFoundation::create
 }
 
 MediaSourcePrivateMediaFoundation::MediaSourcePrivateMediaFoundation(MediaPlayerPrivateMediaFoundation& player, MediaSourcePrivateClient& client)
-    : m_player(player)
+    : m_player(&player)
     , m_client(client)
 {
     m_srcHandle = PortMseCreate(this);
@@ -60,8 +61,15 @@ MediaSourcePrivate::AddStatus MediaSourcePrivateMediaFoundation::addSourceBuffer
 
 void MediaSourcePrivateMediaFoundation::durationChanged(const MediaTime& duration)
 {
-    if (m_srcHandle && duration.isValid())
+    if (!duration.isValid())
+        return;
+    { char b[64]; snprintf(b, sizeof b, "mse: durationChanged %.2fs", duration.toDouble()); PortImgLog(b); }
+    if (m_srcHandle)
         PortMseSetDuration(m_srcHandle, duration.toDouble());
+    // The element's duration comes from MediaPlayer::duration(); without this it stayed 0 (the WinRT
+    // session's NaturalDurationChanged never fires for an MseStreamSource fed incrementally).
+    if (m_player)
+        m_player->setDurationFromMediaSource(duration.toDouble());
 }
 
 void MediaSourcePrivateMediaFoundation::markEndOfStream(EndOfStreamStatus status)
@@ -81,6 +89,11 @@ void MediaSourcePrivateMediaFoundation::unmarkEndOfStream()
 void MediaSourcePrivateMediaFoundation::setReadyState(MediaPlayer::ReadyState state)
 {
     m_readyState = state;
+    // This is MediaSource::monitorSourceBuffers() telling us what the spec says the readyState is,
+    // computed from the buffered ranges. It was being stored and dropped; the media element never saw
+    // it, so it never reached HAVE_FUTURE_DATA and never started playback. Forward it to the player.
+    if (m_player)
+        m_player->setReadyStateFromMediaSource(state);
 }
 
 void* MediaSourcePrivateMediaFoundation::copyMFMediaSource() const

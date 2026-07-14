@@ -14,6 +14,7 @@ void* PortMseAddSourceBuffer(void* srcH, const char* type, void* sbCtx);
 void PortMseAppend(void* sbH, const uint8_t* data, int len);
 int PortMseIsUpdating(void* sbH);
 void PortMseAbort(void* sbH);
+void PortMseRemove(void* sbH, double startSeconds, double endSeconds); // endSeconds<0 = unbounded
 void PortMseSetTimestampOffset(void* sbH, double seconds);
 int PortMseGetBuffered(void* sbH, double* starts, double* ends, int maxN);
 void PortMseSetDuration(void* srcH, double seconds);
@@ -39,6 +40,19 @@ double PortMsePlayerDuration(void* srcH);
 void PortMsePlayerNativeSize(void* srcH, int* w, int* h);   // decoded video size (compositor thread)
 int PortMsePlayerCopyFrame(void* srcH, void* d3dTexture);   // zero-copy current frame -> ANGLE texture
 
+// --- HLS via AdaptiveMediaSource, played through the SAME frame-server pipeline ---
+// Returns a handle usable with every PortMsePlayer* control above. Creation is async; state/error
+// arrive via the WebCoreMsePlayer* callbacks. Destroy with PortHlsPlayerDestroy (after PlayerStop).
+void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx);
+void PortHlsPlayerDestroy(void* srcH);
+
+// Progressive (<video src="...mp4">): fetched over Windows.Web.Http with the BROWSER'S UA + Referer
+// (IMFMediaEngine's own network source gets refused by CDNs) and played on the same frame-server
+// MediaPlayer, so video frames arrive per decoded frame instead of once per TIMEUPDATE.
+// Destroy with PortProgressivePlayerDestroy (after PortMsePlayerStop).
+void* PortProgressivePlayerStart(const char* url, const char* userAgent, const char* referer, void* playerCtx);
+void PortProgressivePlayerDestroy(void* srcH);
+
 // --- shell -> WebCore (WinRT events, on the UI thread) ---
 void WebCoreMseSbUpdateEnded(void* sbCtx);
 void WebCoreMseSbErrored(void* sbCtx, int hr);
@@ -52,5 +66,6 @@ void WebCoreMsePlayerError(void* playerCtx, int hr);
 void WebCoreMsePlayerDurationChanged(void* playerCtx, double seconds);
 void WebCoreMsePlayerSizeChanged(void* playerCtx, int width, int height);
 void WebCoreMsePlayerTimeUpdate(void* playerCtx, double seconds);
+void WebCoreMsePlayerSeekCompleted(void* playerCtx); // MediaPlaybackSession::SeekCompleted
 
 }
