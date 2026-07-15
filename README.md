@@ -125,3 +125,7 @@ Revenant is derived from [WebKit](https://webkit.org/) (BSD/LGPL) and links the 
 in [BUILD.md](BUILD.md), each under its own license. Our patches and new files follow the license of
 the file they modify (WebKit's BSD/LGPL) unless otherwise noted. This is an independent hobbyist port,
 not affiliated with Apple, the WebKit project, or Microsoft.
+
+## AI Disclosure
+
+This project is developed with AI assistance. See **[AI.md](AI.md)** for how AI is used here, the ethical obligations behind it, and how upstream credit and licensing are handled.
