@@ -624,6 +624,274 @@ index ef571408c9..b3d9362a09 100644
      else
          $output.puts "_TEXT ENDS"
          $output.puts "END"
+diff --git a/Source/JavaScriptCore/parser/SourceProvider.cpp b/Source/JavaScriptCore/parser/SourceProvider.cpp
+index 2bd559b353..83b1e628be 100644
+--- a/Source/JavaScriptCore/parser/SourceProvider.cpp
++++ b/Source/JavaScriptCore/parser/SourceProvider.cpp
+@@ -26,10 +26,195 @@
+ #include "config.h"
+ #include "SourceProvider.h"
+ 
++#include "BytecodeCacheError.h"
++#include "CachedTypes.h"
++#include "Options.h"
++#include "UnlinkedFunctionExecutable.h"
++#include <atomic>
++#include <cstdint>
++#include <wtf/CheckedArithmetic.h>
++#include <wtf/FileSystem.h>
++#include <wtf/HexNumber.h>
++#include <wtf/Scope.h>
++#include <wtf/text/StringConcatenateNumbers.h>
++
+ namespace JSC {
+ 
+ DEFINE_ALLOCATOR_WITH_HEAP_IDENTIFIER(StringSourceProvider);
+ 
++// Revenant disk bytecode cache -----------------------------------------------------------------
++// Only cache sources at least this large. Tiny inline <script>s / eval snippets aren't worth a file
++// (the decode + open cost dwarfs re-parsing a few hundred bytes, and they'd flood the cache dir).
++static constexpr unsigned minDiskCacheableSourceLength = 2048;
++
++// Instrumentation counters (proof of hit RATE, not just "files exist"). Read cross-DLL via the exported
++// bytecodeCacheStats() accessor below (a global-variable import across the JSC.dll boundary would need
++// dllexport plumbing; one exported function is cleaner).
++static std::atomic<uint64_t> s_bcHits { 0 };       // disk file found + mmap'd (decode may still reject)
++static std::atomic<uint64_t> s_bcMisses { 0 };     // eligible source, no disk file -> will parse
++static std::atomic<uint64_t> s_bcWrites { 0 };     // bytecode committed to disk (atomic rename ok)
++static std::atomic<uint64_t> s_bcWriteFails { 0 };  // commit attempted but open/write/rename failed
++static std::atomic<uint64_t> s_bcBytesRead { 0 };
++static std::atomic<uint64_t> s_bcBytesWritten { 0 };
++
++JS_EXPORT_PRIVATE void bytecodeCacheStats(uint64_t out[6]);
++void bytecodeCacheStats(uint64_t out[6])
++{
++    out[0] = s_bcHits.load(); out[1] = s_bcMisses.load(); out[2] = s_bcWrites.load();
++    out[3] = s_bcWriteFails.load(); out[4] = s_bcBytesRead.load(); out[5] = s_bcBytesWritten.load();
++}
++
++bool SourceProvider::diskCacheEnabled()
++{
++    // Latched once: the port sets Options::diskCachePath() to LocalState\bytecode-cache at startup,
++    // before any compile. Null path => feature off (identical to the old no-op behavior).
++    static bool enabled = !!Options::diskCachePath();
++    return enabled;
++}
++
++String SourceProvider::bytecodeDiskCachePath() const
++{
++    const char* dir = Options::diskCachePath();
++    if (!dir)
++        return String();
++    // Filename = <urlHash>-<sourceHash>-<length>.bcache. Correctness does NOT depend on this being
++    // collision-free (decodeCodeBlockImpl re-checks the embedded SourceCodeKey against the live source
++    // and rejects any mismatch); the hashes just maximize hit rate and separate same-URL revisions.
++    unsigned urlHash = sourceURL().isEmpty() ? 0u : sourceURL().hash();
++    unsigned srcHash = source().toString().hash();
++    return FileSystem::pathByAppendingComponent(String::fromUTF8(dir),
++        makeString(hex(urlHash), '-', hex(srcHash), '-', source().length(), ".bcache"_s));
++}
++
++void SourceProvider::loadDiskBytecode() const
++{
++    if (!diskCacheEnabled() || source().length() < minDiskCacheableSourceLength)
++        return;
++    String filename = bytecodeDiskCachePath();
++    if (filename.isNull())
++        return;
++    auto fd = FileSystem::openAndLockFile(filename, FileSystem::FileOpenMode::Read, { FileSystem::FileLockMode::Shared, FileSystem::FileLockMode::Nonblocking });
++    if (!FileSystem::isHandleValid(fd))
++        return;
++    auto closeFD = makeScopeExit([&] { FileSystem::unlockAndCloseFile(fd); });
++    bool success = false;
++    FileSystem::MappedFileData mappedFileData(fd, FileSystem::MappedFileMode::Private, success);
++    if (!success)
++        return;
++    m_diskBytecode = CachedBytecode::create(WTFMove(mappedFileData));
++    m_diskBytecodeFromDisk = true;
++}
++
++RefPtr<CachedBytecode> SourceProvider::cachedBytecode() const
++{
++    if (!diskCacheEnabled())
++        return nullptr;
++    if (!m_triedLoadDiskBytecode) {
++        m_triedLoadDiskBytecode = true;
++        loadDiskBytecode();
++        if (source().length() >= minDiskCacheableSourceLength) {
++            if (m_diskBytecode) { s_bcHits.fetch_add(1); s_bcBytesRead.fetch_add(m_diskBytecode->size()); }
++            else s_bcMisses.fetch_add(1);
++        }
++    }
++    return m_diskBytecode.copyRef();
++}
++
++void SourceProvider::cacheBytecode(const BytecodeCacheGenerator& generator) const
++{
++    if (!diskCacheEnabled() || source().length() < minDiskCacheableSourceLength)
++        return;
++    // Reaching here while still holding a blob we mmap'd from disk means JSC is REGENERATING bytecode for
++    // this source -- which only happens on a disk MISS or a decoder REJECT (stale format / SourceCodeKey
++    // mismatch). Reusing the stale blob would append fresh updates onto bytes the decoder only ever reads
++    // from offset 0, so the file grows on every visit and never hits again (the observed bcache hit=0), and
++    // it leaves the bad file on disk to be re-read forever. Drop it and delete the file, then build a clean
++    // one below and commit it -- self-healing instead of a grow-forever / re-reject loop.
++    if (m_diskBytecode && m_diskBytecodeFromDisk) {
++        String filename = bytecodeDiskCachePath();
++        if (!filename.isNull())
++            FileSystem::deleteFile(filename);
++        m_diskBytecode = nullptr;
++        m_diskBytecodeFromDisk = false;
++    }
++    if (!m_diskBytecode)
++        m_diskBytecode = CachedBytecode::create();
++    auto update = generator();
++    if (update)
++        m_diskBytecode->addGlobalUpdate(*update);
++}
++
++void SourceProvider::updateCache(const UnlinkedFunctionExecutable* executable, const SourceCode&, CodeSpecializationKind kind, const UnlinkedFunctionCodeBlock* codeBlock) const
++{
++    if (!diskCacheEnabled() || !m_diskBytecode)
++        return;
++    // The blob may have been replaced since this executable was registered (eviction commit nulls it and a
++    // later compile re-creates it; the self-heal path swaps a rejected mmap for a fresh one). addFunctionUpdate
++    // derefs m_leafExecutables.find(executable) unchecked (release: end-iterator deref -> AV at 0x4), so only
++    // forward updates for executables registered in THIS blob's leaf map. A skip just leaves that one
++    // function out of the disk cache.
++    if (!m_diskBytecode->leafExecutables().contains(executable))
++        return;
++    BytecodeCacheError error;
++    RefPtr<CachedBytecode> cachedBytecode = encodeFunctionCodeBlock(executable->vm(), codeBlock, error);
++    if (cachedBytecode && !error.isValid())
++        m_diskBytecode->addFunctionUpdate(executable, kind, *cachedBytecode);
++}
++
++void SourceProvider::commitCachedBytecode() const
++{
++    if (!diskCacheEnabled() || !m_diskBytecode || !m_diskBytecode->hasUpdates())
++        return;
++    auto clearBytecode = makeScopeExit([&] { m_diskBytecode = nullptr; });
++
++    String filename = bytecodeDiskCachePath();
++    if (filename.isNull())
++        return;
++
++    // ATOMIC WRITE (fixes the 0-byte-file bug): the upstream ShellSourceProvider opens the TARGET in
++    // Write mode, which on Windows is CREATE_ALWAYS -> it truncates the existing file to 0 immediately,
++    // and if the subsequent size-guard bails (a second provider for the same source, in-memory view
++    // stale) the good cache file is left at 0 bytes. Instead we build the complete image in a temp file
++    // and moveFile() it over the target only on success, so the target is never truncated-and-abandoned.
++    // We reconstruct the full content ourselves: write the committed base (m_diskBytecode->data(), the
++    // mmap'd bytes on an incremental update, empty on a fresh cache), then apply the updates on top. This
++    // handles BOTH the fresh case (base size 0 -> updates are the whole file) and the incremental case
++    // (base + new function updates) without depending on the target already holding the base.
++    String tmp = makeString(filename, ".tmp"_s);
++    auto fd = FileSystem::openAndLockFile(tmp, FileSystem::FileOpenMode::Write, { FileSystem::FileLockMode::Exclusive, FileSystem::FileLockMode::Nonblocking });
++    if (!FileSystem::isHandleValid(fd)) {
++        s_bcWriteFails.fetch_add(1);
++        return;
++    }
++    bool ok = true;
++    {
++        auto closeFD = makeScopeExit([&] { FileSystem::unlockAndCloseFile(fd); });
++        // Lay down the committed base first so update offsets that reference it are valid.
++        if (m_diskBytecode->size()) {
++            size_t w = static_cast<size_t>(FileSystem::writeToFile(fd, m_diskBytecode->data(), m_diskBytecode->size()));
++            if (w != m_diskBytecode->size())
++                ok = false;
++        }
++        if (ok && !FileSystem::truncateFile(fd, m_diskBytecode->sizeForUpdate()))
++            ok = false;
++        if (ok) {
++            m_diskBytecode->commitUpdates([&] (off_t offset, const void* data, size_t size) {
++                if (FileSystem::seekFile(fd, offset, FileSystem::FileSeekOrigin::Beginning) == -1) { ok = false; return; }
++                if (static_cast<size_t>(FileSystem::writeToFile(fd, data, size)) != size) ok = false;
++            });
++        }
++    } // fd closed here (must close before rename)
++
++    if (ok && FileSystem::moveFile(tmp, filename)) {
++        s_bcWrites.fetch_add(1);
++        s_bcBytesWritten.fetch_add(m_diskBytecode->sizeForUpdate());
++    } else {
++        s_bcWriteFails.fetch_add(1);
++        FileSystem::deleteFile(tmp); // don't leave a stale temp behind
++    }
++}
++// ----------------------------------------------------------------------------------------------
++
+ SourceProvider::SourceProvider(const SourceOrigin& sourceOrigin, String&& sourceURL, const TextPosition& startPosition, SourceProviderSourceType sourceType)
+     : m_sourceType(sourceType)
+     , m_sourceOrigin(sourceOrigin)
+diff --git a/Source/JavaScriptCore/parser/SourceProvider.h b/Source/JavaScriptCore/parser/SourceProvider.h
+index dc61660b8f..df692801de 100644
+--- a/Source/JavaScriptCore/parser/SourceProvider.h
++++ b/Source/JavaScriptCore/parser/SourceProvider.h
+@@ -59,10 +59,17 @@ class UnlinkedFunctionCodeBlock;
+ 
+         virtual unsigned hash() const = 0;
+         virtual StringView source() const = 0;
+-        virtual RefPtr<CachedBytecode> cachedBytecode() const { return nullptr; }
+-        virtual void cacheBytecode(const BytecodeCacheGenerator&) const { }
+-        virtual void updateCache(const UnlinkedFunctionExecutable*, const SourceCode&, CodeSpecializationKind, const UnlinkedFunctionCodeBlock*) const { }
+-        virtual void commitCachedBytecode() const { }
++        // Disk-backed unlinked-bytecode cache (Revenant, single-process port). The base class now
++        // implements these (they used to be no-ops) so EVERY page script inherits persistent caching
++        // when Options::diskCachePath() is set: parse once, serialize the UnlinkedCodeBlock tree to a
++        // per-source file keyed by URL+content hash, and on the next visit (or after an in-memory
++        // CodeCache wipe) decode instead of re-tokenizing. decodeCodeBlockImpl re-validates the embedded
++        // SourceCodeKey against the live source, so a stale/collided/changed file can only miss, never
++        // feed wrong bytecode. Subclasses may still override. See SourceProvider.cpp.
++        JS_EXPORT_PRIVATE virtual RefPtr<CachedBytecode> cachedBytecode() const;
++        JS_EXPORT_PRIVATE virtual void cacheBytecode(const BytecodeCacheGenerator&) const;
++        JS_EXPORT_PRIVATE virtual void updateCache(const UnlinkedFunctionExecutable*, const SourceCode&, CodeSpecializationKind, const UnlinkedFunctionCodeBlock*) const;
++        JS_EXPORT_PRIVATE virtual void commitCachedBytecode() const;
+ 
+         StringView getRange(int start, int end) const
+         {
+@@ -92,6 +99,14 @@ class UnlinkedFunctionCodeBlock;
+     private:
+         JS_EXPORT_PRIVATE void getID();
+ 
++        // Disk bytecode cache helpers (base implementation; see SourceProvider.cpp).
++        String bytecodeDiskCachePath() const;
++        void loadDiskBytecode() const;
++        static bool diskCacheEnabled();
++        mutable RefPtr<CachedBytecode> m_diskBytecode;
++        mutable bool m_triedLoadDiskBytecode { false };
++        mutable bool m_diskBytecodeFromDisk { false }; // true while m_diskBytecode holds a file we mmap'd (vs a fresh in-memory one we're building)
++
+         SourceProviderSourceType m_sourceType;
+         SourceOrigin m_sourceOrigin;
+         String m_sourceURL;
+diff --git a/Source/JavaScriptCore/runtime/CachedTypes.cpp b/Source/JavaScriptCore/runtime/CachedTypes.cpp
+index f5dcb879c1..0574c2fc79 100644
+--- a/Source/JavaScriptCore/runtime/CachedTypes.cpp
++++ b/Source/JavaScriptCore/runtime/CachedTypes.cpp
+@@ -69,7 +69,21 @@ using SourceType = typename SourceTypeImpl<T>::type;
+ 
+ static constexpr unsigned jscBytecodeCacheVersion()
+ {
+-    return StringHasher::computeHash(__TIMESTAMP__);
++    // __TIMESTAMP__ is the mtime of THIS file only -- it does NOT change on a plain recompile, and a layout
++    // change in a serialized type declared in another header can shift the on-disk format while this value
++    // stays put, feeding stale bytes to the (unhardened) decoder -> crash. That is a real hazard now that this
++    // port PERSISTS the bytecode cache to disk across runs/rebuilds (bootSessionUUID is empty on Windows, so
++    // the per-boot invalidation that normally backstops this is absent). Mix in the sizes of the actual
++    // serialized structures -- which change when their layout changes and force this TU to recompile -- plus a
++    // manual salt we can bump to force global invalidation. A version MISMATCH is caught cleanly by isUpToDate()
++    // before any deep decode, so an engine rebuild reparses instead of crashing on its own stale cache.
++    return StringHasher::computeHash(__TIMESTAMP__)
++        ^ (0x9E3779B9u * 3u) // manual salt -- bump to force-invalidate every on-disk .bcache
++        ^ (static_cast<unsigned>(sizeof(UnlinkedProgramCodeBlock)) << 1)
++        ^ (static_cast<unsigned>(sizeof(UnlinkedModuleProgramCodeBlock)) << 5)
++        ^ (static_cast<unsigned>(sizeof(UnlinkedEvalCodeBlock)) << 9)
++        ^ (static_cast<unsigned>(sizeof(UnlinkedFunctionCodeBlock)) << 13)
++        ^ (static_cast<unsigned>(sizeof(UnlinkedCodeBlock)) << 17);
+ }
+ 
+ class Encoder {
 diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
 index 81a5c90965..a0472d3a81 100644
 --- a/Source/JavaScriptCore/runtime/Options.cpp
@@ -1923,6 +2191,31 @@ index 09491df328..266b9dad56 100644
  using WTF::memoryFootprint;
 +using WTF::setMemoryFootprintOverride;
  
+diff --git a/Source/WTF/wtf/MemoryPressureHandler.cpp b/Source/WTF/wtf/MemoryPressureHandler.cpp
+index 4b0552e0bf..422fcda915 100644
+--- a/Source/WTF/wtf/MemoryPressureHandler.cpp
++++ b/Source/WTF/wtf/MemoryPressureHandler.cpp
+@@ -69,12 +69,14 @@ MemoryPressureHandler::MemoryPressureHandler()
+ 
+ void MemoryPressureHandler::setShouldUsePeriodicMemoryMonitor(bool use)
+ {
+-    if (!isFastMallocEnabled()) {
+-        // If we're running with FastMalloc disabled, some kind of testing or debugging is probably happening.
+-        // Let's be nice and not enable the memory kill mechanism.
+-        return;
+-    }
+-
++    // NOTE (Revenant/WinCairo port): upstream bails here when FastMalloc is disabled, on the assumption that
++    // no-FastMalloc == a test/debug run that shouldn't get the memory-KILL mechanism. But this port builds with
++    // USE_SYSTEM_MALLOC=1 in EVERY configuration, so isFastMallocEnabled() is permanently false and this early
++    // return silently disabled the periodic monitor for good -- the policy stayed Unrestricted forever and the
++    // pressure consumers (TileController, FontCache, tile stores) never fired under the 390MB AppContainer cap.
++    // Arming is safe here because the KILL path is inert: thresholdForMemoryKill() returns nullopt (no
++    // killThresholdFraction configured) and no kill callback is set, so measurementTimerFired() only ever runs
++    // the policy -> releaseMemory() cache-shrink branch, never shrinkOrDie(). So we arm regardless of malloc.
+     if (use) {
+         m_measurementTimer = makeUnique<RunLoop::Timer<MemoryPressureHandler>>(RunLoop::main(), this, &MemoryPressureHandler::measurementTimerFired);
+         m_measurementTimer->startRepeating(m_configuration.pollInterval);
 diff --git a/Source/WTF/wtf/NumberOfCores.cpp b/Source/WTF/wtf/NumberOfCores.cpp
 index 7636865101..aef49c40b8 100644
 --- a/Source/WTF/wtf/NumberOfCores.cpp
@@ -2225,6 +2518,53 @@ index 83301adcd5..ab11b67731 100644
  #endif
      return result;
  }
+diff --git a/Source/WTF/wtf/URLParser.cpp b/Source/WTF/wtf/URLParser.cpp
+index 1353856631..5c7e8c174d 100644
+--- a/Source/WTF/wtf/URLParser.cpp
++++ b/Source/WTF/wtf/URLParser.cpp
+@@ -27,6 +27,8 @@
+ #include <wtf/URLParser.h>
+ 
+ #include <array>
++#include <atomic>
++#include <cstdint>
+ #include <functional>
+ #include <mutex>
+ #include <wtf/text/CodePointIterator.h>
+@@ -1059,6 +1061,19 @@ ALWAYS_INLINE size_t URLParser::currentPosition(const CodePointIterator<Characte
+     return iterator.codeUnitsSince(reinterpret_cast<const CharacterType*>(m_inputBegin));
+ }
+ 
++// Revenant instrumentation: URL parsing showed up as ~15% of JS-heavy page load in on-device profiling
++// (2026-07-15), split across parse<char16_t>/parse<unsigned char>. Count total parses and the 8-bit vs
++// 16-bit input split so we can tell whether URLs are needlessly taking the (slower) UTF-16 path and how
++// many parses happen per load (does a URL cache help?). Read cross-DLL via urlParseStats().
++static std::atomic<uint64_t> s_urlParses { 0 };
++static std::atomic<uint64_t> s_urlParses8bit { 0 };
++static std::atomic<uint64_t> s_urlParses16bit { 0 };
++WTF_EXPORT_PRIVATE void urlParseStats(uint64_t out[3]);
++void urlParseStats(uint64_t out[3])
++{
++    out[0] = s_urlParses.load(); out[1] = s_urlParses8bit.load(); out[2] = s_urlParses16bit.load();
++}
++
+ URLParser::URLParser(const String& input, const URL& base, const URLTextEncoding* nonUTF8QueryEncoding)
+     : m_inputString(input)
+ {
+@@ -1070,10 +1085,13 @@ URLParser::URLParser(const String& input, const URL& base, const URLTextEncoding
+         return;
+     }
+ 
++    s_urlParses.fetch_add(1);
+     if (input.is8Bit()) {
++        s_urlParses8bit.fetch_add(1);
+         m_inputBegin = input.characters8();
+         parse(input.characters8(), input.length(), base, nonUTF8QueryEncoding);
+     } else {
++        s_urlParses16bit.fetch_add(1);
+         m_inputBegin = input.characters16();
+         parse(input.characters16(), input.length(), base, nonUTF8QueryEncoding);
+     }
 diff --git a/Source/WTF/wtf/WindowsExtras.h b/Source/WTF/wtf/WindowsExtras.h
 index 061db5379f..972f2d06fc 100644
 --- a/Source/WTF/wtf/WindowsExtras.h
@@ -3144,7 +3484,7 @@ index c71e77828f..ff0623439c 100644
  
  } // namespace PAL
 diff --git a/Source/WebCore/PlatformWin.cmake b/Source/WebCore/PlatformWin.cmake
-index 6209fa6e36..58c01144e6 100644
+index 6209fa6e36..17a6238a40 100644
 --- a/Source/WebCore/PlatformWin.cmake
 +++ b/Source/WebCore/PlatformWin.cmake
 @@ -3,6 +3,12 @@ add_definitions(/bigobj -D__STDC_CONSTANT_MACROS)
@@ -3211,7 +3551,7 @@ index 6209fa6e36..58c01144e6 100644
      platform/graphics/win/SimpleFontDataWin.cpp
      platform/graphics/win/TransformationMatrixWin.cpp
  
-@@ -70,19 +97,41 @@ list(APPEND WebCore_SOURCES
+@@ -70,19 +97,42 @@ list(APPEND WebCore_SOURCES
      platform/win/DragImageWin.cpp
      platform/win/GDIObjectCounter.cpp
      platform/win/GDIUtilities.cpp
@@ -3227,6 +3567,7 @@ index 6209fa6e36..58c01144e6 100644
 +    port/PortPlatformStrategies.cpp
 +    port/PortFrameLoaderClient.cpp
 +    port/PortChromeClient.cpp
++    port/PortContentBlocker.cpp
 +    port/PortDeviceSensorClients.cpp
 +    port/PortStorageProvider.cpp
 +    port/PortCacheStorage.cpp
@@ -3257,7 +3598,7 @@ index 6209fa6e36..58c01144e6 100644
      platform/win/SystemInfo.cpp
      platform/win/UserAgentWin.cpp
      platform/win/WCDataObject.cpp
-@@ -94,7 +143,16 @@ list(APPEND WebCore_SOURCES
+@@ -94,7 +144,16 @@ list(APPEND WebCore_SOURCES
      platform/win/WindowMessageBroadcaster.cpp
      platform/win/WindowsKeyNames.cpp
  
@@ -4475,6 +4816,54 @@ index 31557da5da..13a56f05d9 100644
      int rightAligned = ::GetSystemMetrics(SM_MENUDROPALIGNMENT);
  #else
      int rightAligned = 0;
+diff --git a/Source/WebCore/page/MemoryRelease.cpp b/Source/WebCore/page/MemoryRelease.cpp
+index c233fba893..e0fb67a639 100644
+--- a/Source/WebCore/page/MemoryRelease.cpp
++++ b/Source/WebCore/page/MemoryRelease.cpp
+@@ -66,6 +66,12 @@
+ 
+ namespace WebCore {
+ 
++#if USE(HARFBUZZ) && OS(WINDOWS)
++// Defined in ComplexTextControllerHarfBuzz.cpp (WebCore namespace). No dedicated header for one
++// Windows-only free function; forward-declare at namespace scope so it links correctly.
++void clearHarfBuzzFaceCache();
++#endif
++
+ static void releaseNoncriticalMemory(MaintainMemoryCache maintainMemoryCache)
+ {
+     RenderTheme::singleton().purgeCaches();
+@@ -74,6 +80,13 @@ static void releaseNoncriticalMemory(MaintainMemoryCache maintainMemoryCache)
+     FontCache::forCurrentThread().purgeInactiveFontData();
+     FontCache::forCurrentThread().clearWidthCaches();
+ 
++#if USE(HARFBUZZ) && OS(WINDOWS)
++    // W10M: drop cached HarfBuzz faces (parsed OT tables, one per DirectWrite face). Small, and rebuilt
++    // lazily on next shape. (Forward-declared at namespace scope above — a block-scope extern decl would
++    // bind to the global namespace under MSVC and fail to link against WebCore::clearHarfBuzzFaceCache.)
++    clearHarfBuzzFaceCache();
++#endif
++
+     TextPainter::clearGlyphDisplayLists();
+ 
+     for (auto* document : Document::allDocuments()) {
+@@ -117,7 +130,15 @@ static void releaseCriticalMemory(Synchronous synchronous, MaintainBackForwardCa
+         document->cachedResourceLoader().garbageCollectDocumentResources();
+     }
+ 
+-    GCController::singleton().deleteAllCode(JSC::DeleteAllCodeIfNotCollecting);
++    // Reclaim LINKED code (baseline/DFG machine code — the large, regenerable memory) but PRESERVE the
++    // unlinked CodeCache (the expensive parse/bytecode-gen result). deleteAllCode() clears both, which on
++    // this ~390MB-capped device was catastrophic: memory pressure fires near the cap during a load, wipes
++    // every script's unlinked bytecode, and the next execution re-parses everything from source — the
++    // self-inflicted "parser hot at 69%" thrash. deleteAllLinkedCode() frees the JIT code (cheap to
++    // regenerate from the retained unlinked bytecode) without throwing away the parse. This matches what
++    // Apple's own platform does (MemoryReleaseCocoa.mm uses deleteAllLinkedCode here). The persistent
++    // disk bytecode cache (SourceProvider) further backs this: even a full wipe re-loads from disk.
++    GCController::singleton().deleteAllLinkedCode(JSC::DeleteAllCodeIfNotCollecting);
+ 
+ #if ENABLE(VIDEO)
+     for (auto* mediaElement : HTMLMediaElement::allMediaElements()) {
 diff --git a/Source/WebCore/page/Navigator.cpp b/Source/WebCore/page/Navigator.cpp
 index 56b17f2ec5..43acaf3e26 100644
 --- a/Source/WebCore/page/Navigator.cpp
@@ -4667,6 +5056,26 @@ index dc5e5a07cb..7f8969c927 100644
  #if USE(CORE_TEXT)
      RetainPtr<CGFontRef> m_cgFont; // FIXME: Delete this in favor of m_ctFont.
      RetainPtr<CTFontRef> m_ctFont;
+diff --git a/Source/WebCore/platform/graphics/ImageSource.cpp b/Source/WebCore/platform/graphics/ImageSource.cpp
+index f2c9640d46..5ae6614f01 100644
+--- a/Source/WebCore/platform/graphics/ImageSource.cpp
++++ b/Source/WebCore/platform/graphics/ImageSource.cpp
+@@ -335,8 +335,13 @@ bool ImageSource::canUseAsyncDecoding()
+ {
+     if (!isDecoderAvailable())
+         return false;
+-    // FIXME: figure out the best heuristic for enabling async image decoding.
+-    return size().area() * sizeof(uint32_t) >= (frameCount() > 1 ? 100 * KB : 500 * KB);
++    // Revenant: on this ARM32 / software-cairo device, synchronous decode of even modest images
++    // (YouTube feed thumbnails, ~168x94..360x202) on the main thread during tile raster costs
++    // 100s of ms and is re-run every time the tile re-rasters -> the sustained ~800ms paint stalls
++    // the BACK-SPLIT instrument localized. Anything worth a worker-thread hop should qualify, so drop
++    // the "large" cutoff from 500KB to 48KB decoded (~112x112). Tiny UI icons stay under it (sync,
++    // no async flicker).
++    return size().area() * sizeof(uint32_t) >= 48 * KB;
+ }
+ 
+ void ImageSource::startAsyncDecodingQueue()
 diff --git a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp b/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
 index f45975091b..6ecd31bf74 100644
 --- a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
@@ -4690,26 +5099,107 @@ index f45975091b..6ecd31bf74 100644
          surface = cairo_win32_surface_get_image(surface);
          ASSERT(surface);
 diff --git a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp b/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
-index c323044535..87d62be9e7 100644
+index c323044535..477005f870 100644
 --- a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
 +++ b/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
-@@ -45,7 +45,7 @@
+@@ -44,8 +44,9 @@
+ #include "IntRect.h"
  #include "NotImplemented.h"
  #include "RefPtrCairo.h"
++#include <wtf/MonotonicTime.h>
  
 -#if PLATFORM(WIN)
 +#if PLATFORM(WIN) && CAIRO_HAS_WIN32_SURFACE
  #include <cairo-win32.h>
  #endif
  
-@@ -145,6 +145,7 @@ void GraphicsContextCairo::drawRect(const FloatRect& rect, float borderThickness
+@@ -55,6 +56,25 @@
+ 
+ namespace WebCore {
+ 
++// bstat raster attribution: split the software-raster time (BitmapTexture::updateContents, timed as
++// g_bsRasterMs) by cairo primitive TYPE, so the driver's bstat line says whether a 600-1165ns/px raster
++// is image scaling, text glyphs, fills, or gradients. Accumulated on the main thread during raster,
++// harvested + reset per bstat window in WebCoreDriver. (Replaces the old per-drawNativeImage log line.)
++double g_bsCairoImageMs = 0;  unsigned g_bsCairoImageN = 0;   // drawNativeImage + drawPattern (blit/scale)
++double g_bsCairoGlyphMs = 0;  unsigned g_bsCairoGlyphN = 0; unsigned g_bsCairoGlyphCount = 0; // drawGlyphs
++double g_bsCairoFillMs = 0;   unsigned g_bsCairoFillN = 0;    // fillRect/fillPath (solid)
++double g_bsCairoGradMs = 0;   unsigned g_bsCairoGradN = 0;    // fillRect(gradient)
++double g_bsCairoStrokeMs = 0;                                 // strokePath/strokeRect/drawLine (minor)
++
++namespace {
++struct CairoOpTimer {
++    double& acc;
++    MonotonicTime t0;
++    explicit CairoOpTimer(double& a) : acc(a), t0(MonotonicTime::now()) { }
++    ~CairoOpTimer() { acc += (MonotonicTime::now() - t0).milliseconds(); }
++};
++}
++
+ // Encapsulates the additional painting state information we store for each
+ // pushed graphics state.
+ class GraphicsContextCairo::CairoState {
+@@ -144,6 +164,7 @@ void GraphicsContextCairo::drawRect(const FloatRect& rect, float borderThickness
+ 
  void GraphicsContextCairo::drawNativeImage(NativeImage& nativeImage, const FloatSize&, const FloatRect& destRect, const FloatRect& srcRect, const ImagePaintingOptions& options)
  {
++    CairoOpTimer _t(g_bsCairoImageMs); ++g_bsCairoImageN;
      auto& state = this->state();
-+    { extern void PortImgLog(const char*); char b[128]; snprintf(b, sizeof b, "img: drawNativeImage surface=%p dest=%.0fx%.0f", (void*)nativeImage.platformImage().get(), destRect.width(), destRect.height()); PortImgLog(b); }
      Cairo::drawPlatformImage(*this, nativeImage.platformImage().get(), destRect, srcRect, { options, state.imageInterpolationQuality }, state.alpha, Cairo::ShadowState(state));
  }
+@@ -170,6 +191,7 @@ void GraphicsContextCairo::fillPath(const Path& path)
+     if (path.isEmpty())
+         return;
  
++    CairoOpTimer _t(g_bsCairoFillMs); ++g_bsCairoFillN;
+     auto& state = this->state();
+     Cairo::fillPath(*this, path, Cairo::FillSource(state), Cairo::ShadowState(state));
+ }
+@@ -185,17 +207,20 @@ void GraphicsContextCairo::strokePath(const Path& path)
+ 
+ void GraphicsContextCairo::fillRect(const FloatRect& rect)
+ {
++    CairoOpTimer _t(g_bsCairoFillMs); ++g_bsCairoFillN;
+     auto& state = this->state();
+     Cairo::fillRect(*this, rect, Cairo::FillSource(state), Cairo::ShadowState(state));
+ }
+ 
+ void GraphicsContextCairo::fillRect(const FloatRect& rect, const Color& color)
+ {
++    CairoOpTimer _t(g_bsCairoFillMs); ++g_bsCairoFillN;
+     Cairo::fillRect(*this, rect, color, Cairo::ShadowState(state()));
+ }
+ 
+ void GraphicsContextCairo::fillRect(const FloatRect& rect, Gradient& gradient)
+ {
++    CairoOpTimer _t(g_bsCairoGradMs); ++g_bsCairoGradN;
+     auto& state = this->state();
+     auto pattern = gradient.createPattern(1.0, state.fillGradientSpaceTransform);
+     if (!pattern)
+@@ -208,6 +233,7 @@ void GraphicsContextCairo::fillRect(const FloatRect& rect, Gradient& gradient)
+ 
+ void GraphicsContextCairo::fillRect(const FloatRect& rect, const Color& color, CompositeOperator compositeOperator, BlendMode blendMode)
+ {
++    CairoOpTimer _t(g_bsCairoFillMs); ++g_bsCairoFillN;
+     auto& state = this->state();
+     CompositeOperator previousOperator = state.compositeOperator;
+ 
+@@ -400,6 +426,7 @@ void GraphicsContextCairo::drawPattern(NativeImage& nativeImage, const FloatRect
+     if (!patternTransform.isInvertible())
+         return;
+ 
++    CairoOpTimer _t(g_bsCairoImageMs); ++g_bsCairoImageN;
+     UNUSED_PARAM(spacing);
+     Cairo::drawPattern(*this, nativeImage.platformImage().get(), nativeImage.size(), destRect, tileRect, patternTransform, phase, options);
+ }
+@@ -414,6 +441,7 @@ void GraphicsContextCairo::drawGlyphs(const Font& font, const GlyphBufferGlyph*
+     if (!font.platformData().size())
+         return;
+ 
++    CairoOpTimer _t(g_bsCairoGlyphMs); ++g_bsCairoGlyphN; g_bsCairoGlyphCount += numGlyphs;
+     auto xOffset = point.x();
+     Vector<cairo_glyph_t> cairoGlyphs(numGlyphs);
+     {
 diff --git a/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp b/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp
 index 262b2fb902..f9449a40c5 100644
 --- a/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp
@@ -4833,11 +5323,88 @@ index 262b2fb902..f9449a40c5 100644
      return eglCreateContext(platformDisplay.eglDisplay(), config, sharingContext, contextAttributes);
  }
  
+diff --git a/Source/WebCore/platform/graphics/filters/software/FEGaussianBlurSoftwareApplier.cpp b/Source/WebCore/platform/graphics/filters/software/FEGaussianBlurSoftwareApplier.cpp
+index dee04801a3..e32918143b 100644
+--- a/Source/WebCore/platform/graphics/filters/software/FEGaussianBlurSoftwareApplier.cpp
++++ b/Source/WebCore/platform/graphics/filters/software/FEGaussianBlurSoftwareApplier.cpp
+@@ -80,6 +80,18 @@ inline void FEGaussianBlurSoftwareApplier::boxBlurAlphaOnly(const Uint8ClampedAr
+     // Memory alignment is: RGBA, zero-index based.
+     const int channel = 3;
+ 
++    // ARMv7 has no hardware integer divide, so `sum / dx` (dx = box diameter, constant for this whole
++    // pass) compiled to a software __rt_udiv call PER PIXEL — profiling on-device (2026-07-14) put
++    // FEGaussianBlurSoftwareApplier::boxBlur + __rt_udiv at ~44% of a blur-heavy page load. Replace the
++    // per-pixel divide with a fixed-point reciprocal multiply computed once: recip = round(2^32 / dx),
++    // then floor-ish(sum/dx) = (sum * recip) >> 32 with round-to-nearest (+2^31). Verified over the full
++    // input range (sum in [0, 255*dx]) the result differs from integer division by at most 1 LSB, and
++    // only in true rounding cases — imperceptible in a blur, and unbiased vs. truncation's downward skew.
++    const uint64_t recip = ((static_cast<uint64_t>(1) << 32) + dx / 2) / dx;
++    auto divBox = [recip](int s) -> uint8_t {
++        return static_cast<uint8_t>((static_cast<uint64_t>(static_cast<unsigned>(s)) * recip + (static_cast<uint64_t>(1) << 31)) >> 32);
++    };
++
+     for (int y = 0; y < effectHeight; ++y) {
+         int line = y * strideLine;
+         int sum = 0;
+@@ -95,7 +107,7 @@ inline void FEGaussianBlurSoftwareApplier::boxBlurAlphaOnly(const Uint8ClampedAr
+         for (int x = 0; x < effectWidth; ++x) {
+             unsigned pixelByteOffset = line + x * stride + channel;
+             uint8_t* dstPtr = dstData + pixelByteOffset;
+-            *dstPtr = static_cast<uint8_t>(sum / dx);
++            *dstPtr = divBox(sum);
+ 
+             // Shift kernel.
+             if (x >= dxLeft) {
+@@ -122,6 +134,14 @@ inline void FEGaussianBlurSoftwareApplier::boxBlur(const Uint8ClampedArray& srcP
+     const uint8_t* srcData = srcPixelArray.data();
+     uint8_t* dstData = dstPixelArray.data();
+ 
++    // Per-pixel `sumX / dx` was a software __rt_udiv on ARMv7 (no HW divide) — the dominant load-time
++    // cost on blur-heavy pages. Replace with a once-per-pass fixed-point reciprocal multiply (see the
++    // detailed note in boxBlurAlphaOnly). Round-to-nearest; max 1-LSB delta vs integer divide, unbiased.
++    const uint64_t recip = ((static_cast<uint64_t>(1) << 32) + dx / 2) / dx;
++    auto divBox = [recip](int s) -> uint8_t {
++        return static_cast<uint8_t>((static_cast<uint64_t>(static_cast<unsigned>(s)) * recip + (static_cast<uint64_t>(1) << 31)) >> 32);
++    };
++
+     // Concerning the array width/length: it is Element size + Margin + Border. The number of pixels will be
+     // P = width * height * channels.
+     for (int y = 0; y < effectHeight; ++y) {
+@@ -144,10 +164,10 @@ inline void FEGaussianBlurSoftwareApplier::boxBlur(const Uint8ClampedArray& srcP
+                 unsigned pixelByteOffset = line + x * stride;
+                 uint8_t* dstPtr = dstData + pixelByteOffset;
+ 
+-                *dstPtr++ = static_cast<uint8_t>(sumR / dx);
+-                *dstPtr++ = static_cast<uint8_t>(sumG / dx);
+-                *dstPtr++ = static_cast<uint8_t>(sumB / dx);
+-                *dstPtr = static_cast<uint8_t>(sumA / dx);
++                *dstPtr++ = divBox(sumR);
++                *dstPtr++ = divBox(sumG);
++                *dstPtr++ = divBox(sumB);
++                *dstPtr = divBox(sumA);
+ 
+                 // Shift kernel.
+                 if (x >= dxLeft) {
+@@ -204,10 +224,10 @@ inline void FEGaussianBlurSoftwareApplier::boxBlur(const Uint8ClampedArray& srcP
+                 unsigned pixelByteOffset = line + x * stride;
+                 uint8_t* dstPtr = dstData + pixelByteOffset;
+ 
+-                *dstPtr++ = static_cast<uint8_t>(sumR / dx);
+-                *dstPtr++ = static_cast<uint8_t>(sumG / dx);
+-                *dstPtr++ = static_cast<uint8_t>(sumB / dx);
+-                *dstPtr = static_cast<uint8_t>(sumA / dx);
++                *dstPtr++ = divBox(sumR);
++                *dstPtr++ = divBox(sumG);
++                *dstPtr++ = divBox(sumB);
++                *dstPtr = divBox(sumA);
+ 
+                 // Shift kernel.
+                 if (x < dxLeft) {
 diff --git a/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp b/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
-index aade8a6f6e..3a07137288 100644
+index aade8a6f6e..3393bbd735 100644
 --- a/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
 +++ b/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
-@@ -31,12 +31,16 @@
+@@ -31,16 +31,83 @@
  #include "FontTaggedSettings.h"
  #include "HbUniquePtr.h"
  #include "SurrogatePairAwareTextIterator.h"
@@ -4848,6 +5415,9 @@ index aade8a6f6e..3a07137288 100644
 +#include <hb-directwrite.h>
  #include <hb-icu.h>
  #include <hb-ot.h>
++#include <wtf/HashMap.h>
++#include <wtf/Lock.h>
++#include <wtf/NeverDestroyed.h>
  
  #if ENABLE(VARIATION_FONTS)
 -#include FT_MULTIPLE_MASTERS_H
@@ -4856,7 +5426,71 @@ index aade8a6f6e..3a07137288 100644
  #endif
  
  namespace WebCore {
-@@ -72,16 +76,13 @@ static hb_font_funcs_t* harfBuzzFontFunctions()
+ 
++// PERF (W10M): hb_directwrite_face_create() parses the font's OpenType tables into a fresh hb_face
++// EVERY call. collectComplexTextRunsForCharacters() runs per text run per raster, so a text-dense page
++// (YouTube feed) rebuilt the face hundreds of times per frame -- measured as ~900ms of "raster" time
++// per composited frame (bstat: raster=896ms/1.5Mpx while upload/tile/texture churn were ~0). The hb_face
++// is pure table data: independent of size, scale, and variation-axis values (those live on the hb_font,
++// created per run below), so it is safe to build once per IDWriteFontFace and reuse.
++//
++// Cache keyed by the raw IDWriteFontFace*. We AddRef the face and keep the ref for the life of the entry,
++// which pins the COM object so its address can never be freed and reused as a stale key. The value owns
++// one hb_face reference. Both are released only in clearHarfBuzzFaceCache() (memory-pressure hook). A lock
++// guards it: shaping is main-thread on this port today, but worker layout could reach here.
++struct CachedHbFace {
++    IDWriteFontFace* dwFace { nullptr }; // held with an explicit AddRef; released on eviction
++    hb_face_t* hbFace { nullptr };       // owns one hb_face reference
++};
++
++static Lock& harfBuzzFaceCacheLock()
++{
++    static NeverDestroyed<Lock> lock;
++    return lock.get();
++}
++
++static HashMap<IDWriteFontFace*, CachedHbFace>& harfBuzzFaceCache()
++{
++    static NeverDestroyed<HashMap<IDWriteFontFace*, CachedHbFace>> cache;
++    return cache.get();
++}
++
++// Returns a BORROWED hb_face_t* owned by the cache (do NOT destroy it). Null only if creation failed.
++static hb_face_t* cachedHarfBuzzFace(IDWriteFontFace* dwFace)
++{
++    Locker locker { harfBuzzFaceCacheLock() };
++    auto& cache = harfBuzzFaceCache();
++    auto it = cache.find(dwFace);
++    if (it != cache.end())
++        return it->value.hbFace;
++
++    hb_face_t* hbFace = hb_directwrite_face_create(dwFace);
++    if (!hbFace)
++        return nullptr;
++    dwFace->AddRef(); // pin the key: prevents the COM object being freed and its address reused
++    cache.add(dwFace, CachedHbFace { dwFace, hbFace });
++    return hbFace;
++}
++
++// Drop all cached faces. Called from the memory-pressure path so a low-memory device can reclaim the
++// (small) table data; entries are rebuilt lazily on next shape.
++void clearHarfBuzzFaceCache()
++{
++    Locker locker { harfBuzzFaceCacheLock() };
++    auto& cache = harfBuzzFaceCache();
++    for (auto& entry : cache.values()) {
++        if (entry.hbFace)
++            hb_face_destroy(entry.hbFace);
++        if (entry.dwFace)
++            entry.dwFace->Release();
++    }
++    cache.clear();
++}
++
+ static inline float harfBuzzPositionToFloat(hb_position_t value)
+ {
+     return static_cast<float>(value) / (1 << 16);
+@@ -72,16 +139,13 @@ static hb_font_funcs_t* harfBuzzFontFunctions()
          }, nullptr, nullptr);
  
          hb_font_funcs_set_variation_glyph_func(fontFunctions, [](hb_font_t*, void* context, hb_codepoint_t unicode, hb_codepoint_t variation, hb_codepoint_t* glyph, void*) -> hb_bool_t {
@@ -4879,7 +5513,7 @@ index aade8a6f6e..3a07137288 100644
              }, nullptr, nullptr);
  #else
          hb_font_funcs_set_glyph_func(fontFunctions, [](hb_font_t*, void* context, hb_codepoint_t unicode, hb_codepoint_t, hb_codepoint_t* glyph, void*) -> hb_bool_t {
-@@ -371,10 +372,15 @@ static Vector<hb_feature_t, 4> fontFeatures(const FontCascade& font, const FontP
+@@ -371,10 +435,15 @@ static Vector<hb_feature_t, 4> fontFeatures(const FontCascade& font, const FontP
  
      // 2. If the font is defined via an @font-face rule, the font features implied by the
      //    font-feature-settings descriptor in the @font-face rule.
@@ -4895,7 +5529,7 @@ index aade8a6f6e..3a07137288 100644
  
      // 3. Font features implied by the value of the ‘font-variant’ property, the related ‘font-variant’
      //    subproperties and any other CSS property that uses OpenType features.
-@@ -506,13 +512,11 @@ void ComplexTextController::collectComplexTextRunsForCharacters(const UChar* cha
+@@ -506,14 +575,15 @@ void ComplexTextController::collectComplexTextRunsForCharacters(const UChar* cha
          return;
  
      const auto& fontPlatformData = font->platformData();
@@ -4908,11 +5542,16 @@ index aade8a6f6e..3a07137288 100644
          return;
  
 -    HbUniquePtr<hb_face_t> face(hb_ft_face_create_cached(ftFace));
-+    HbUniquePtr<hb_face_t> face(hb_directwrite_face_create(dwFace));
-     HbUniquePtr<hb_font_t> harfBuzzFont(hb_font_create(face.get()));
+-    HbUniquePtr<hb_font_t> harfBuzzFont(hb_font_create(face.get()));
++    // Borrowed: owned by the process-global face cache (built once per DirectWrite face, not per run).
++    hb_face_t* face = cachedHarfBuzzFace(dwFace);
++    if (!face)
++        return;
++    HbUniquePtr<hb_font_t> harfBuzzFont(hb_font_create(face));
      hb_font_set_funcs(harfBuzzFont.get(), harfBuzzFontFunctions(), const_cast<Font*>(font), nullptr);
      const float size = fontPlatformData.size();
-@@ -522,19 +526,27 @@ void ComplexTextController::collectComplexTextRunsForCharacters(const UChar* cha
+     if (floorf(size) == size)
+@@ -522,19 +592,27 @@ void ComplexTextController::collectComplexTextRunsForCharacters(const UChar* cha
      hb_font_set_scale(harfBuzzFont.get(), scale, scale);
  
  #if ENABLE(VARIATION_FONTS)
@@ -4951,6 +5590,15 @@ index aade8a6f6e..3a07137288 100644
      }
  #endif
  
+@@ -543,7 +621,7 @@ void ComplexTextController::collectComplexTextRunsForCharacters(const UChar* cha
+     auto features = fontFeatures(m_font, fontPlatformData);
+     HbUniquePtr<hb_buffer_t> buffer(hb_buffer_create());
+     if (fontPlatformData.orientation() == FontOrientation::Vertical)
+-        hb_buffer_set_script(buffer.get(), findScriptForVerticalGlyphSubstitution(face.get()));
++        hb_buffer_set_script(buffer.get(), findScriptForVerticalGlyphSubstitution(face));
+ 
+     for (unsigned i = 0; i < runCount; ++i) {
+         auto& run = runList[m_run.rtl() ? runCount - i - 1 : i];
 diff --git a/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h b/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h
 index c92e7484d1..b0e668ed23 100644
 --- a/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h
@@ -5109,11 +5757,68 @@ index f737ab8fa0..7504cc3b1f 100644
          EGL_DestroyContext(m_display, m_context);
      }
  
+diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp b/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
+index e24493b25d..76ad61ecb6 100644
+--- a/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
++++ b/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
+@@ -32,15 +32,27 @@
+ #include "ImageBuffer.h"
+ #include "TextureMapper.h"
+ 
++#include <wtf/MonotonicTime.h>
++
+ namespace WebCore {
+ 
++// bstat counters (defined in GraphicsLayerTextureMapper.cpp).
++extern double g_bsRasterMs;
++extern unsigned long long g_bsRasterPx;
++extern double g_bsBackCreateMs;
++extern double g_bsBackPaintMs;
++extern double g_bsBackCopyMs;
++extern unsigned g_bsBackCalls;
++
+ void BitmapTexture::updateContents(GraphicsLayer* sourceLayer, const IntRect& targetRect, const IntPoint& offset, float scale)
+ {
++    MonotonicTime rasterStart = MonotonicTime::now();
+     // Making an unconditionally unaccelerated buffer here is OK because this code
+     // isn't used by any platforms that respect the accelerated bit.
+     auto imageBuffer = ImageBuffer::create(targetRect.size(), RenderingMode::Unaccelerated, 1, DestinationColorSpace::SRGB(), PixelFormat::BGRA8);
+     if (!imageBuffer)
+         return;
++    MonotonicTime afterCreate = MonotonicTime::now();
+ 
+     GraphicsContext& context = imageBuffer->context();
+     context.setImageInterpolationQuality(InterpolationQuality::Default);
+@@ -52,12 +64,24 @@ void BitmapTexture::updateContents(GraphicsLayer* sourceLayer, const IntRect& ta
+     context.applyDeviceScaleFactor(scale);
+     context.translate(-sourceRect.x(), -sourceRect.y());
+ 
++    MonotonicTime beforePaint = MonotonicTime::now();
+     sourceLayer->paintGraphicsLayerContents(context, sourceRect);
++    MonotonicTime afterPaint = MonotonicTime::now();
+ 
+     RefPtr<Image> image = imageBuffer->copyImage(DontCopyBackingStore);
+     if (!image)
+         return;
+ 
++    MonotonicTime rasterEnd = MonotonicTime::now();
++    // Raster clock stops here: the call below is the GL upload, accounted separately (g_bsUploadMs).
++    g_bsRasterMs += (rasterEnd - rasterStart).milliseconds();
++    g_bsRasterPx += static_cast<unsigned long long>(targetRect.width()) * targetRect.height();
++    // Localize the stall: create (alloc) vs paint (draw + hidden sync decode/lock) vs copy.
++    g_bsBackCreateMs += (afterCreate - rasterStart).milliseconds();
++    g_bsBackPaintMs += (afterPaint - beforePaint).milliseconds();
++    g_bsBackCopyMs += (rasterEnd - afterPaint).milliseconds();
++    g_bsBackCalls++;
++
+     updateContents(image.get(), targetRect, IntPoint());
+ }
+ 
 diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp b/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp
-index 91e8ea8014..ba165365a2 100644
+index 91e8ea8014..a5b5023887 100644
 --- a/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp
-@@ -25,11 +25,13 @@
+@@ -25,11 +25,15 @@
  #if USE(TEXTURE_MAPPER_GL)
  
  #include "FilterOperations.h"
@@ -5122,13 +5827,35 @@ index 91e8ea8014..ba165365a2 100644
  #include "NativeImage.h"
  #include "NotImplemented.h"
  #include "TextureMapperShaderProgram.h"
++#include <wtf/MonotonicTime.h>
++#include <wtf/Scope.h>
  #include "Timer.h"
 +#include <cstdio> // snprintf for texture-allocation diagnostics
  #include <wtf/HashMap.h>
  #include <wtf/RefCounted.h>
  #include <wtf/RefPtr.h>
-@@ -79,13 +81,102 @@ void BitmapTextureGL::didReset()
+@@ -67,6 +71,11 @@ BitmapTextureGL::BitmapTextureGL(const TextureMapperContextAttributes& contextAt
+     m_internalFormat = GL_RGBA;
+ }
+ 
++// bstat counters (defined in GraphicsLayerTextureMapper.cpp, same namespace).
++extern double g_bsUploadMs;
++extern unsigned long long g_bsUploadKB;
++extern unsigned g_bsTexRealloc, g_bsTexReuse, g_bsTexClamp;
++
+ void BitmapTextureGL::didReset()
+ {
+     if (!m_id)
+@@ -75,21 +84,120 @@ void BitmapTextureGL::didReset()
+     m_shouldClear = true;
+     m_colorConvertFlags = TextureMapperGL::NoFlag;
+     m_filterInfo = FilterInfo();
+-    if (m_textureSize == contentSize())
++    if (m_textureSize == contentSize()) {
++        g_bsTexReuse++;
          return;
++    }
++    g_bsTexRealloc++;
  
      m_textureSize = contentSize();
 +
@@ -5151,6 +5878,7 @@ index 91e8ea8014..ba165365a2 100644
 +    int w = reqW > s_maxTextureSize ? s_maxTextureSize : reqW;
 +    int h = reqH > s_maxTextureSize ? s_maxTextureSize : reqH;
 +    if (w != reqW || h != reqH) {
++        g_bsTexClamp++;
 +        m_textureSize = IntSize(w, h);
 +        char b[112];
 +        snprintf(b, sizeof b, "TEXCLAMP requested %dx%d -> %dx%d", reqW, reqH, w, h);
@@ -5230,7 +5958,17 @@ index 91e8ea8014..ba165365a2 100644
  }
  
  void BitmapTextureGL::updateContents(const void* srcData, const IntRect& targetRect, const IntPoint& sourceOffset, int bytesPerLine)
-@@ -298,8 +389,56 @@ void BitmapTextureGL::createFboIfNeeded()
+ {
++    MonotonicTime uploadStart = MonotonicTime::now();
++    auto accountUpload = makeScopeExit([&] {
++        g_bsUploadMs += (MonotonicTime::now() - uploadStart).milliseconds();
++        g_bsUploadKB += static_cast<unsigned long long>(targetRect.width()) * targetRect.height() * 4 / 1024;
++    });
++
+     // We are updating a texture with format RGBA with content from a buffer that has BGRA format. Instead of turning BGRA
+     // into RGBA and then uploading it, we upload it as is. This causes the texture format to be RGBA but the content to be BGRA,
+     // so we mark the texture to convert the colors when painting the texture.
+@@ -298,8 +406,56 @@ void BitmapTextureGL::createFboIfNeeded()
  void BitmapTextureGL::bindAsSurface()
  {
      glBindTexture(GL_TEXTURE_2D, 0);
@@ -5287,7 +6025,7 @@ index 91e8ea8014..ba165365a2 100644
      glViewport(0, 0, m_textureSize.width(), m_textureSize.height());
      clearIfNeeded();
      m_clipStack.apply();
-@@ -307,6 +446,16 @@ void BitmapTextureGL::bindAsSurface()
+@@ -307,6 +463,16 @@ void BitmapTextureGL::bindAsSurface()
  
  BitmapTextureGL::~BitmapTextureGL()
  {
@@ -5319,10 +6057,10 @@ index 5b163f60f1..42b98a98e1 100644
      TextureMapperContextAttributes m_contextAttributes;
      TextureMapperGL::Flags m_colorConvertFlags { TextureMapperGL::NoFlag };
 diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/texmap/BitmapTexturePool.cpp
-index 8122048536..9bd3681a2e 100644
+index 8122048536..c157b8ce17 100644
 --- a/Source/WebCore/platform/graphics/texmap/BitmapTexturePool.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/BitmapTexturePool.cpp
-@@ -44,6 +44,14 @@ BitmapTexturePool::BitmapTexturePool(const TextureMapperContextAttributes& conte
+@@ -44,21 +44,46 @@ BitmapTexturePool::BitmapTexturePool(const TextureMapperContextAttributes& conte
  }
  #endif
  
@@ -5334,10 +6072,21 @@ index 8122048536..9bd3681a2e 100644
 +unsigned long long g_texmapPoolBytes = 0;
 +unsigned g_texmapPoolCount = 0;
 +
++// bstat counters (defined in GraphicsLayerTextureMapper.cpp).
++extern unsigned g_bsPoolHit, g_bsPoolMiss;
++
  RefPtr<BitmapTexture> BitmapTexturePool::acquireTexture(const IntSize& size, const BitmapTexture::Flags flags)
  {
      Entry* selectedEntry = std::find_if(m_textures.begin(), m_textures.end(),
-@@ -56,9 +64,21 @@ RefPtr<BitmapTexture> BitmapTexturePool::acquireTexture(const IntSize& size, con
+         [&size](Entry& entry) { return entry.m_texture->refCount() == 1 && entry.m_texture->size() == size; });
+ 
+     if (selectedEntry == m_textures.end()) {
++        g_bsPoolMiss++;
+         m_textures.append(Entry(createTexture(flags)));
+         selectedEntry = &m_textures.last();
+-    }
++    } else
++        g_bsPoolHit++;
  
      scheduleReleaseUnusedTextures();
      selectedEntry->markIsInUse();
@@ -5359,7 +6108,7 @@ index 8122048536..9bd3681a2e 100644
  void BitmapTexturePool::scheduleReleaseUnusedTextures()
  {
      if (m_releaseUnusedTexturesTimer.isActive())
-@@ -78,6 +98,7 @@ void BitmapTexturePool::releaseUnusedTexturesTimerFired()
+@@ -78,6 +103,7 @@ void BitmapTexturePool::releaseUnusedTexturesTimerFired()
      m_textures.removeAllMatching([&minUsedTime](const Entry& entry) {
          return entry.canBeReleased(minUsedTime);
      });
@@ -5409,7 +6158,7 @@ index 5f1476fd45..1241d7c558 100644
  // When converting a rounded rectangle to an array of floats, we need 12 elements. So the size of the array
  // required to contain the 10 rectangles is 12 * 10 = 120.
 diff --git a/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp b/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
-index f237be7458..7aba895515 100644
+index f237be7458..04edc3c41a 100644
 --- a/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
 @@ -25,6 +25,11 @@
@@ -5445,7 +6194,7 @@ index f237be7458..7aba895515 100644
  }
  
  void GraphicsLayerTextureMapper::notifyChange(ChangeMask changeMask)
-@@ -58,6 +70,8 @@ void GraphicsLayerTextureMapper::notifyChange(ChangeMask changeMask)
+@@ -58,17 +70,61 @@ void GraphicsLayerTextureMapper::notifyChange(ChangeMask changeMask)
  
  GraphicsLayerTextureMapper::~GraphicsLayerTextureMapper()
  {
@@ -5454,7 +6203,70 @@ index f237be7458..7aba895515 100644
      if (m_contentsLayer)
          m_contentsLayer->setClient(0);
  
-@@ -553,17 +567,113 @@ void GraphicsLayerTextureMapper::updateBackingStoreIncludingSubLayers(TextureMap
+     willBeDestroyed();
+ }
+ 
++// bstat: backing-phase breakdown counters. Written on the main thread during flush/composite, snapshot +
++// reset by the driver each frame (WebCoreDriver compositeTree), printed on SLOWFRAMEs and per gate window.
++// Answers, for the 1.4s-backing frames: WHO invalidates (full vs rect, on big layers), how much rasters,
++// how much uploads, and whether tile/texture churn (retile, realloc, pool miss) is eating the rest.
++unsigned g_bsVisited = 0;        // updateBackingStoreIfNeeded entries on layers with backing
++unsigned g_bsPainted = 0;        // ... that reached updateContents (non-empty dirty)
++unsigned g_bsNdspFull = 0;       // ... that arrived with m_needsDisplay (FULL invalidation)
++unsigned g_bsClipped = 0;        // ... where the visible-band clip fired
++unsigned g_bsSelfHeal = 0;       // null-backing self-heals
++unsigned g_bsInvFull = 0;        // setNeedsDisplay() calls (full-layer invalidation)
++unsigned g_bsInvFullBig = 0;     // ... on layers >= 300k CSS px (the tall scroll layers)
++unsigned g_bsInvRect = 0;        // setNeedsDisplayInRect() calls
++unsigned g_bsInvRectBig = 0;     // ... with rect >= 300k CSS px
++unsigned long long g_bsDirtyPx = 0; // CSS px handed to updateContents after clipping
++unsigned g_bsRetile = 0;         // createOrDestroyTilesIfNeeded past the early-out (tile set rebuilt)
++unsigned g_bsTilesCreated = 0;
++unsigned g_bsTilesRecycled = 0;
++unsigned g_bsTilesRemoved = 0;
++unsigned g_bsScaleNuke = 0;      // contents scale changed -> whole tile grid invalidated
++float g_bsScaleMin = 0.f, g_bsScaleMax = 0.f; // range of scales seen this frame (thrash diagnosis)
++double g_bsRasterMs = 0;         // cairo raster (BitmapTexture::updateContents GraphicsLayer path)
++unsigned long long g_bsRasterPx = 0;
++// Split of the g_bsRasterMs bracket into its three sub-steps, to localize the ~1s stall the
++// RASTER-BY-TYPE instrument proved is NOT in the cairo primitives. create = ImageBuffer::create
++// (allocation), paint = paintGraphicsLayerContents wall (drawing + any synchronous image-decode /
++// lock wait hidden inside it), copy = copyImage(DontCopyBackingStore).
++double g_bsBackCreateMs = 0;
++double g_bsBackPaintMs = 0;
++double g_bsBackCopyMs = 0;
++unsigned g_bsBackCalls = 0;
++double g_bsUploadMs = 0;         // glTexSubImage2D upload (BitmapTextureGL::updateContents)
++unsigned long long g_bsUploadKB = 0;
++unsigned g_bsTexRealloc = 0;     // BitmapTextureGL::didReset full reallocation (size changed)
++unsigned g_bsTexReuse = 0;       // ... early-return reuse (size matched)
++unsigned g_bsTexClamp = 0;       // TEXCLAMP fired (>4096 request)
++unsigned g_bsPoolHit = 0;        // BitmapTexturePool acquire matched an idle texture
++unsigned g_bsPoolMiss = 0;       // ... had to create a new one
++
+ void GraphicsLayerTextureMapper::setNeedsDisplay()
+ {
+     if (!drawsContent())
+         return;
+ 
++    g_bsInvFull++;
++    if (m_size.width() * m_size.height() >= 300000)
++        g_bsInvFullBig++;
++
+     // The current size might change, thus we need to update the whole display.
+     m_needsDisplay = true;
+     notifyChange(DisplayChange);
+@@ -88,6 +144,9 @@ void GraphicsLayerTextureMapper::setNeedsDisplayInRect(const FloatRect& rect, Sh
+ 
+     if (m_needsDisplay)
+         return;
++    g_bsInvRect++;
++    if (rect.width() * rect.height() >= 300000)
++        g_bsInvRectBig++;
+     m_needsDisplayRect.unite(rect);
+     notifyChange(DisplayChange);
+     addRepaintRect(rect);
+@@ -553,20 +612,124 @@ void GraphicsLayerTextureMapper::updateBackingStoreIncludingSubLayers(TextureMap
          downcast<GraphicsLayerTextureMapper>(child.get()).updateBackingStoreIncludingSubLayers(textureMapper);
  }
  
@@ -5498,8 +6310,12 @@ index f237be7458..7aba895515 100644
 +    // below dereferenced a null backing store (crash at this+0x24) — that was the x.com wedge that
 +    // then cascaded into repeated ANGLE faults and blocked every later navigation. Create the real
 +    // backing store the layer is supposed to have (same as prepareBackingStoreIfNeeded) and paint.
++    g_bsVisited++;
++    if (m_needsDisplay)
++        g_bsNdspFull++;
      ASSERT(m_backingStore);
 +    if (!m_backingStore) {
++        g_bsSelfHeal++;
 +        m_backingStore = TextureMapperTiledBackingStore::create();
 +        m_changeMask |= BackingStoreChange;
 +        // Brand-new backing store: force a full paint. Otherwise m_needsDisplay is false and the
@@ -5550,6 +6366,7 @@ index f237be7458..7aba895515 100644
 +            }
 +            dirtyRect.intersect(band);
 +            clipped = true;
++            g_bsClipped++;
 +        }
 +    }
 +
@@ -5568,6 +6385,12 @@ index f237be7458..7aba895515 100644
      if (dirtyRect.isEmpty())
          return;
  
++    g_bsPainted++;
++    g_bsDirtyPx += static_cast<unsigned long long>(dirtyRect.width()) * dirtyRect.height();
++
+     m_backingStore->updateContentsScale(pageScaleFactor() * deviceScaleFactor());
+ 
+     dirtyRect.scale(pageScaleFactor() * deviceScaleFactor());
 diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperFPSCounter.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperFPSCounter.cpp
 index c8cac48c6c..8e32104292 100644
 --- a/Source/WebCore/platform/graphics/texmap/TextureMapperFPSCounter.cpp
@@ -6045,10 +6868,10 @@ index c902dd5a00..0f30aa3886 100644
  
      m_texture->updateContents(sourceLayer, targetRect, sourceOffset, scale);
 diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
-index aa8c49b2d7..a9184829a1 100644
+index aa8c49b2d7..b5e262a313 100644
 --- a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
-@@ -24,11 +24,30 @@
+@@ -24,11 +24,34 @@
  #include "ImageBuffer.h"
  #include "ImageObserver.h"
  #include "TextureMapper.h"
@@ -6076,10 +6899,25 @@ index aa8c49b2d7..a9184829a1 100644
 +// coords). Used to allocate GPU tiles ONLY for what's on screen.
 +bool texmapVisibleRectForTiling(IntRect&);
 +
++// bstat counters (defined in GraphicsLayerTextureMapper.cpp; see the block comment there).
++extern unsigned g_bsRetile, g_bsTilesCreated, g_bsTilesRecycled, g_bsTilesRemoved, g_bsScaleNuke;
++extern float g_bsScaleMin, g_bsScaleMax;
++
  void TextureMapperTiledBackingStore::updateContentsFromImageIfNeeded(TextureMapper& textureMapper)
  {
      if (!m_image)
-@@ -77,21 +96,71 @@ void TextureMapperTiledBackingStore::updateContentsScale(float scale)
+@@ -73,25 +96,83 @@ void TextureMapperTiledBackingStore::updateContentsScale(float scale)
+     if (m_contentsScale == scale)
+         return;
+ 
++    g_bsScaleNuke++;
++    // Track the range of scales that caused nukes this frame. Oscillation (min != max) means the
++    // effective contents scale is thrashing -> every nuke re-rasters the whole grid. Old value first.
++    if (g_bsScaleMin == 0.f || m_contentsScale < g_bsScaleMin) g_bsScaleMin = m_contentsScale;
++    if (m_contentsScale > g_bsScaleMax) g_bsScaleMax = m_contentsScale;
++    if (scale < g_bsScaleMin) g_bsScaleMin = scale;
++    if (scale > g_bsScaleMax) g_bsScaleMax = scale;
+     m_isScaleDirty = true;
      m_contentsScale = scale;
  }
  
@@ -6131,6 +6969,7 @@ index aa8c49b2d7..a9184829a1 100644
      m_isScaleDirty = false;
 +    m_lastTilingVisibleRect = gateToVisible ? scaledVisible : FloatRect();
 +    m_wasTilingGated = gateToVisible;
++    g_bsRetile++;
  
      FloatSize scaledSize(m_size);
      if (!m_image)
@@ -6153,7 +6992,7 @@ index aa8c49b2d7..a9184829a1 100644
  
      // This method recycles tiles. We check which tiles we need to add, which to remove, and use as many
      // removable tiles as replacement for new tiles when possible.
-@@ -99,6 +168,8 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -99,6 +180,8 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
          for (float x = 0; x < scaledSize.width(); x += tileSize.width()) {
              FloatRect tileRect(x, y, tileSize.width(), tileSize.height());
              tileRect.intersect(rect());
@@ -6162,7 +7001,7 @@ index aa8c49b2d7..a9184829a1 100644
              tileRectsToAdd.append(tileRect);
          }
      }
-@@ -124,6 +195,13 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -124,6 +207,13 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
              tileIndicesToRemove.append(i);
      }
  
@@ -6176,7 +7015,19 @@ index aa8c49b2d7..a9184829a1 100644
      // Recycle removable tiles to be used for newly requested tiles.
      for (auto& rect : tileRectsToAdd) {
          if (!tileIndicesToRemove.isEmpty()) {
-@@ -141,12 +219,44 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -131,6 +221,7 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+             TextureMapperTile& tile = m_tiles[tileIndicesToRemove.last()];
+             tileIndicesToRemove.removeLast();
+             tile.setRect(rect);
++            g_bsTilesRecycled++;
+ 
+             if (tile.texture())
+                 tile.texture()->reset(enclosingIntRect(tile.rect()).size(), hasAlpha ? BitmapTexture::SupportsAlpha : 0);
+@@ -138,17 +229,51 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+         }
+ 
+         m_tiles.append(TextureMapperTile(rect));
++        g_bsTilesCreated++;
      }
  
      // Remove unnecessary tiles, if they weren't recycled.
@@ -6188,7 +7039,8 @@ index aa8c49b2d7..a9184829a1 100644
 +        if (m_tiles.size() <= eraseThreshold)
              break;
          m_tiles.remove(index);
-     }
++        g_bsTilesRemoved++;
++    }
 +    { // Account this store's GPU tile bytes into the global, and log the layer's share periodically.
 +        unsigned long long bytes = 0;
 +        for (auto& t : m_tiles) {
@@ -6209,9 +7061,9 @@ index aa8c49b2d7..a9184829a1 100644
 +                bytes / 1024, gateToVisible ? 1 : 0, g_texmapTileBytes / 1024, g_texmapStoreCount);
 +            WebCorePort::portLog(b);
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
 +TextureMapperTiledBackingStore::~TextureMapperTiledBackingStore()
 +{
 +    auto& map = tileBytesByStore();
@@ -6220,10 +7072,12 @@ index aa8c49b2d7..a9184829a1 100644
 +        map.remove(it);
 +    }
 +    g_texmapStoreCount = map.size();
- }
- 
++}
++
  void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper, Image* image, const FloatSize& totalSize, const IntRect& dirtyRect)
-@@ -159,8 +269,16 @@ void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper
+ {
+     createOrDestroyTilesIfNeeded(totalSize, textureMapper.maxTextureSize(), !image->currentFrameKnownToBeOpaque());
+@@ -159,8 +284,16 @@ void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper
  void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper, GraphicsLayer* sourceLayer, const FloatSize& totalSize, const IntRect& dirtyRect)
  {
      createOrDestroyTilesIfNeeded(totalSize, textureMapper.maxTextureSize(), true);
@@ -7775,7 +8629,7 @@ index 033c912f3e..b9883d2008 100644
 +
 +#endif // USE(MEDIA_FOUNDATION)
 diff --git a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
-index 953df378ec..cda3cd45db 100644
+index 953df378ec..c81a1d327d 100644
 --- a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 +++ b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 @@ -25,56 +25,152 @@
@@ -7980,7 +8834,7 @@ index 953df378ec..cda3cd45db 100644
  }
  
  static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
-@@ -116,2888 +214,1454 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
+@@ -116,2888 +214,1480 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
      if (cachedTypes.get().size() > 0)
          return cachedTypes;
  
@@ -8027,6 +8881,22 @@ index 953df378ec..cda3cd45db 100644
  {
      types = mimeTypeCache();
 +    { extern void PortImgLog(const char*); char b[96]; snprintf(b, sizeof b, "mf: getSupportedTypes count=%u", (unsigned)types.size()); PortImgLog(b); }
++}
++
++// True if the codecs string names ANY codec this device cannot hardware-decode (and can't software-
++// decode fast enough at video resolution). Used to keep YouTube's ABR off AV1/VP9/Opus so it selects
++// the H.264/AAC renditions we can actually play. Shared by the MSE path here and PortMseIsTypeSupported.
++bool mseCodecsUndecodable(const String& codecs)
++{
++    String c = codecs.convertToASCIILowercase();
++    // Video we can't decode: AV1 (av01/av1), VP9 (vp09/vp9), VP8 (vp08/vp8).
++    // Audio we can't demux/decode through the fMP4 pipeline: Opus, Vorbis, Dolby (ac-3/ec-3), FLAC.
++    return c.contains("av01"_s) || c.contains("av1."_s)
++        || c.contains("vp09"_s) || c.contains("vp9"_s)
++        || c.contains("vp08"_s) || c.contains("vp8"_s)
++        || c.contains("opus"_s) || c.contains("vorbis"_s)
++        || c.contains("ac-3"_s) || c.contains("ec-3"_s)
++        || c.contains("flac"_s) || c.contains("dts"_s);
  }
  
 +static MediaPlayer::SupportsType mfSupportsTypeImpl(const MediaEngineSupportParameters&);
@@ -8099,6 +8969,16 @@ index 953df378ec..cda3cd45db 100644
 +        // adaptive players (YouTube) fall back to their mp4/H.264 streams. Direct (non-MSE) <video>
 +        // still plays webm/VP9/etc. via the installed Store codec extensions.
 +        if (!equalLettersIgnoringASCIICase(containerType, "video/mp4") && !equalLettersIgnoringASCIICase(containerType, "audio/mp4"))
++            return MediaPlayer::SupportsType::IsNotSupported;
++        // HONEST CODEC GATING (RC1). This device (Adreno 305 / Snapdragon 400) has HW decode for
++        // H.264+AAC only. AV1/VP9 must be decoded in software at video resolution — it can't keep up,
++        // so appendBuffer "succeeds" but the pipeline never advances video.buffered, the SABR server
++        // sees no progress and returns 204s forever -> the 60s wedge. If we claim these codecs are
++        // supported, YouTube's ABR PICKS them (mp4 can carry av01/vp09). So reject them here: MWEB's
++        // ABR then selects the H.264/AAC mp4 renditions we can actually decode. Codecs is a
++        // comma-separated list ("avc1.640028,mp4a.40.2"); reject the WHOLE type if ANY entry is one we
++        // can't decode. (ContentType lowercases codec params, but match case-insensitively to be safe.)
++        if (!codecs.isEmpty() && mseCodecsUndecodable(codecs))
 +            return MediaPlayer::SupportsType::IsNotSupported;
 +        return codecs.isEmpty() ? MediaPlayer::SupportsType::MayBeSupported : MediaPlayer::SupportsType::IsSupported;
 +    }
@@ -8757,16 +9637,12 @@ index 953df378ec..cda3cd45db 100644
              return;
 -        weakPtr->onCreatedMediaSource();
 -    });
--
--    return true;
--}
 +        }
 +    }
 +#endif
  
--bool MediaPlayerPrivateMediaFoundation::endGetEvent(IMFAsyncResult* asyncResult)
--{
--    COMPtr<IMFMediaEvent> event;
+-    return true;
+-}
 +#if ENABLE(MEDIA_SOURCE)
 +    // PROGRESSIVE (<video src="...mp4">). Do NOT hand the URL to IMFMediaEngine: it fetches with the
 +    // legacy Windows Media network source (its own UA, no cookies, no Referer), so SetSource returns
@@ -8792,8 +9668,9 @@ index 953df378ec..cda3cd45db 100644
 +    }
 +#endif
  
--    if (!m_mediaSession)
--        return false;
+-bool MediaPlayerPrivateMediaFoundation::endGetEvent(IMFAsyncResult* asyncResult)
+-{
+-    COMPtr<IMFMediaEvent> event;
 +    bool engineOk = createMediaEngine();
 +    { extern void PortImgLog(const char*); auto u = url.utf8(); char b[400];
 +      snprintf(b, sizeof b, "mf: load engine=%d dxgi=%d url=%s", engineOk?1:0, m_dxgiManager?1:0, u.data()); PortImgLog(b); }
@@ -8803,15 +9680,18 @@ index 953df378ec..cda3cd45db 100644
 +        return;
 +    }
  
--    // Get the event from the event queue.
--    HRESULT hr = m_mediaSession->EndGetEvent(asyncResult, &event);
--    if (FAILED(hr))
+-    if (!m_mediaSession)
 -        return false;
 +    BSTR urlString = SysAllocString(url.wideCharacters().data());
 +    HRESULT hr = m_mediaEngine->SetSource(urlString);
 +    SysFreeString(urlString);
 +    { extern void PortImgLog(const char*); char b[80]; snprintf(b, sizeof b, "mf: SetSource hr=0x%08lx", (unsigned long)hr); PortImgLog(b); }
  
+-    // Get the event from the event queue.
+-    HRESULT hr = m_mediaSession->EndGetEvent(asyncResult, &event);
+-    if (FAILED(hr))
+-        return false;
+-
 -    // Get the event type.
 -    MediaEventType mediaEventType;
 -    hr = event->GetType(&mediaEventType);
@@ -8988,10 +9868,12 @@ index 953df378ec..cda3cd45db 100644
 -    Locker locker { m_mutexListeners };
 -
 -    m_listeners.add(listener);
--}
--
+ }
+ 
 -void MediaPlayerPrivateMediaFoundation::removeListener(MediaPlayerListener* listener)
--{
++#if ENABLE(MEDIA_STREAM)
++void MediaPlayerPrivateMediaFoundation::load(MediaStreamPrivate&)
+ {
 -    Locker locker { m_mutexListeners };
 -
 -    m_listeners.remove(listener);
@@ -9003,12 +9885,10 @@ index 953df378ec..cda3cd45db 100644
 -
 -    for (HashSet<MediaPlayerListener*>::const_iterator it = m_listeners.begin(); it != m_listeners.end(); ++it)
 -        (*it)->onMediaPlayerDeleted();
- }
- 
+-}
+-
 -void MediaPlayerPrivateMediaFoundation::setNaturalSize(const FloatSize& size)
-+#if ENABLE(MEDIA_STREAM)
-+void MediaPlayerPrivateMediaFoundation::load(MediaStreamPrivate&)
- {
+-{
 -    Locker locker { m_cachedNaturalSizeLock };
 -    m_cachedNaturalSize = size;
 +    // Media Foundation does not play WebRTC/getUserMedia MediaStreams. Report the
@@ -9170,14 +10050,14 @@ index 953df378ec..cda3cd45db 100644
 -}
 -
 -void MediaPlayerPrivateMediaFoundation::onBufferingStopped()
--{
++#if ENABLE(MEDIA_SOURCE)
++void MediaPlayerPrivateMediaFoundation::load(const URL&, const ContentType&, MediaSourcePrivateClient* client)
+ {
 -    updateReadyState();
 -}
 -
 -void MediaPlayerPrivateMediaFoundation::onSessionStarted()
-+#if ENABLE(MEDIA_SOURCE)
-+void MediaPlayerPrivateMediaFoundation::load(const URL&, const ContentType&, MediaSourcePrivateClient* client)
- {
+-{
 -    m_sessionEnded = false;
 -    if (m_seeking) {
 -        m_seeking = false;
@@ -17477,10 +18357,26 @@ index db35dc7066..954fdf300c 100644
          paintFillLayers(paintInfo, Color(), style().maskLayers(), paintRect, BackgroundBleedNone, compositeOp);
          paintNinePieceImage(paintInfo.context(), paintRect, style(), style().maskBoxImage(), compositeOp);
 diff --git a/Source/WebCore/rendering/RenderBoxModelObject.cpp b/Source/WebCore/rendering/RenderBoxModelObject.cpp
-index 8530e3355f..70259a7daf 100644
+index 8530e3355f..7958b55797 100644
 --- a/Source/WebCore/rendering/RenderBoxModelObject.cpp
 +++ b/Source/WebCore/rendering/RenderBoxModelObject.cpp
-@@ -755,6 +755,17 @@ void RenderBoxModelObject::paintFillLayerExtended(const PaintInfo& paintInfo, co
+@@ -331,7 +331,14 @@ DecodingMode RenderBoxModelObject::decodingModeForImageDraw(const Image& image,
+     // FIXME: isVisibleInViewport() is not cheap. Find a way to make this condition faster.
+     if (!isVisibleInViewport())
+         return DecodingMode::Asynchronous;
+-    return DecodingMode::Synchronous;
++    // Revenant: upstream returns Synchronous here so a VISIBLE image never flashes in — it blocks the
++    // main thread until decoded. On this software-raster ARM32 device that block is 100s of ms per
++    // image and repeats every tile re-raster, which is the sustained paint stall the BACK-SPLIT
++    // instrument proved (paint >> cairo primitives). Decode on the worker thread instead; the frame
++    // pops in a frame or two later (imageFrameAvailable -> repaint), which is vastly better than
++    // freezing the whole UI. Any image large enough to be worth decoding is large enough to be worth
++    // NOT blocking on.
++    return DecodingMode::Asynchronous;
+ }
+ 
+ LayoutSize RenderBoxModelObject::relativePositionOffset() const
+@@ -755,6 +762,17 @@ void RenderBoxModelObject::paintFillLayerExtended(const PaintInfo& paintInfo, co
      Color bgColor = color;
      StyleImage* bgImage = bgLayer.image();
      bool shouldPaintBackgroundImage = bgImage && bgImage->canRender(this, style().effectiveZoom());
@@ -17618,6 +18514,69 @@ index bfe52d758f..50a771d9c0 100644
              if (layer.isRenderViewLayer() && useCoordinatedScrollingForLayer(layer)) {
                  auto& frameView = m_renderView.frameView();
                  if (auto* scrollingCoordinator = this->scrollingCoordinator())
+diff --git a/Source/WebCore/rendering/RenderLayerFilters.cpp b/Source/WebCore/rendering/RenderLayerFilters.cpp
+index 5ba94cfd5d..bb6707cd66 100644
+--- a/Source/WebCore/rendering/RenderLayerFilters.cpp
++++ b/Source/WebCore/rendering/RenderLayerFilters.cpp
+@@ -33,9 +33,13 @@
+ 
+ #include "CSSFilter.h"
+ #include "CachedSVGDocument.h"
++#include "FilterOperation.h"
++#include "FilterOperations.h"
+ #include "CachedSVGDocumentReference.h"
+ #include "Logging.h"
+ #include "RenderSVGResourceFilter.h"
++#include <algorithm>
++#include <cmath>
+ #include <wtf/NeverDestroyed.h>
+ 
+ namespace WebCore {
+@@ -116,11 +120,44 @@ void RenderLayerFilters::removeReferenceFilterClients()
+     m_internalSVGReferences.clear();
+ }
+ 
++// Revenant memory tier (0 = 1GB software-raster device). Declared here to keep the filter downsample
++// local to this TU; defined in WebCoreDriver.cpp.
++extern "C" unsigned WebCoreMemBudgetTier();
++
+ void RenderLayerFilters::buildFilter(RenderElement& renderer, float scaleFactor, RenderingMode renderingMode)
+ {
+     // If the filter fails to build, remove it from the layer. It will still attempt to
+     // go through regular processing (e.g. compositing), but never apply anything.
+     // FIXME: This rebuilds the entire effects chain even if the filter style didn't change.
++
++    // Revenant: on the tier-0 device (1GB, no GPU filter path — every filter is a SOFTWARE raster)
++    // the passed scaleFactor is the device scale (1.75 on the 640XL), so filters get SUPERSAMPLED and
++    // FEGaussianBlur's boxBlur (cost ~= regionPixels * scale^2, O(area) via running-sum) runs on the
++    // single ARM32 CPU. A full-page `filter: blur()` (pornhub's age-gate `body.is-blurred`) measured a
++    // 3-15s main-thread burn (MAIN-STALL stage=c3:updateBacking BURNING-CPU in boxBlur), and because a
++    // CSS animation on the same subtree re-rasters the layer every frame, it recomputes forever ->
++    // hard freeze. Blur is low-frequency, so downsampling it is visually free.
++    if (WebCoreMemBudgetTier() == 0 && scaleFactor > 0.0f) {
++        // Never supersample a filter on this device.
++        if (scaleFactor > 1.0f)
++            scaleFactor = 1.0f;
++        // If a blur is present, bound the raster area to a fixed pixel budget so even a per-frame
++        // recompute stays ~tens of ms (sluggish, not a watchdog kill) instead of seconds. Only blur is
++        // clamped this hard — it's the one expensive filter that's immune to downsampling; sharp
++        // filters (drop-shadow edges) keep the <=1.0 scale above.
++        bool hasBlur = false;
++        for (auto& op : renderer.style().filter().operations()) {
++            if (op && op->type() == FilterOperation::BLUR) { hasBlur = true; break; }
++        }
++        if (hasBlur) {
++            float areaCss = std::max(1.0f, m_targetBoundingBox.width().toFloat() * m_targetBoundingBox.height().toFloat());
++            const float kBudgetPx = 90000.0f; // ~300x300 raster target
++            float fit = std::sqrt(kBudgetPx / areaCss);
++            if (fit < scaleFactor)
++                scaleFactor = std::max(0.35f, fit); // floor so a huge region doesn't blur to mush
++        }
++    }
++
+     m_filter = CSSFilter::create(renderer, renderer.style().filter(), renderingMode, FloatSize { scaleFactor, scaleFactor }, Filter::ClipOperation::Unite, m_targetBoundingBox);
+ }
+ 
 diff --git a/Source/WebCore/rendering/style/RenderStyle.h b/Source/WebCore/rendering/style/RenderStyle.h
 index 019e6ec724..7eafa61c3a 100644
 --- a/Source/WebCore/rendering/style/RenderStyle.h
@@ -17661,6 +18620,155 @@ index c48f376442..2b9b20ad50 100644
  #endif
  #if ENABLE(CSS3_TEXT)
      , textAlignLast(static_cast<unsigned>(RenderStyle::initialTextAlignLast()))
+diff --git a/Source/WebCore/svg/SVGLengthContext.cpp b/Source/WebCore/svg/SVGLengthContext.cpp
+index 91e6ea08f3..48f0d7f92e 100644
+--- a/Source/WebCore/svg/SVGLengthContext.cpp
++++ b/Source/WebCore/svg/SVGLengthContext.cpp
+@@ -25,6 +25,7 @@
+ #include "SVGLengthContext.h"
+ 
+ #include "CSSHelper.h"
++#include "Document.h"
+ #include "FontMetrics.h"
+ #include "Frame.h"
+ #include "LegacyRenderSVGRoot.h"
+@@ -133,6 +134,8 @@ ExceptionOr<float> SVGLengthContext::convertValueToUserUnits(float value, SVGLen
+         return convertValueFromPercentageToUserUnits(value / 100, lengthMode);
+     case SVGLengthType::Ems:
+         return convertValueFromEMSToUserUnits(value);
++    case SVGLengthType::Rem:
++        return convertValueFromREMSToUserUnits(value);
+     case SVGLengthType::Exs:
+         return convertValueFromEXSToUserUnits(value);
+     case SVGLengthType::Centimeters:
+@@ -162,6 +165,8 @@ ExceptionOr<float> SVGLengthContext::convertValueFromUserUnits(float value, SVGL
+         return convertValueFromUserUnitsToPercentage(value * 100, lengthMode);
+     case SVGLengthType::Ems:
+         return convertValueFromUserUnitsToEMS(value);
++    case SVGLengthType::Rem:
++        return convertValueFromUserUnitsToREMS(value);
+     case SVGLengthType::Exs:
+         return convertValueFromUserUnitsToEXS(value);
+     case SVGLengthType::Pixels:
+@@ -259,6 +264,42 @@ ExceptionOr<float> SVGLengthContext::convertValueFromEMSToUserUnits(float value)
+     return value * style->computedFontPixelSize();
+ }
+ 
++// rem resolves against the DOCUMENT ROOT element's font size, not the local element's (that's em).
++static inline const RenderStyle* rootRenderStyleForRem(const SVGElement* context)
++{
++    if (!context)
++        return nullptr;
++    if (auto* root = context->document().documentElement()) {
++        if (root->renderer())
++            return &root->renderer()->style();
++    }
++    // No root renderer yet — fall back to the element's own resolved style so we still produce a
++    // sane pixel value instead of failing the whole attribute parse (which would drop to 100%).
++    return renderStyleForLengthResolving(context);
++}
++
++ExceptionOr<float> SVGLengthContext::convertValueFromUserUnitsToREMS(float value) const
++{
++    auto* style = rootRenderStyleForRem(m_context);
++    if (!style)
++        return Exception { NotSupportedError };
++
++    float fontSize = style->computedFontPixelSize();
++    if (!fontSize)
++        return Exception { NotSupportedError };
++
++    return value / fontSize;
++}
++
++ExceptionOr<float> SVGLengthContext::convertValueFromREMSToUserUnits(float value) const
++{
++    auto* style = rootRenderStyleForRem(m_context);
++    if (!style)
++        return Exception { NotSupportedError };
++
++    return value * style->computedFontPixelSize();
++}
++
+ ExceptionOr<float> SVGLengthContext::convertValueFromUserUnitsToEXS(float value) const
+ {
+     auto* style = renderStyleForLengthResolving(m_context);
+diff --git a/Source/WebCore/svg/SVGLengthContext.h b/Source/WebCore/svg/SVGLengthContext.h
+index d3cc4fa700..d620a52c8f 100644
+--- a/Source/WebCore/svg/SVGLengthContext.h
++++ b/Source/WebCore/svg/SVGLengthContext.h
+@@ -60,6 +60,9 @@ private:
+     ExceptionOr<float> convertValueFromUserUnitsToEMS(float value) const;
+     ExceptionOr<float> convertValueFromEMSToUserUnits(float value) const;
+ 
++    ExceptionOr<float> convertValueFromUserUnitsToREMS(float value) const;
++    ExceptionOr<float> convertValueFromREMSToUserUnits(float value) const;
++
+     ExceptionOr<float> convertValueFromUserUnitsToEXS(float value) const;
+     ExceptionOr<float> convertValueFromEXSToUserUnits(float value) const;
+ 
+diff --git a/Source/WebCore/svg/SVGLengthValue.cpp b/Source/WebCore/svg/SVGLengthValue.cpp
+index 39061332cc..20f06ce601 100644
+--- a/Source/WebCore/svg/SVGLengthValue.cpp
++++ b/Source/WebCore/svg/SVGLengthValue.cpp
+@@ -56,6 +56,8 @@ static inline const char* lengthTypeToString(SVGLengthType lengthType)
+         return "pt";
+     case SVGLengthType::Picas:
+         return "pc";
++    case SVGLengthType::Rem:
++        return "rem";
+     }
+ 
+     ASSERT_NOT_REACHED();
+@@ -74,8 +76,15 @@ template<typename CharacterType> static inline SVGLengthType parseLengthType(Str
+ 
+     auto secondChar = *buffer++;
+ 
+-    if (!buffer.atEnd())
++    if (!buffer.atEnd()) {
++        // The only 3-character unit we accept is "rem" (CSS root em). Anything else is invalid.
++        auto thirdChar = *buffer++;
++        if (!buffer.atEnd())
++            return SVGLengthType::Unknown;
++        if (firstChar == 'r' && secondChar == 'e' && thirdChar == 'm')
++            return SVGLengthType::Rem;
+         return SVGLengthType::Unknown;
++    }
+ 
+     if (firstChar == 'e' && secondChar == 'm')
+         return SVGLengthType::Ems;
+@@ -108,6 +117,8 @@ static inline SVGLengthType primitiveTypeToLengthType(CSSUnitType primitiveType)
+         return SVGLengthType::Percentage;
+     case CSSUnitType::CSS_EMS:
+         return SVGLengthType::Ems;
++    case CSSUnitType::CSS_REMS:
++        return SVGLengthType::Rem;
+     case CSSUnitType::CSS_EXS:
+         return SVGLengthType::Exs;
+     case CSSUnitType::CSS_PX:
+@@ -140,6 +151,8 @@ static inline CSSUnitType lengthTypeToPrimitiveType(SVGLengthType lengthType)
+         return CSSUnitType::CSS_PERCENTAGE;
+     case SVGLengthType::Ems:
+         return CSSUnitType::CSS_EMS;
++    case SVGLengthType::Rem:
++        return CSSUnitType::CSS_REMS;
+     case SVGLengthType::Exs:
+         return CSSUnitType::CSS_EXS;
+     case SVGLengthType::Pixels:
+diff --git a/Source/WebCore/svg/SVGLengthValue.h b/Source/WebCore/svg/SVGLengthValue.h
+index 448b94fc65..43c6a32e44 100644
+--- a/Source/WebCore/svg/SVGLengthValue.h
++++ b/Source/WebCore/svg/SVGLengthValue.h
+@@ -41,7 +41,8 @@ enum class SVGLengthType : uint8_t {
+     Millimeters,
+     Inches,
+     Points,
+-    Picas
++    Picas,
++    Rem // CSS rem unit — non-SVG1.1, resolved off the document root font size (modern SVG/CSS).
+ };
+ 
+ enum class SVGLengthMode : uint8_t {
 diff --git a/Source/WebCore/svg/graphics/SVGImage.cpp b/Source/WebCore/svg/graphics/SVGImage.cpp
 index 4dd7f80e37..4f8b06da3a 100644
 --- a/Source/WebCore/svg/graphics/SVGImage.cpp

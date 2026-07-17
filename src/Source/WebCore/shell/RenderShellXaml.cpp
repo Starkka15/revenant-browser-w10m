@@ -13,7 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <roapi.h>  // RoInitialize for the background memory-watcher thread
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <EGL/egl.h>
@@ -42,11 +44,14 @@ extern "C" void WebCoreBrowserRenderFrameSafe();
 extern "C" void WebCoreBrowserLog(const char*);
 extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale);
 extern "C" void WebCoreBrowserTap(int x, int y);
+extern "C" void WebCoreSetMemoryBudgetFromLimit(unsigned long long appLimitBytes);
 extern "C" void WebCoreBrowserTouch(int identifier, int phase, int x, int y); // 0=down 1=move 2=up 3=cancel
 extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y);
 extern "C" void WebCoreBrowserNavigate(const char* url);
 extern "C" void WebCoreBrowserKeepCompositing(unsigned frames);
 extern "C" void WebCoreBrowserReleaseMemory(int critical); // release WebKit caches on memory pressure
+extern "C" void WebCoreBrowserMemEmergency(); // background watcher -> frame pump: release at first opportunity
+extern "C" void PortMseEmergencyTrim();       // off-main-thread MSE buffered-media trim (ShellMse.cpp)
 extern "C" void WebCoreBrowserSetMemStats(unsigned long long usedBytes, unsigned long long limitBytes,
     unsigned long long pct, int level); // publish app memory to WebKit (footprint + gate line)
 extern "C" void WebCoreBrowserForceRepaint();
@@ -371,6 +376,91 @@ private:
             snprintf(b, sizeof b, "revenant: InitPanel rc=%d px=%dx%d scale=%.3f", rc, pxW, pxH, raw);
             WebCorePort::portLog(b);
 
+            // BACKGROUND memory watcher. The UI-thread sampler above goes blind exactly when it matters:
+            // a 3s+ main-thread stall (heavy decode/CSS at video open) stops both the readings and any
+            // releaseMemory, and the run-4 death shows memory racing from 78% past the 390MB cap with
+            // zero log lines. This thread keeps watching (and logging) through main-thread stalls:
+            //  >=88%: flag the frame pump for an immediate critical release at its next iteration.
+            //  >=92%: emergency-trim MSE buffered media directly on the WinRT buffers (thread-safe,
+            //         MF owns the frames) -- the one big lever that does not need the main thread.
+            //
+            // Per-device memory tiering: read THIS device's real AppMemoryUsageLimit (1GB->390MB,
+            // 2GB->900MB) and set the budget NOW, on the main thread (the resource-cache resize it does
+            // is not safe from the watcher thread). Every lever below — release thresholds, MSE
+            // keep-behind, cache size — then derives from the resulting tier instead of 1GB-hardcoded
+            // constants. The watcher only READS the derived effective ceiling (pure computation).
+            try {
+                uint64 startupLimit = Windows::System::MemoryManager::AppMemoryUsageLimit;
+                WebCoreSetMemoryBudgetFromLimit(startupLimit);
+            } catch (...) { }
+            std::thread([] {
+                RoInitialize(RO_INIT_MULTITHREADED);
+                unsigned long long lastLoggedPct = 0, lastLimit = 0;
+                int lastLevel = -1;
+                ULONGLONG lastEmergency = 0, lastTrim = 0;
+                for (;;) {
+                    Sleep(250);
+                    unsigned long long used = 0, limit = 0;
+                    int level = 0;
+                    try {
+                        used = Windows::System::MemoryManager::AppMemoryUsage;
+                        limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
+                        level = (int)Windows::System::MemoryManager::AppMemoryUsageLevel;
+                    } catch (...) { continue; }
+                    if (!limit)
+                        continue;
+                    // The OS LOWERS the limit dynamically under system commit pressure (observed
+                    // 390MB -> 195MB mid-session, level jumping to 3=OverLimit at an unchanged
+                    // usage). Log every change — it is the reaper announcing itself.
+                    if (limit != lastLimit) {
+                        if (lastLimit) {
+                            char lb[112];
+                            snprintf(lb, sizeof lb, "memwatch: LIMIT CHANGED %lluMB -> %lluMB",
+                                lastLimit / (1024 * 1024), limit / (1024 * 1024));
+                            WebCoreBrowserLog(lb);
+                        }
+                        lastLimit = limit;
+                    }
+                    unsigned long long pct = used * 100 / limit;
+                    // Log transitions only (level change, or pct moved >=2 points) so a stable page
+                    // stays quiet but a spike leaves a trail even while the UI thread is stalled.
+                    if (level != lastLevel || (pct > lastLoggedPct ? pct - lastLoggedPct : lastLoggedPct - pct) >= 2) {
+                        char wb[128];
+                        snprintf(wb, sizeof wb, "memwatch: %lluMB (%llu%%) level=%d",
+                            used / (1024 * 1024), pct, level);
+                        WebCoreBrowserLog(wb);
+                        lastLoggedPct = pct;
+                        lastLevel = level;
+                    }
+                    ULONGLONG now = GetTickCount64();
+                    // Thresholds derive from the EFFECTIVE kill line, PER DEVICE, not a hardcoded pct of
+                    // the raw app cap. On ~1GB devices the SYSTEM commit limit binds ~50MB below the app
+                    // cap (PC-side systemperf caught the reap at ~340MB while the app pct read a "safe"
+                    // 80%); on >=2GB devices commit is not binding so the cap itself (minus a small
+                    // margin) is the ceiling. Computed inline from the CURRENT limit so it also tracks
+                    // the OS dynamically lowering the limit under system pressure. Emergency at 88% of
+                    // effective, MSE trim at 93%. For the 640XL (390MB cap -> 340 effective) that is
+                    // ~300MB / ~316MB — matching the old hand-tuned gates; for the 1520 (900 -> 855) it
+                    // scales up to ~752MB / ~795MB instead of firing needlessly at 300MB.
+                    // 15s cadence, not 5s: when the OS halves the limit (pct jumps to ~150%), a 5s
+                    // cadence produced 19 critical wipes in ~90s — each re-decodes/re-JITs the page
+                    // (the video stutter) while barely moving the footprint. One release per episode.
+                    unsigned long long limitMB = limit / (1024 * 1024);
+                    unsigned long long effMB = (limitMB < 512)
+                        ? (limitMB > 60 ? limitMB - 50 : limitMB)
+                        : (limitMB - limitMB / 20);
+                    unsigned long long usedMB = used / (1024 * 1024);
+                    if (usedMB >= effMB * 88 / 100 && now - lastEmergency >= 15000) {
+                        lastEmergency = now;
+                        WebCoreBrowserMemEmergency();
+                    }
+                    if (usedMB >= effMB * 93 / 100 && now - lastTrim >= 10000) {
+                        lastTrim = now;
+                        PortMseEmergencyTrim();
+                    }
+                }
+            }).detach();
+
             // MSE go/no-go: does the WinRT-native Windows.Media.Core.MseStreamSource activate in OUR
             // AppContainer, and does it accept YouTube's VP9/Opus + H.264/AAC types? This is the path
             // that replaces the desktop-only IMFMediaSourceExtension (which returned 0xc00d36e6). If
@@ -481,7 +571,12 @@ private:
                 sprintf_s(rb, sizeof rb, "mem: pressure level=%d pct=%llu%% -> releaseMemory(%s)",
                     level, pct, (level >= 2 || pct >= 85) ? "critical" : "normal");
                 WebCoreBrowserLog(rb);
-                WebCoreBrowserReleaseMemory((level >= 2 || pct >= 70) ? 1 : 0);
+                // Match the decision to the log line above: critical (full wipe: memory cache, decoded
+                // images, fonts, JIT-linked code) ONLY at High/OverLimit or >=85%. The 70% guard fires a
+                // NORMAL release. Passing critical at 70% made every 5s tick a full wipe on pages that
+                // live at 80% (YouTube: 25 critical releases in one session, usage never dropped -- the
+                // wipes were pure re-decode/re-JIT jank with zero relief).
+                WebCoreBrowserReleaseMemory((level >= 2 || pct >= 85) ? 1 : 0);
                 m_lastMemReleaseTick = GetTickCount64();
             }
             m_lastMemLevel = level;

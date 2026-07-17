@@ -14,6 +14,8 @@
 #include "Element.h"
 #include "FullscreenManager.h"
 #include "ModalContainerTypes.h"
+#include "PopupMenu.h"
+#include "SearchPopupMenu.h"
 
 namespace WebCorePort { void portLog(const char*); }
 using WebCorePort::portLog;
@@ -39,8 +41,37 @@ void PortChromeClient::elementDidBlur(Element&)
     PortShowKeyboard(0);
 }
 
-RefPtr<PopupMenu> PortChromeClient::createPopupMenu(PopupMenuClient&) const { return nullptr; }
-RefPtr<SearchPopupMenu> PortChromeClient::createSearchPopupMenu(PopupMenuClient&) const { return nullptr; }
+// A <select> tap routes through RenderMenuList::showPopup(), which calls m_popup->show() with NO
+// null-check -- so returning nullptr here is a guaranteed virtual-call-through-null crash on every
+// dropdown (and WebCoreBrowserTap isn't SEH-wrapped, so the crash filter never catches it). WebKit's
+// own EmptyClients returns a non-null EmptyPopupMenu for exactly this reason; mirror it so the tap is
+// crash-safe. (Follow-up: a real native XAML list-picker so the options are actually selectable --
+// tracked separately; this only removes the crash, it does not yet render the option list.)
+namespace {
+class PortEmptyPopupMenu final : public PopupMenu {
+public:
+    PortEmptyPopupMenu() = default;
+private:
+    void show(const IntRect&, FrameView*, int) final { }
+    void hide() final { }
+    void updateFromElement() final { }
+    void disconnectClient() final { }
+};
+
+class PortEmptySearchPopupMenu final : public SearchPopupMenu {
+public:
+    PortEmptySearchPopupMenu() : m_popup(adoptRef(*new PortEmptyPopupMenu)) { }
+private:
+    PopupMenu* popupMenu() final { return m_popup.ptr(); }
+    void saveRecentSearches(const AtomString&, const Vector<RecentSearch>&) final { }
+    void loadRecentSearches(const AtomString&, Vector<RecentSearch>&) final { }
+    bool enabled() final { return false; }
+    Ref<PortEmptyPopupMenu> m_popup;
+};
+}
+
+RefPtr<PopupMenu> PortChromeClient::createPopupMenu(PopupMenuClient&) const { return adoptRef(*new PortEmptyPopupMenu); }
+RefPtr<SearchPopupMenu> PortChromeClient::createSearchPopupMenu(PopupMenuClient&) const { return adoptRef(*new PortEmptySearchPopupMenu); }
 
 #if ENABLE(INPUT_TYPE_COLOR)
 std::unique_ptr<ColorChooser> PortChromeClient::createColorChooser(ColorChooserClient&, const Color&) { return nullptr; }
