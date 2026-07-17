@@ -73,6 +73,9 @@
 #include "IntSize.h"
 #include "Page.h"
 #include "PageConfiguration.h"
+#if ENABLE(CONTENT_EXTENSIONS)
+#include "UserContentController.h"
+#endif
 #include "PlatformMouseEvent.h"
 #include "PlatformTouchEvent.h" // real multitouch dispatch (WebCoreBrowserTouch)
 #include <map>                  // active touch-point set keyed by pointer id
@@ -104,6 +107,8 @@
 #include <JavaScriptCore/ExecutableAllocator.h> // exported JIT telemetry: revJITAllocCount/Bytes(), revExecAllocValid()
 #include <JavaScriptCore/Options.h>
 #include <cairo.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -112,13 +117,25 @@
 #include <pal/SessionID.h>
 #include <string>
 #include <vector>
+#include <wtf/FileSystem.h>
 #include <wtf/MainThread.h>
+#include <wtf/NumberOfCores.h>
 #include <wtf/MonotonicTime.h>
 #include <wtf/RunLoop.h>
 #include <wtf/Seconds.h>
 #include <wtf/URL.h>
 
 namespace WebCorePort { void installPortPlatformStrategies(); }
+#if ENABLE(CONTENT_EXTENSIONS)
+namespace WebCore { class UserContentController; }
+namespace WebCorePort { unsigned installPortContentBlocker(WebCore::UserContentController&); }
+#endif
+
+// Exported instrumentation accessors: bytecode-cache stats live in JavaScriptCore.dll (SourceProvider.cpp),
+// URL-parse stats in WTF.dll (URLParser.cpp). Plain extern decls link against the DLL import libs (function
+// imports resolve through the .lib without needing dllimport).
+namespace JSC { void bytecodeCacheStats(uint64_t out[6]); }
+namespace WTF { void urlParseStats(uint64_t out[3]); }
 
 using namespace WebCore;
 
@@ -199,7 +216,8 @@ void portLog(const char* msg)
         static const char* kCritical[] = { "MAIN-STALL", "RENDER-CRASH", "KEY-CRASH", "UNHANDLED",
             "GLERR", "TEXALLOC", "TEXFBO", "TEXDEL", "SHADER", "GLCAP", "mem:", "mse:", "mf:", "hls:", "prog:", "media:",
             "fullscreen:", "identity:", "browser:", "gate:", "SLOWFRAME", "jitcfg", "watchdog",
-            "app:", "mempool:", "tmtile:", "compositing:", "cmplayer:", "CRAWL", "  prof", "  st rva" };
+            "app:", "mempool:", "tmtile:", "compositing:", "cmplayer:", "CRAWL", "  prof", "  st rva",
+            "  dstk", "bcache:", "  athr" };
         for (const char* p : kCritical) {
             if (!std::strncmp(line, p, std::strlen(p)))
                 return true;
@@ -263,6 +281,99 @@ static Ref<WebCore::ResourceHandle> createBlobResourceHandle(const WebCore::Reso
     return WebCore::blobRegistry().blobRegistryImpl()->createResourceHandle(request, client);
 }
 
+// Size-cap the on-disk bytecode cache: if the dir exceeds capBytes, delete oldest files (by mtime)
+// until back under. Bytecode blobs are compact, so a modest cap holds many sites; this just keeps
+// LocalState from growing without bound across visits. Best-effort — failures are non-fatal.
+static void pruneBytecodeCacheDir(const WTF::String& dir, uint64_t capBytes)
+{
+    struct Ent { WTF::String path; uint64_t size; WTF::WallTime mtime; };
+    WTF::Vector<Ent> ents;
+    uint64_t total = 0;
+    for (auto& name : FileSystem::listDirectory(dir)) {
+        auto full = FileSystem::pathByAppendingComponent(dir, name);
+        auto sz = FileSystem::fileSize(full);
+        if (!sz)
+            continue;
+        auto mt = FileSystem::fileModificationTime(full);
+        ents.append({ full, *sz, mt.value_or(WTF::WallTime::fromRawSeconds(0)) });
+        total += *sz;
+    }
+    if (total <= capBytes)
+        return;
+    std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.mtime < b.mtime; }); // oldest first
+    for (auto& e : ents) {
+        if (total <= capBytes)
+            break;
+        if (FileSystem::deleteFile(e.path))
+            total -= e.size;
+    }
+}
+
+// ---- Per-device memory budget --------------------------------------------------------------
+// W10M gives each device a different AppMemoryUsageLimit (1GB Lumia -> 390MB, 2GB -> 900MB), and on
+// the 1GB device the SYSTEM commit limit binds ~50MB BELOW that cap (the OS reaps us at ~340MB while
+// the app-level pct still reads "safe"). A single hardcoded config can't serve both: what keeps the
+// 640XL alive starves nothing on the 1520, and what the 1520 can afford kills the 640XL. So the shell
+// reads the real AppMemoryUsageLimit at startup and calls WebCoreSetMemoryBudgetFromLimit(); every
+// memory lever (resource cache size, MSE keep-behind, the watcher's release thresholds) derives from
+// the resulting tier. Defaults below are the safe LOW (1GB) tier until the shell sets the real value.
+struct MemoryBudget {
+    int tier;                       // 0=LOW(~1GB) 1=MID(~2GB) 2=HIGH(>=3GB)
+    unsigned appLimitMB;            // raw AppMemoryUsageLimit
+    unsigned effectiveCeilingMB;    // real kill line (commit-limited on 1GB, ~cap on bigger RAM)
+    unsigned memCacheTotalMB;       // WebCore MemoryCache total capacity
+    unsigned mseKeepBehindSec;      // seconds of already-played video the emergency trim keeps
+};
+static MemoryBudget g_memBudget = { 0, 390, 340, 12, 8 };
+
+static void applyMemoryCacheFromBudget()
+{
+    using namespace WebCore;
+    unsigned total = g_memBudget.memCacheTotalMB * 1024u * 1024u;
+    MemoryCache::singleton().setCapacities(0, total / 3, total); // minDead, maxDead, total
+    // On the LOW (1GB) tier, drop dead decoded image data every 1s instead of 3s: while scrolling a
+    // thumbnail feed, images that leave the viewport become "dead" and must free FAST or they pile up
+    // and tip the ~340MB ceiling mid-scroll (the 640XL scroll-while-video crash). Bigger devices can
+    // afford to keep them longer (fewer re-decodes when scrolling back up).
+    MemoryCache::singleton().setDeadDecodedDataDeletionInterval(Seconds { g_memBudget.tier == 0 ? 1.0 : 3.0 });
+}
+
+extern "C" void WebCoreSetMemoryBudgetFromLimit(unsigned long long appLimitBytes)
+{
+    unsigned limitMB = static_cast<unsigned>(appLimitBytes / (1024 * 1024));
+    if (!limitMB)
+        return;
+    MemoryBudget b {};
+    b.appLimitMB = limitMB;
+    if (limitMB < 512) {            // ~1GB device: commit binds ~50MB below the app cap
+        b.tier = 0;
+        b.effectiveCeilingMB = limitMB > 60 ? limitMB - 50 : limitMB;
+        b.memCacheTotalMB = 12;
+        b.mseKeepBehindSec = 8;
+    } else if (limitMB < 1400) {    // ~2GB device: cap itself is the ceiling (commit not binding)
+        b.tier = 1;
+        b.effectiveCeilingMB = limitMB - limitMB / 20;
+        b.memCacheTotalMB = 48;
+        b.mseKeepBehindSec = 20;
+    } else {                        // 3GB+
+        b.tier = 2;
+        b.effectiveCeilingMB = limitMB - limitMB / 20;
+        b.memCacheTotalMB = 96;
+        b.mseKeepBehindSec = 30;
+    }
+    g_memBudget = b;
+    applyMemoryCacheFromBudget();
+    char lg[220];
+    snprintf(lg, sizeof lg,
+        "membudget: tier=%d appLimit=%uMB effectiveCeiling=%uMB memCache=%uMB mseKeepBehind=%us",
+        b.tier, b.appLimitMB, b.effectiveCeilingMB, b.memCacheTotalMB, b.mseKeepBehindSec);
+    portLog(lg);
+}
+
+extern "C" unsigned WebCoreMemBudgetEffectiveCeilingMB() { return g_memBudget.effectiveCeilingMB; }
+extern "C" int WebCoreMemBudgetTier() { return g_memBudget.tier; }
+extern "C" unsigned WebCoreMemBudgetMseKeepBehindSec() { return g_memBudget.mseKeepBehindSec; }
+
 static void ensureInit()
 {
     static bool inited = false;
@@ -274,6 +385,16 @@ static void ensureInit()
     // computeCanUseJIT->enableAssembler — actually reach debug.log. Assigning this raw exported
     // pointer needs no prior init.
     JSC::g_watchdogTerminationLog = [](const char* m) { portLog(m); };
+    // JIT pool 32MB -> 16MB. The UWP W^X path commits the WHOLE reservation RWX up front, and PC-side
+    // systemperf polling (2026-07-15) showed the OS reaping us at ~340MB app commit — the 1GB device's
+    // SYSTEM commit limit binds ~50MB below our 390MB cap, so standing commit is the scarcest resource
+    // we have. Measured JIT usage on heavy pages is well under 16MB; if exec memory ever runs out, JSC
+    // degrades to LLInt for the overflow (jitdiag logs it), not a crash. Must be set BEFORE
+    // JSC::initialize(): the reservation happens inside it (computeCanUseJIT -> enableAssembler), long
+    // before setOption() is usable — hence the env var, which Options::initialize reads via the
+    // GetEnvironmentVariableA shim. Numeric option, so the thread_local-getenv-buffer trap
+    // (OptionString keeping a raw pointer) does not apply.
+    SetEnvironmentVariableA("JSC_jitMemoryReservationSize", "16777216");
     JSC::initialize();
     WTF::initializeMainThread();
 
@@ -287,6 +408,11 @@ static void ensureInit()
     // Verifying"). 60s still eventually breaks a genuine runaway (rare; the real freezes were native
     // deadlocks the JS watchdog can't see anyway) while letting the PoW challenges complete.
     JSC::Options::setOption("watchdog=60000");
+    // MINI-VM MODE: temporarily REVERTED. Enabled alongside the content blocker in one build; that build
+    // died silently (no AV, no dump) during YouTube video load at only 55% memory — a new failure mode.
+    // Pulling mini mode to isolate: get a clean content-blocker-only run first, then re-A/B mini mode
+    // alone if we still want the jsHeap win. (Option is valid: OptionsList.h forceMiniVMMode.)
+    // JSC::Options::setOption("forceMiniVMMode=true");
     // DFG TIER (re-enabled 2026-07-12 to attack the Turnstile CPU wall): the DFG speculatively
     // optimizes hot functions ~3-10x over baseline. With DFG OFF, heavy Turnstile PoW JS runs baseline
     // forever (inModule=0 CPU burn, 90+ /new/ cycles) — the binding constraint on rule34. Baseline JIT
@@ -296,6 +422,33 @@ static void ensureInit()
     // the real fix is the DFG ARM32 codegen bug, not re-disabling. Watchdog=60s + the jitcfg/MAIN-STALL
     // diagnostics stay in to catch it. (Toggle back to false to isolate if a regression appears.)
     JSC::Options::setOption("useDFGJIT=true");
+    // CONCURRENCY / MULTICORE: use every core the device actually reports. JSC's stock defaults CAP the
+    // worklist/DFG pool at computeNumberOfWorkerThreads(3,2) = min(cores,3) — so even a 4-core Snapdragon
+    // 400 gets only 2 DFG compiler threads and never scales past 3. Page-load profiling (2026-07-14, PC
+    // build) attributed the 6-12s load burst as: 69% inside JavaScriptCore.dll (parser / bytecode-gen /
+    // runtime property access, only ~2% LLInt), 25% RUNNING JIT-compiled code at the 0x19600000 pool, 6%
+    // WebCore CSS/layout. Not interpreter-bound — so tiering hot JS up sooner and OFF the main thread is a
+    // real lever on the 25%. Detect cores (GetSystemInfo via WTF::numberOfProcessorCores) and raise the
+    // caps to use them all: every core compiles concurrently while the main thread parses. useConcurrentJIT
+    // stays on so DFG compilation never blocks the executing JS thread. Must be set here — after
+    // JSC::initialize(), before the first VM/DFG-Worklist is created (which snapshots these). FTL is
+    // compiled OUT on this port (ENABLE_FTL_JIT OFF) so numberOfFTLCompilerThreads is a no-op; DFG is the
+    // only tier that threads today. The jitthreads: log line reports the RESOLVED count so we can see what
+    // the AppContainer actually grants on-device (it may throttle below the physical core count).
+    {
+        int cores = WTF::numberOfProcessorCores();
+        if (cores < 1) cores = 1;
+        unsigned worklist = static_cast<unsigned>(cores);                        // all cores may compile
+        unsigned dfgThreads = static_cast<unsigned>(cores > 1 ? cores - 1 : 1);  // leave 1 core for main-thread JS
+        JSC::Options::useConcurrentJIT() = true;
+        JSC::Options::numberOfWorklistThreads() = worklist;
+        JSC::Options::numberOfDFGCompilerThreads() = dfgThreads;
+        char cb[200];
+        snprintf(cb, sizeof cb,
+            "jitthreads: cores=%d -> worklistThreads=%u dfgCompilerThreads=%u concurrentJIT=1 ftlCompiled=0",
+            cores, worklist, dfgThreads);
+        portLog(cb);
+    }
     // DFG DISASSEMBLY CAPTURE (debug, OFF by default): flip to true + load a minimal page to dump
     // the DFG's ARM as RAWCODE hex into LocalState\dfgdis.txt (routed in PortSetDebugLogPathW;
     // Disassembler.cpp emits raw bytes since Capstone is off). Used to root-cause the ARM32
@@ -307,6 +460,33 @@ static void ensureInit()
     // JS — which is exactly what jitcfg caught (useJIT=0). The default reservation (32MB, the size the
     // working on-device JSC self-test uses) is what keeps the JIT enabled. Leave it at default.
     // (g_watchdogTerminationLog is set at the top of ensureInit, before JSC::initialize.)
+    // DISK BYTECODE CACHE: point JSC's on-disk unlinked-bytecode cache at a LocalState subdir. The base
+    // SourceProvider (patched) serializes each parsed script's UnlinkedCodeBlock tree here and, on the
+    // next visit (or after an in-memory CodeCache wipe), decodes it instead of re-tokenizing — the
+    // durable half of the re-parse fix. Must be set AFTER JSC::initialize() (Options ready) and BEFORE
+    // the first compile. LocalState path arrives via PortSetDebugLogPathW (g_logPath); derive a sibling
+    // "bytecode-cache" dir from it. If the shell hasn't handed us the path yet, the cache stays off.
+    {
+        std::wstring logDir;
+        {
+            std::lock_guard<std::mutex> lock(g_logMutex);
+            logDir = g_logPath;
+        }
+        if (!logDir.empty()) {
+            size_t slash = logDir.find_last_of(L"\\/");
+            std::wstring cacheW = (slash == std::wstring::npos ? std::wstring() : logDir.substr(0, slash + 1)) + L"bytecode-cache";
+            static std::string s_bytecodeCacheDir(cacheW.begin(), cacheW.end()); // LocalState paths are ASCII
+            WTF::String cacheDirStr = WTF::String::fromUTF8(s_bytecodeCacheDir.c_str());
+            FileSystem::makeAllDirectories(cacheDirStr);
+            pruneBytecodeCacheDir(cacheDirStr, 48ull * 1024 * 1024); // 48MB cap, LRU by mtime
+            JSC::Options::diskCachePath() = s_bytecodeCacheDir.c_str(); // stable pointer (static)
+            char cb[300];
+            snprintf(cb, sizeof cb, "bytecodecache: enabled dir=%s cap=48MB minSrc=2048B", s_bytecodeCacheDir.c_str());
+            portLog(cb);
+        } else
+            portLog("bytecodecache: no LocalState path yet -> disk cache DISABLED this run");
+    }
+
     WebCorePort::installPortPlatformStrategies();
     WebCore::ResourceHandle::registerBuiltinConstructor("blob"_s, createBlobResourceHandle);
 #if ENABLE(SERVICE_WORKER)
@@ -327,11 +507,12 @@ static void ensureInit()
         mph.setShouldLogMemoryMemoryPressureEvents(true);
         mph.install();
     }
-    // Keep retained-resource memory small on this constrained device: cap the resource cache and disable
-    // the back/forward page cache (retaining whole prior pages is unaffordable at 390MB). Dead decoded
-    // image data is dropped promptly so offscreen thumbnails don't pin memory.
-    MemoryCache::singleton().setCapacities(0, 4 * 1024 * 1024, 12 * 1024 * 1024); // minDead, maxDead, total
-    MemoryCache::singleton().setDeadDecodedDataDeletionInterval(Seconds { 3 });
+    // Keep retained-resource memory small on constrained devices: cap the resource cache (size scales
+    // with the detected memory tier — see g_memBudget; the shell sets the real tier once it reads the
+    // AppMemoryUsageLimit, this applies the safe LOW default until then) and disable the back/forward
+    // page cache (retaining whole prior pages is unaffordable at 390MB). Dead decoded image data is
+    // dropped promptly so offscreen thumbnails don't pin memory.
+    applyMemoryCacheFromBudget();
     BackForwardCache::singleton().setMaxSize(0);
 }
 
@@ -564,7 +745,19 @@ static int compositeToRGBA(WebCore::GraphicsLayer* rootLayer, WebCore::FrameView
 
 // ===================== Live interactive browser (CoreWindow) =====================
 namespace {
-double g_deviceScale = 1.0;   // device pixels per CSS pixel (mobile DPR)
+double g_deviceScale = 1.0;   // device pixels per CSS pixel (mobile DPR) — GEOMETRIC scale: drives
+                              // cssW/cssH, the root composite transform (fills the physical panel), and
+                              // input/clip px<->CSS conversion. Stays at the true device DPR.
+double g_rasterScale = 1.0;   // RASTER/DPR scale = min(g_deviceScale, cap). On extreme-DPR panels
+                              // (Lumia 950 @ 3.5, 1440p) every backing store is a 3.5x D3D texture and
+                              // YouTube's watch page exhausts the GPU texture budget -> E_OUTOFMEMORY on
+                              // Texture2D -> present throws on the XAML commit thread -> process killed
+                              // (I-01). Tiles raster (and window.devicePixelRatio reports) at THIS capped
+                              // value; the composite transform still uses g_deviceScale, so the GPU
+                              // upscales the smaller tiles to fill the panel. Verified safe: contentsScale
+                              // (=deviceScaleFactor) only sets texture resolution — on-screen size comes
+                              // from the root transform via rectToRect normalization (contentsScale!=1
+                              // already renders correctly). cssW + iOS-impersonation layout unchanged.
 int g_cssW = 0, g_cssH = 0;   // CSS-px viewport (physical / deviceScale)
 
 // GPU-tree paint crash fallback (declared here so BrowserContentClient::paintContents below can
@@ -737,11 +930,14 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     // does NOT establish that the browser VM enabled the JIT). Pair with the gate line's jitAllocs
     // counter (rising => baseline/DFG actually emitting code; flat => interpreter).
     {
-        char jb[220];
-        snprintf(jb, sizeof jb, "jitcfg: useJIT=%d baselineJIT=%d dfgJIT=%d llint=%d regexpJIT=%d",
+        char jb[280];
+        snprintf(jb, sizeof jb, "jitcfg: useJIT=%d baselineJIT=%d dfgJIT=%d llint=%d regexpJIT=%d "
+            "concurrentJIT=%d worklistThreads=%u dfgThreads=%u cores=%d",
             JSC::Options::useJIT() ? 1 : 0, JSC::Options::useBaselineJIT() ? 1 : 0,
             JSC::Options::useDFGJIT() ? 1 : 0, JSC::Options::useLLInt() ? 1 : 0,
-            JSC::Options::useRegExpJIT() ? 1 : 0);
+            JSC::Options::useRegExpJIT() ? 1 : 0,
+            JSC::Options::useConcurrentJIT() ? 1 : 0, JSC::Options::numberOfWorklistThreads(),
+            JSC::Options::numberOfDFGCompilerThreads(), WTF::numberOfProcessorCores());
         portLog(jb);
     }
     startMainStallDetector(); // logs where the main thread is stuck if a native (non-JS) freeze hits
@@ -772,6 +968,12 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     // the content fully covers the surface (the sub-pixel overscan is clipped by glViewport).
     g_cssW = static_cast<int>(std::ceil(g_winW / g_deviceScale));
     g_cssH = static_cast<int>(std::ceil(g_winH / g_deviceScale));
+    // Cap the RASTER scale on extreme-DPR panels so backing textures don't exhaust GPU memory (I-01).
+    // 2.5x is still crisp on a 500+ppi screen; the composite transform (g_deviceScale) upscales to fill.
+    g_rasterScale = g_deviceScale > 3.0 ? 2.5 : g_deviceScale;
+    if (g_rasterScale != g_deviceScale)
+        portLog((std::string("browser: raster scale capped ") + std::to_string(g_deviceScale)
+            + " -> " + std::to_string(g_rasterScale) + " (GPU texture budget)").c_str());
     portLog((std::string("browser: window ") + std::to_string(g_winW) + "x" + std::to_string(g_winH)
         + " renderer=" + reinterpret_cast<const char*>(glGetString(GL_RENDERER))).c_str());
     // The shader budget of this GPU. D3D feature level 9_3 (Adreno 305) caps the FRAGMENT uniform
@@ -795,6 +997,17 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     g_textureMapper = TextureMapperGL::create();
 
     auto config = pageConfigurationWithEmptyClients(PAL::SessionID::defaultSessionID());
+    // Content blocker: replace the EmptyUserContentProvider (blocks nothing) with a real
+    // UserContentController carrying our ad/tracker blocklist. ResourceLoader::willSendRequest runs the
+    // ContentExtensions DFA pre-fetch, so blocked scripts never download/parse/JIT — the biggest memory
+    // + CPU + network lever we have on this commit-starved device.
+#if ENABLE(CONTENT_EXTENSIONS)
+    {
+        auto userContent = WebCore::UserContentController::create();
+        WebCorePort::installPortContentBlocker(userContent.get());
+        config.userContentProvider = WTFMove(userContent);
+    }
+#endif
     // Real editor client: the empty one blocks all editing (typing inserts nothing). This one
     // permits editing and turns key events into text insertion / editing commands.
     config.editorClient = WebCorePort::createPortEditorClient();
@@ -859,7 +1072,7 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     // Hand DPR to WebCore: layout in CSS px, backing stores in device px. Replaces the manual
     // scale-wrapper. WebCore now scales CSS->device internally; media (resolution), image srcset and
     // hit-testing are correct. Input arrives in device px and is converted to CSS px before dispatch.
-    g_page->setDeviceScaleFactor(g_deviceScale);
+    g_page->setDeviceScaleFactor(g_rasterScale); // capped on extreme-DPR (I-01); geometry uses g_deviceScale
     g_page->settings().setShouldAllowUserInstalledFonts(false);
     // window.requestIdleCallback is implemented in 2.36.8 but gated off by default
     // (EnabledBySetting=requestIdleCallbackEnabled) → "ReferenceError: requestIdleCallback".
@@ -1146,6 +1359,119 @@ static void installFaultHandler()
 // storm; "u:layout" = a layout loop; etc.) without needing SuspendThread (desktop-only under UWP).
 static std::atomic<unsigned long long> g_mainHeartbeat { 0 };
 static HANDLE g_mainThreadHandle = nullptr;
+static DWORD g_mainThreadId = 0;
+
+// At an IDLE deadlock the main thread is parked in a kernel wait -- to name WHAT it waits on we must
+// see the OTHER threads (the one holding the lock/mutex). CreateToolhelp32Snapshot isn't in the UWP
+// app container, so enumerate with ntdll's NtGetNextThread (present on Win10 OneCore). For each thread
+// (except the detector itself) suspend, read PC/LR + a few executable return addresses off the stack
+// top, RESUME, then log (portLog takes a mutex a suspended thread might hold -> log only after resume).
+// Offline: resolve pc/lr/st against the module at each base (JSC 0x54970000, WTF 0x77c40000, exe base,
+// JIT pool). Best-effort: if the export is missing we still have the main-thread deep stack.
+typedef LONG (NTAPI *PFN_NtGetNextThread)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+
+// Get ntdll's base WITHOUT GetModuleHandle*: both GetModuleHandleW and GetModuleHandleExW are guarded
+// into WINAPI_PARTITION_DESKTOP in this SDK, so neither compiles for the UWP app. GetProcAddress IS
+// APP-available but needs a base. Walk the PEB loader list via NtCurrentTeb() (an intrinsic, present in
+// all partitions). 32-bit/ARM32 field offsets: TEB->PEB @0x30, PEB->Ldr @0x0C, LDR->InMemoryOrderList
+// @0x14; each list node is &entry.InMemoryOrderLinks (@0x08 within the entry). The loader memory is
+// valid to read; we only touch documented, stable fields.
+static void* ntdllBaseViaPeb()
+{
+    // UNICODE_STRING isn't declared in this TU (winnt's ntdef bits aren't pulled in for the UWP build);
+    // inline the identical 8-byte (32-bit) layout so the field offsets still line up.
+    struct MY_USTR { USHORT Length; USHORT MaximumLength; wchar_t* Buffer; };
+    struct MY_LDR_ENTRY {
+        LIST_ENTRY InLoadOrderLinks;            // 0x00
+        LIST_ENTRY InMemoryOrderLinks;          // 0x08
+        LIST_ENTRY InInitializationOrderLinks;  // 0x10
+        void* DllBase;                          // 0x18
+        void* EntryPoint;                       // 0x1C
+        ULONG SizeOfImage;                      // 0x20
+        MY_USTR FullDllName;                    // 0x24
+        MY_USTR BaseDllName;                    // 0x2C
+    };
+    unsigned char* teb = reinterpret_cast<unsigned char*>(NtCurrentTeb());
+    if (!teb) return nullptr;
+    void* peb = *reinterpret_cast<void**>(teb + 0x30);
+    if (!peb) return nullptr;
+    void* ldr = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(peb) + 0x0C);
+    if (!ldr) return nullptr;
+    LIST_ENTRY* head = reinterpret_cast<LIST_ENTRY*>(reinterpret_cast<unsigned char*>(ldr) + 0x14);
+    for (LIST_ENTRY* node = head->Flink; node && node != head; node = node->Flink) {
+        MY_LDR_ENTRY* e = reinterpret_cast<MY_LDR_ENTRY*>(reinterpret_cast<unsigned char*>(node) - 0x08);
+        const wchar_t* nm = e->BaseDllName.Buffer;
+        unsigned len = e->BaseDllName.Length / 2; // bytes -> wchars
+        if (!nm || len < 9) continue;             // "ntdll.dll" == 9 chars
+        // case-insensitive suffix match on "ntdll.dll" (some entries carry a path)
+        const wchar_t* want = L"ntdll.dll";
+        const wchar_t* tail = nm + (len - 9);
+        bool eq = true;
+        for (int i = 0; i < 9; ++i) {
+            wchar_t a = tail[i]; if (a >= L'A' && a <= L'Z') a = wchar_t(a - L'A' + L'a');
+            if (a != want[i]) { eq = false; break; }
+        }
+        if (eq) return e->DllBase;
+    }
+    return nullptr;
+}
+
+static void dumpAllThreadsAtStall()
+{
+    void* nt = ntdllBaseViaPeb();
+    PFN_NtGetNextThread getNext = nt ? reinterpret_cast<PFN_NtGetNextThread>(GetProcAddress(reinterpret_cast<HMODULE>(nt), "NtGetNextThread")) : nullptr;
+    if (!getNext) { portLog("  athr: NtGetNextThread unavailable (no thread enumeration)"); return; }
+    const ACCESS_MASK acc = THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
+    HANDLE prev = nullptr, cur = nullptr;
+    int n = 0;
+    while (n < 96 && getNext(GetCurrentProcess(), prev, acc, 0, 0, &cur) == 0 && cur) {
+        if (prev) CloseHandle(prev);
+        prev = cur;
+        ++n;
+        DWORD tid = GetThreadId(cur);
+        if (tid == GetCurrentThreadId())
+            continue; // the detector thread itself -- suspending self would hang
+        unsigned long pc = 0, lr = 0, sp = 0; bool ok = false;
+        unsigned long sw[6]; int nsw = 0;
+        if (SuspendThread(cur) != (DWORD)-1) {
+            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            ok = GetThreadContext(cur, &c);
+            if (ok) {
+                pc = c.Pc; lr = c.Lr; sp = c.Sp;
+                if (sp) {
+                    MEMORY_BASIC_INFORMATION sm;
+                    if (VirtualQuery(reinterpret_cast<void*>((uintptr_t)sp), &sm, sizeof sm) && sm.State == MEM_COMMIT) {
+                        uintptr_t end = reinterpret_cast<uintptr_t>(sm.BaseAddress) + sm.RegionSize;
+                        int mw = static_cast<int>((end - sp) / sizeof(unsigned long)); if (mw > 128) mw = 128;
+                        unsigned long buf[128];
+                        if (mw > 0) {
+                            memcpy(buf, reinterpret_cast<void*>((uintptr_t)sp), mw * sizeof(unsigned long));
+                            for (int i = 0; i < mw && nsw < 6; ++i) {
+                                unsigned long w = buf[i];
+                                if (w < 0x10000 || !(w & 1)) continue;
+                                MEMORY_BASIC_INFORMATION cm;
+                                if (VirtualQuery(reinterpret_cast<void*>((uintptr_t)(w & ~1UL)), &cm, sizeof cm)) {
+                                    bool ex = (cm.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0;
+                                    if (ex && (cm.Type == MEM_IMAGE || cm.Type == MEM_PRIVATE)) sw[nsw++] = w;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ResumeThread(cur);
+        }
+        if (ok) {
+            char tb[300];
+            int off = snprintf(tb, sizeof tb, "  athr tid=%lu%s pc=0x%08lx lr=0x%08lx sp=0x%08lx st=",
+                (unsigned long)tid, tid == g_mainThreadId ? "*main" : "", pc, lr, sp);
+            for (int i = 0; i < nsw && off < static_cast<int>(sizeof tb) - 12; ++i)
+                off += snprintf(tb + off, sizeof tb - off, "%08lx ", sw[i]);
+            portLog(tb);
+        }
+    }
+    if (prev) CloseHandle(prev);
+}
 
 // Read up to n bytes from a (possibly partly-unmapped) address, in 512B chunks, stopping at the first
 // fault. Used to walk a deadlocked thread's stack without risking an AV in the detector thread.
@@ -1176,7 +1502,18 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
     struct ProfBucket { unsigned long rva; int count; };
     ProfBucket hist[48];
     ProfBucket callerHist[48];
-    unsigned long topSysPc[6] = {0,0,0,0,0,0}; int topSysN = 0;
+    // FULL per-sample capture of every out-of-module PC (DLL + JIT) so the 69% JSC.dll bucket can be
+    // resolved offline against the PDB's function RANGES (not just top-6 nearest-public, which misresolves
+    // gaps to bogus symbols like _initterm_e). Store PC + caller LR + allocBase + kind for all 60 samples.
+    unsigned long allOutPc[60]; unsigned long allOutLr[60]; unsigned long allOutBase[60]; char allOutKind[60];
+    int nOut = 0;
+    // DEEP STACK SCAN: PC+LR (1 frame) proved too thin to attribute the 26-min WTF::sleep hang, the
+    // URLParser hotpath, and __rt_sdiv64 (LR resolved only 1 weak caller). For each sample we copy the
+    // top of the suspended thread's stack, then (after resume) keep the words that point into executable
+    // memory -- a heuristic call chain (no unwind info on Thumb-2). Offline we resolve each frame against
+    // the module at its base (JSC 0x54970000 / WTF 0x77c40000 / exe 0x400000 / JIT pool). frame:base pairs.
+    unsigned long stkPc[60][8]; unsigned long stkBase[60][8]; unsigned char stkN[60];
+    for (int i = 0; i < 60; ++i) stkN[i] = 0;
     int nb = 0, ncall = 0, samples = 0;
     int inMod = 0, jitRange = 0, sysHi = 0, other = 0;
     for (int s = 0; s < 60; ++s) {
@@ -1187,8 +1524,42 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
         pctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         bool pok = GetThreadContext(g_mainThreadHandle, &pctx);
         unsigned long ppc = pok ? pctx.Pc : 0, plr = pok ? pctx.Lr : 0;
+        // Copy the top of the stack WHILE suspended (fast memcpy, minimal suspend extension); classify
+        // after resume since VirtualQuery doesn't need the target paused. Bound the copy to the committed
+        // stack region so we never read past the guard page.
+        unsigned long stackCopy[200]; int stackWords = 0;
+        unsigned long psp = pok ? pctx.Sp : 0;
+        if (pok && psp) {
+            MEMORY_BASIC_INFORMATION sm;
+            if (VirtualQuery(reinterpret_cast<void*>(psp), &sm, sizeof sm) && sm.State == MEM_COMMIT) {
+                uintptr_t regionEnd = reinterpret_cast<uintptr_t>(sm.BaseAddress) + sm.RegionSize;
+                int maxw = static_cast<int>((regionEnd - psp) / sizeof(unsigned long));
+                stackWords = maxw < 200 ? maxw : 200;
+                if (stackWords > 0)
+                    memcpy(stackCopy, reinterpret_cast<void*>(psp), stackWords * sizeof(unsigned long));
+                else
+                    stackWords = 0;
+            }
+        }
         ResumeThread(g_mainThreadHandle);
         if (!pok) { ::Sleep(20); continue; }
+        {
+            int fcount = 0;
+            for (int i = 0; i < stackWords && fcount < 8; ++i) {
+                unsigned long val = stackCopy[i];
+                if (val < 0x10000) continue;
+                MEMORY_BASIC_INFORMATION cm;
+                if (VirtualQuery(reinterpret_cast<void*>(val), &cm, sizeof cm)) {
+                    bool ex = (cm.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0;
+                    if (ex && (cm.Type == MEM_IMAGE || cm.Type == MEM_PRIVATE)) {
+                        stkPc[s][fcount] = val;
+                        stkBase[s][fcount] = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(cm.AllocationBase));
+                        ++fcount;
+                    }
+                }
+            }
+            stkN[s] = static_cast<unsigned char>(fcount);
+        }
         ++samples;
         if (ppc >= pbase && ppc < pmodEnd) {
             ++inMod;
@@ -1206,14 +1577,16 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
             //                                    number that says whether hot JS runs compiled or in
             //                                    the LLInt interpreter (interpreter PCs land in-module).
             MEMORY_BASIC_INFORMATION mq;
+            char kind = 'o'; unsigned long ab = 0;
             if (VirtualQuery(reinterpret_cast<void*>(ppc), &mq, sizeof mq)) {
                 bool execProt = (mq.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0;
-                if (mq.Type == MEM_IMAGE) ++sysHi;                    // a DLL
-                else if (mq.Type == MEM_PRIVATE && execProt) ++jitRange; // JIT code (private exec pages)
+                ab = (unsigned long)reinterpret_cast<uintptr_t>(mq.AllocationBase);
+                if (mq.Type == MEM_IMAGE) { ++sysHi; kind = 'I'; }                    // a DLL
+                else if (mq.Type == MEM_PRIVATE && execProt) { ++jitRange; kind = 'J'; } // JIT code (private exec pages)
                 else ++other;
             } else
                 ++other;
-            if (topSysN < 6) { bool dup=false; for(int i=0;i<topSysN;i++) if((topSysPc[i]&~0xFFFFUL)==(ppc&~0xFFFFUL)) dup=true; if(!dup) topSysPc[topSysN++]=ppc; }
+            if (nOut < 60) { allOutPc[nOut]=ppc; allOutLr[nOut]=plr; allOutBase[nOut]=ab; allOutKind[nOut]=kind; ++nOut; }
             if (plr >= pbase && plr < pmodEnd) {
                 unsigned long lrva = (unsigned long)((plr & ~1UL) - pbase);
                 int f=-1; for (int i=0;i<ncall;++i){ unsigned long d=callerHist[i].rva>lrva?callerHist[i].rva-lrva:lrva-callerHist[i].rva; if(d<64){f=i;break;} }
@@ -1230,14 +1603,22 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
     // IDENTIFIABLE in one pass: type (IMAGE=a DLL, PRIVATE=JIT/heap), the exec protection, and the
     // allocation base (a DLL's base is stable per-run; a JIT pool's base matches jitdiag's reservation
     // or a later JSC commit). This is what turns "other=44 at 0x54000000" into a named thing.
-    for (int i = 0; i < topSysN; ++i) {
-        MEMORY_BASIC_INFORMATION mq; const char* ty = "?"; unsigned long ab = 0; int xp = 0;
-        if (VirtualQuery(reinterpret_cast<void*>(topSysPc[i]), &mq, sizeof mq)) {
-            ty = mq.Type == MEM_IMAGE ? "IMAGE" : mq.Type == MEM_PRIVATE ? "PRIVATE" : mq.Type == MEM_MAPPED ? "MAPPED" : "?";
-            ab = (unsigned long)reinterpret_cast<uintptr_t>(mq.AllocationBase);
-            xp = (mq.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) ? 1 : 0;
-        }
-        char sp2[112]; snprintf(sp2,sizeof sp2,"  prof outPc=0x%08lx type=%s exec=%d allocBase=0x%08lx", topSysPc[i], ty, xp, ab); portLog(sp2);
+    // Dump EVERY out-of-module sample (kind I=DLL image, J=JIT private-exec, o=other), with caller LR
+    // and allocBase, so offline resolution against the PDB gets the full ~60-sample/burst distribution
+    // instead of a deduped top-6. kind+base disambiguate JSC.dll (base 0x54970000) from ANGLE/ntdll/etc.
+    for (int i = 0; i < nOut; ++i) {
+        char sp2[128]; snprintf(sp2, sizeof sp2, "  profs k=%c pc=0x%08lx lr=0x%08lx base=0x%08lx",
+            allOutKind[i], allOutPc[i], allOutLr[i], allOutBase[i]); portLog(sp2);
+    }
+    // Deep stack per sample: "  dstk i=<sample> <frameAddr>:<moduleBase> ..." (up to 8 exec frames).
+    // Offline: for each frame, base 0x54970000 -> jsc ranges, 0x77c40000 -> wtf ranges, 0x400000 -> exe
+    // map (rva+0x400000), a 0x19xxxxxx-ish MEM_PRIVATE base -> JIT pool. The chain gives real callers.
+    for (int s2 = 0; s2 < 60; ++s2) {
+        if (!stkN[s2]) continue;
+        char db[320]; int off = snprintf(db, sizeof db, "  dstk i=%d", s2);
+        for (int f = 0; f < stkN[s2] && off < static_cast<int>(sizeof db) - 20; ++f)
+            off += snprintf(db + off, sizeof db - off, " %08lx:%08lx", stkPc[s2][f], stkBase[s2][f]);
+        portLog(db);
     }
     for (int k = 0; k < 8; ++k) { int bi=-1,bc=0; for(int i=0;i<nb;++i) if(hist[i].count>bc){bc=hist[i].count;bi=i;} if(bi<0||bc==0)break; char pl[96]; snprintf(pl,sizeof pl,"  prof pcRva=0x%08lx hits=%d",hist[bi].rva,bc); portLog(pl); hist[bi].count=0; }
     for (int k = 0; k < 10; ++k) { int bi=-1,bc=0; for(int i=0;i<ncall;++i) if(callerHist[i].count>bc){bc=callerHist[i].count;bi=i;} if(bi<0||bc==0)break; char pl[96]; snprintf(pl,sizeof pl,"  prof callerRva=0x%08lx hits=%d",callerHist[bi].rva,bc); portLog(pl); callerHist[bi].count=0; }
@@ -1252,6 +1633,7 @@ static void startMainStallDetector()
     // Grab a real handle to THIS (main) thread so the detector can suspend+sample it on a stall.
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
         &g_mainThreadHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    g_mainThreadId = GetCurrentThreadId();
     std::thread([]() {
         unsigned long long last = 0;
         int stalledSecs = 0;
@@ -1338,8 +1720,21 @@ static void startMainStallDetector()
                     }
 
                     // BURST PROFILE the frozen stall (shared with the crawl path above).
+                    // BURNING: burst-profile the spinning main thread (dstk shows the native loop).
+                    // IDLE (deadlock): the main thread is parked -- one deep-stack pass shows the full
+                    // frozen chain (does it end in WTF::Lock::lockSlow / Condition::wait -> waiting on
+                    // another thread, or in ICU data-load -> self-contained?), and dumpAllThreadsAtStall
+                    // names the thread that HOLDS whatever it waits on. Gate both to the first few stall
+                    // reports so a long deadlock doesn't flood the log (nothing moves between samples).
+                    static int s_stallProbes = 0;
                     if (cpuDeltaMs > 400)
                         profileBurstMainThread(hb, cpuDeltaMs, "MAIN-STALL");
+                    else if (s_stallProbes < 3) {
+                        profileBurstMainThread(hb, cpuDeltaMs, "MAIN-STALL-IDLE");
+                        portLog("  athr: enumerating all threads at deadlock (holder = who parks the ICU/lock main waits on)");
+                        dumpAllThreadsAtStall();
+                        ++s_stallProbes;
+                    }
                 }
             } else {
                 last = hb;
@@ -1423,6 +1818,7 @@ extern "C" void WebCoreBrowserNoteVideoFrameDrawn() { g_videoFramesDrawn.fetch_a
 
 static unsigned g_composeFrame = 0;      // increments once per render frame
 static unsigned g_forceComposeUntil = 0; // composite unconditionally while g_composeFrame < this
+static unsigned g_lastActiveComposeFrame = 0; // last frame WebCore produced a visual change (dirty/flush)
 static unsigned g_composited300 = 0, g_skipped300 = 0; // rolling 300-frame gate stats (proves savings)
 static unsigned g_gateFrames = 0; // loop iterations in the CURRENT gate window (gate is time- OR frame-triggered)
 static double g_msJS = 0, g_msComposite = 0;           // rolling 300-frame CPU split: JS/RunLoop vs composite
@@ -1499,6 +1895,110 @@ extern unsigned g_texmapStoreCount;      // live TextureMapperTiledBackingStore 
 extern unsigned g_texmapLayerCount;      // live GraphicsLayerTextureMapper objects
 extern unsigned long long g_texmapPoolBytes; // BitmapTexturePool retained bytes
 extern unsigned g_texmapPoolCount;
+// bstat: backing-phase breakdown (defined in GraphicsLayerTextureMapper.cpp; see comment there).
+extern unsigned g_bsVisited, g_bsPainted, g_bsNdspFull, g_bsClipped, g_bsSelfHeal;
+extern unsigned g_bsInvFull, g_bsInvFullBig, g_bsInvRect, g_bsInvRectBig;
+extern unsigned long long g_bsDirtyPx;
+extern unsigned g_bsRetile, g_bsTilesCreated, g_bsTilesRecycled, g_bsTilesRemoved, g_bsScaleNuke;
+extern float g_bsScaleMin, g_bsScaleMax;
+extern double g_bsRasterMs; extern unsigned long long g_bsRasterPx;
+extern double g_bsBackCreateMs, g_bsBackPaintMs, g_bsBackCopyMs; extern unsigned g_bsBackCalls;
+extern double g_bsUploadMs; extern unsigned long long g_bsUploadKB;
+extern unsigned g_bsTexRealloc, g_bsTexReuse, g_bsTexClamp;
+extern unsigned g_bsPoolHit, g_bsPoolMiss;
+// Raster attribution (defined in GraphicsContextCairo.cpp): splits g_bsRasterMs by cairo primitive type.
+extern double g_bsCairoImageMs; extern unsigned g_bsCairoImageN;
+extern double g_bsCairoGlyphMs; extern unsigned g_bsCairoGlyphN; extern unsigned g_bsCairoGlyphCount;
+extern double g_bsCairoFillMs; extern unsigned g_bsCairoFillN;
+extern double g_bsCairoGradMs; extern unsigned g_bsCairoGradN;
+extern double g_bsCairoStrokeMs;
+}
+
+// Per-gate-window accumulation of the bstat counters (frame counters are snapshot+reset every frame in
+// compositeTree; slow frames print their own snapshot, the window sums print beside the gate line).
+struct BstatWindow {
+    unsigned visited, painted, ndspFull, clipped, selfHeal;
+    unsigned invFull, invFullBig, invRect, invRectBig;
+    unsigned long long dirtyPx;
+    unsigned retile, tilesCreated, tilesRecycled, tilesRemoved, scaleNuke;
+    double rasterMs; unsigned long long rasterPx;
+    double uploadMs; unsigned long long uploadKB;
+    unsigned texRealloc, texReuse, texClamp, poolHit, poolMiss;
+    double cImageMs, cGlyphMs, cFillMs, cGradMs, cStrokeMs;
+    unsigned cImageN, cGlyphN, cGlyphCount, cFillN, cGradN;
+    double backCreateMs, backPaintMs, backCopyMs; unsigned backCalls;
+    float scaleMin, scaleMax; // range of contents scales that caused a nuke this frame
+};
+static BstatWindow g_bstatWindow = {};
+static BstatWindow g_bstatFrame = {}; // last composited frame's counters (valid whenever backing ran)
+
+// Snapshot the frame's counters into `out`, fold them into the window sums, and zero the live counters.
+// Called once per composited frame, right after updateBackingStoreIncludingSubLayers.
+static void bstatHarvestFrame(BstatWindow& out)
+{
+    using namespace WebCore;
+    out = { g_bsVisited, g_bsPainted, g_bsNdspFull, g_bsClipped, g_bsSelfHeal,
+            g_bsInvFull, g_bsInvFullBig, g_bsInvRect, g_bsInvRectBig, g_bsDirtyPx,
+            g_bsRetile, g_bsTilesCreated, g_bsTilesRecycled, g_bsTilesRemoved, g_bsScaleNuke,
+            g_bsRasterMs, g_bsRasterPx, g_bsUploadMs, g_bsUploadKB,
+            g_bsTexRealloc, g_bsTexReuse, g_bsTexClamp, g_bsPoolHit, g_bsPoolMiss,
+            g_bsCairoImageMs, g_bsCairoGlyphMs, g_bsCairoFillMs, g_bsCairoGradMs, g_bsCairoStrokeMs,
+            g_bsCairoImageN, g_bsCairoGlyphN, g_bsCairoGlyphCount, g_bsCairoFillN, g_bsCairoGradN,
+            g_bsBackCreateMs, g_bsBackPaintMs, g_bsBackCopyMs, g_bsBackCalls,
+            g_bsScaleMin, g_bsScaleMax };
+    g_bstatWindow.visited += out.visited; g_bstatWindow.painted += out.painted;
+    g_bstatWindow.ndspFull += out.ndspFull; g_bstatWindow.clipped += out.clipped;
+    g_bstatWindow.selfHeal += out.selfHeal;
+    g_bstatWindow.invFull += out.invFull; g_bstatWindow.invFullBig += out.invFullBig;
+    g_bstatWindow.invRect += out.invRect; g_bstatWindow.invRectBig += out.invRectBig;
+    g_bstatWindow.dirtyPx += out.dirtyPx;
+    g_bstatWindow.retile += out.retile; g_bstatWindow.tilesCreated += out.tilesCreated;
+    g_bstatWindow.tilesRecycled += out.tilesRecycled; g_bstatWindow.tilesRemoved += out.tilesRemoved;
+    g_bstatWindow.scaleNuke += out.scaleNuke;
+    if (g_bstatWindow.scaleMin == 0.f || (out.scaleMin != 0.f && out.scaleMin < g_bstatWindow.scaleMin)) g_bstatWindow.scaleMin = out.scaleMin;
+    if (out.scaleMax > g_bstatWindow.scaleMax) g_bstatWindow.scaleMax = out.scaleMax;
+    g_bstatWindow.rasterMs += out.rasterMs; g_bstatWindow.rasterPx += out.rasterPx;
+    g_bstatWindow.uploadMs += out.uploadMs; g_bstatWindow.uploadKB += out.uploadKB;
+    g_bstatWindow.texRealloc += out.texRealloc; g_bstatWindow.texReuse += out.texReuse;
+    g_bstatWindow.texClamp += out.texClamp;
+    g_bstatWindow.poolHit += out.poolHit; g_bstatWindow.poolMiss += out.poolMiss;
+    g_bstatWindow.cImageMs += out.cImageMs; g_bstatWindow.cGlyphMs += out.cGlyphMs;
+    g_bstatWindow.cFillMs += out.cFillMs; g_bstatWindow.cGradMs += out.cGradMs;
+    g_bstatWindow.cStrokeMs += out.cStrokeMs;
+    g_bstatWindow.cImageN += out.cImageN; g_bstatWindow.cGlyphN += out.cGlyphN;
+    g_bstatWindow.cGlyphCount += out.cGlyphCount; g_bstatWindow.cFillN += out.cFillN;
+    g_bstatWindow.cGradN += out.cGradN;
+    g_bstatWindow.backCreateMs += out.backCreateMs; g_bstatWindow.backPaintMs += out.backPaintMs;
+    g_bstatWindow.backCopyMs += out.backCopyMs; g_bstatWindow.backCalls += out.backCalls;
+    g_bsCairoImageMs = g_bsCairoGlyphMs = g_bsCairoFillMs = g_bsCairoGradMs = g_bsCairoStrokeMs = 0;
+    g_bsCairoImageN = g_bsCairoGlyphN = g_bsCairoGlyphCount = g_bsCairoFillN = g_bsCairoGradN = 0;
+    g_bsBackCreateMs = g_bsBackPaintMs = g_bsBackCopyMs = 0; g_bsBackCalls = 0;
+    g_bsVisited = g_bsPainted = g_bsNdspFull = g_bsClipped = g_bsSelfHeal = 0;
+    g_bsInvFull = g_bsInvFullBig = g_bsInvRect = g_bsInvRectBig = 0;
+    g_bsDirtyPx = 0;
+    g_bsRetile = g_bsTilesCreated = g_bsTilesRecycled = g_bsTilesRemoved = g_bsScaleNuke = 0;
+    g_bsScaleMin = g_bsScaleMax = 0.f;
+    g_bsRasterMs = 0; g_bsRasterPx = 0; g_bsUploadMs = 0; g_bsUploadKB = 0;
+    g_bsTexRealloc = g_bsTexReuse = g_bsTexClamp = 0;
+    g_bsPoolHit = g_bsPoolMiss = 0;
+}
+
+static void bstatFormat(char* buf, size_t bufSize, const char* tag, const BstatWindow& s)
+{
+    snprintf(buf, bufSize,
+        "%s: vis=%u paint=%u ndspFull=%u clip=%u heal=%u | inv full=%u(big=%u) rect=%u(big=%u) dirtyMpx=%.1f | "
+        "retile=%u tiles+%u/~%u/-%u scaleNuke=%u[%.3f..%.3f] | raster=%.0fms/%.1fMpx upload=%.0fms/%lluKB | "
+        "tex realloc=%u reuse=%u clamp=%u pool=%u/%u | "
+        "RASTER-BY-TYPE image=%.0fms/%u glyph=%.0fms/%u(%uglyphs) fill=%.0fms/%u grad=%.0fms/%u stroke=%.0fms | "
+        "BACK-SPLIT create=%.0fms paint=%.0fms copy=%.0fms calls=%u",
+        tag, s.visited, s.painted, s.ndspFull, s.clipped, s.selfHeal,
+        s.invFull, s.invFullBig, s.invRect, s.invRectBig, s.dirtyPx / 1.0e6,
+        s.retile, s.tilesCreated, s.tilesRecycled, s.tilesRemoved, s.scaleNuke, s.scaleMin, s.scaleMax,
+        s.rasterMs, s.rasterPx / 1.0e6, s.uploadMs, s.uploadKB,
+        s.texRealloc, s.texReuse, s.texClamp, s.poolHit, s.poolMiss,
+        s.cImageMs, s.cImageN, s.cGlyphMs, s.cGlyphN, s.cGlyphCount, s.cFillMs, s.cFillN,
+        s.cGradMs, s.cGradN, s.cStrokeMs,
+        s.backCreateMs, s.backPaintMs, s.backCopyMs, s.backCalls);
 }
 static const unsigned GATE_N = 120;      // gate window size (frames); ~10-12fps under load => a line every ~10-12s
 static MonotonicTime g_gateLastWall;      // wall baseline (seeded on frame 1 so the FIRST gate line is valid)
@@ -1542,11 +2042,28 @@ extern "C" void WebCoreBrowserForceRepaint()
 
 // Pump WebCore (async load + timers), lay out, and present the current page state to
 // the CoreWindow surface. Called once per frame by the shell's event loop.
+extern "C" void WebCoreBrowserReleaseMemory(int critical); // defined below
+
+// Set by the shell's BACKGROUND memory watcher (any thread) when app usage nears the OS kill cap.
+// The frame pump consumes it below, first thing on the main thread — the earliest legal moment for a
+// WebCore releaseMemory() after a stall (the watcher can't call WebCore itself; wrong thread).
+static std::atomic<int> g_memEmergencyFlag { 0 };
+extern "C" void WebCoreBrowserMemEmergency()
+{
+    g_memEmergencyFlag.store(1, std::memory_order_relaxed);
+}
+
 extern "C" void WebCoreBrowserRenderFrame()
 {
     using namespace WebCore;
     if (!g_page || !g_glContext)
         return;
+    // Emergency release requested by the background watcher while we were busy/stalled. Do it before
+    // any frame work — memory may be within a few MB of the kill cap by the time we get here.
+    if (g_memEmergencyFlag.exchange(0, std::memory_order_relaxed)) {
+        portLog("mem: EMERGENCY release (background watcher flagged near-cap)");
+        WebCoreBrowserReleaseMemory(1);
+    }
     // Per-frame STAGE trace across a window of frames to localize a main-thread hang to an exact
     // sub-step: whichever "rf N <stage>" line is LAST before the log goes quiet is where the main
     // thread stopped returning. Windowed to avoid spamming every frame for the whole session.
@@ -1630,6 +2147,34 @@ extern "C" void WebCoreBrowserRenderFrame()
                 WebCore::g_texmapPoolBytes / 1024, WebCore::g_texmapPoolCount, mallocKB,
                 g_memUsedMB, g_memPct, g_memLimitMB, g_memLevel);
             portLog(mb);
+
+            // Backing-phase breakdown summed over the whole gate window (per-frame spikes get their own
+            // bstat line on SLOWFRAMEs; this catches the steady-state cost even when no frame trips 250ms).
+            {
+                char bw[640];
+                bstatFormat(bw, sizeof bw, "bstatw", g_bstatWindow);
+                portLog(bw);
+                g_bstatWindow = {};
+            }
+
+            // Bytecode-cache hit rate + URL-parse split (proof the disk cache is READ, not just written,
+            // and whether URLs needlessly take the UTF-16 path). Stats come from JSC.dll / WTF.dll via
+            // exported accessors (cross-DLL global import would need extra plumbing; functions are clean).
+            {
+                uint64_t bc[6] = {0,0,0,0,0,0}; uint64_t url[3] = {0,0,0};
+                JSC::bytecodeCacheStats(bc);
+                WTF::urlParseStats(url);
+                unsigned long long lookups = bc[0] + bc[1];
+                unsigned hitPct = lookups ? static_cast<unsigned>(bc[0] * 100 / lookups) : 0;
+                char cb[300];
+                snprintf(cb, sizeof cb,
+                    "bcache: hit=%llu miss=%llu (%u%%) write=%llu wfail=%llu readKB=%llu writeKB=%llu | url: parses=%llu 8bit=%llu 16bit=%llu",
+                    (unsigned long long)bc[0], (unsigned long long)bc[1], hitPct,
+                    (unsigned long long)bc[2], (unsigned long long)bc[3],
+                    (unsigned long long)(bc[4] / 1024), (unsigned long long)(bc[5] / 1024),
+                    (unsigned long long)url[0], (unsigned long long)url[1], (unsigned long long)url[2]);
+                portLog(cb);
+            }
         }
 
         g_composited300 = 0; g_skipped300 = 0; g_gateFrames = 0; g_msJS = 0; g_msComposite = 0;
@@ -1724,9 +2269,25 @@ extern "C" void WebCoreBrowserRenderFrame()
     // and failed to re-arm on client-side route changes; making the monitor always-on fixed that at the
     // source, so the hand-pump is gone. g_renderingUpdateDoneThisFrame tells us whether it ran.
     stage("c0:renderingUpdate");
+    // ANIMATION FIX: the engine-driven rendering update (above, inside VsyncTick) advances CSS
+    // animations/transitions, FIRES their animationend/transitionend events, and services rAF — but it
+    // only runs on frames where WebCore armed its RenderingUpdateScheduler, and during CSS animations
+    // that arming is unreliable on this port (measured: it ran on ~5% of frames). A CSS animation that
+    // never gets a rendering update freezes mid-flight and NEVER fires its end event — so YouTube's
+    // bottom-sheet close animation stalled and its dark scrim stayed composited forever (screen stuck
+    // darkened, uninteractable). While the page is visually ACTIVE — a keep-alive window (tap/scroll/
+    // nav/video) or WebCore produced a visual change within the last ~30 frames, i.e. an animation is in
+    // progress and repainting — force the rendering update every frame so the animation actually runs to
+    // completion and fires its end event. When the page goes idle (~30 frames with no change) this stops
+    // and the engine-driven path resumes, preserving the static-page idle savings.
+    bool recentlyActive = (g_composeFrame < g_forceComposeUntil)
+        || (g_composeFrame - g_lastActiveComposeFrame) < 30;
+    if (!g_renderingUpdateDoneThisFrame && recentlyActive)
+        WebCoreDriverRunRenderingUpdate();
     { static unsigned s_rupdTick = 0;
       if ((++s_rupdTick % 120) == 5) {
-          char b[72]; snprintf(b, sizeof b, "rupd: engine-driven updateRendering this frame=%d", g_renderingUpdateDoneThisFrame ? 1 : 0);
+          char b[112]; snprintf(b, sizeof b, "rupd: updateRendering this frame=%d active=%d (engine-armed + activity-forced)",
+              g_renderingUpdateDoneThisFrame ? 1 : 0, recentlyActive ? 1 : 0);
           WebCorePort::portLog(b); } }
 
     // Idle period: run pending requestIdleCallback callbacks with a small per-frame budget — this is
@@ -1770,6 +2331,8 @@ extern "C" void WebCoreBrowserRenderFrame()
         bool sceneChanged = g_chrome->needsCompositingFlush() || g_chrome->hasDirtyRegion();
         g_chrome->clearCompositingFlush();
         g_chrome->takeDirtyRegion();
+        if (sceneChanged)
+            g_lastActiveComposeFrame = g_composeFrame; // feeds the animation-fix "recentlyActive" window
         needComposite = sceneChanged || (g_composeFrame < g_forceComposeUntil);
     }
     if (!needComposite) {
@@ -1851,6 +2414,7 @@ extern "C" void WebCoreBrowserRenderFrame()
         tmRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);
         frameBackingMs = (MonotonicTime::now() - tBacking0).milliseconds();
         g_msBacking += frameBackingMs; // CPU raster (cairo) + GL texture upload
+        bstatHarvestFrame(g_bstatFrame); // snapshot+reset this frame's backing counters (printed on SLOWFRAME)
         stage("c4:beginPaint");
         MonotonicTime tPaint0 = MonotonicTime::now();
         g_textureMapper->beginPainting();
@@ -1896,6 +2460,14 @@ extern "C" void WebCoreBrowserRenderFrame()
             g_composeFrame, frameMs, frameUpdateMs, frameIdleMs, frameFlushMs, compositeMs,
             frameBackingMs, framePaintMs, framePaintBeginMs, framePaintTreeMs, framePaintEndMs, swapMs);
         portLog(b);
+        // When the backing phase is the slow part, break it down: invalidation source, raster vs upload,
+        // tile/texture churn. g_bstatFrame was harvested right after updateBackingStoreIncludingSubLayers,
+        // so it describes exactly this frame.
+        if (frameBackingMs >= 250) {
+            char bb[640];
+            bstatFormat(bb, sizeof bb, "bstat", g_bstatFrame);
+            portLog(bb);
+        }
     }
     stage("f:present-done");
 }
@@ -1953,11 +2525,11 @@ extern "C" void WebCoreBrowserRenderFrameSafe()
 // overflow / iframes correctly. Async scrolling is OFF in this build, so it scrolls synchronously on
 // the main thread. Wheel delta is REVERSED from scroll direction (ScrollAnimator: scrollDelta =
 // pixelStep * -deltaY), so a drag that should increase scroll offset by dy uses deltaY = -dy.
-extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y)
+// C++ objects (PlatformWheelEvent) live here — __try cannot coexist with values needing unwind, so
+// the SEH wrapper is the separate extern "C" function below (same split as tapImpl/keyDownUpImpl).
+static void scrollByImpl(int dx, int dy, int x, int y)
 {
     using namespace WebCore;
-    if (!g_page)
-        return;
     Frame& frame = g_page->mainFrame();
     IntPoint pos(x, y);
     PlatformWheelEvent wheel(pos, pos,
@@ -1971,6 +2543,32 @@ extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y)
     };
     frame.eventHandler().handleWheelEvent(wheel, steps);
     WebCoreBrowserKeepCompositing(8); // ensure the scroll paints even if invalidation lags
+}
+
+extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y)
+{
+    if (!g_page)
+        return;
+    // handleWheelEvent runs the synchronous scroll -> style/layout -> compositing-update path (the
+    // cmplayer: layer-promotion churn). A fault or C++ throw down there (crashprobe showed a repeated
+    // 0xE06D7363 from a WinRT graphics call during layer rebuild) had NO handler on this path and,
+    // uncaught, escaped to the WinRT caller -> RoFailFast killed the app: the long-standing "closes on
+    // scroll while a video plays". WebCore is built /EHs- (no C++ unwind), so a C++ try/catch can't
+    // reliably catch it — use SEH like WebCoreBrowserRenderFrameSafe. rfCrashFilter catches every code
+    // (incl. 0xE06D7363) and records it; we log + survive so the next frame retries instead of dying.
+    __try {
+        scrollByImpl(dx, dy, x, y);
+    } __except (rfCrashFilter(GetExceptionInformation())) {
+        static unsigned s_scrollCrashes = 0;
+        if (++s_scrollCrashes <= 20) {
+            uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
+            uintptr_t rva = reinterpret_cast<uintptr_t>(g_crashAt) - base;
+            char b[224];
+            snprintf(b, sizeof b, "SCROLL-CRASH #%u code=0x%08lx at=%p base=0x%08zx rva=0x%08zx fault=%p (survived; see crashprobe VEH type=)",
+                s_scrollCrashes, g_crashCode, g_crashAt, (size_t)base, (size_t)rva, g_crashFault);
+            WebCorePort::portLog(b);
+        }
+    }
 }
 
 // Release memory in response to the platform (W10M AppMemoryUsage) pressure signal. critical!=0 means
@@ -1994,7 +2592,13 @@ extern "C" void WebCoreBrowserReleaseMemory(int critical)
 }
 
 // A tap at (x, y) device pixels: a synthetic left click (focuses fields, follows links).
-extern "C" void WebCoreBrowserTap(int x, int y)
+static void logKeyCrash(const char* which); // defined below; shared crash reporter for input entrypoints
+
+// Body split out so the extern "C" entrypoint can SEH-wrap it: a <select>/dropdown tap dispatches into
+// RenderMenuList::showPopup() and other layout-reentrant paths that can hard-fault, and unlike the render
+// pump and key/char entrypoints this one was NOT guarded -- a fault here killed the whole app with no report.
+// __try cannot coexist with C++ objects needing unwind (String/RefPtr/PlatformMouseEvent), so they live here.
+static void tapImpl(int x, int y)
 {
     using namespace WebCore;
     if (!g_page)
@@ -2013,9 +2617,30 @@ extern "C" void WebCoreBrowserTap(int x, int y)
         RefPtr node = r.innerNode();
         String tag = node ? node->nodeName() : String("<none>");
         String txt = node ? node->textContent().left(40) : String();
+        // Describe an element as tag#id.class (first class only) so a fall-through to HTML/BODY vs a
+        // real overlay backdrop is distinguishable, and the modal's structure is visible on repro.
+        auto describe = [](Node* n) -> std::string {
+            if (!is<Element>(n))
+                return n ? std::string(n->nodeName().utf8().data()) : std::string("<none>");
+            Element& e = downcast<Element>(*n);
+            std::string s = e.tagName().utf8().data();
+            const AtomString& id = e.getIdAttribute();
+            if (!id.isEmpty()) { s += "#"; s += id.string().utf8().data(); }
+            const AtomString& cls = e.getAttribute(HTMLNames::classAttr);
+            if (!cls.isEmpty()) { s += "."; s += cls.string().left(40).utf8().data(); }
+            return s;
+        };
+        // Ancestor chain from the hit node up to <html> — reveals whether the tap landed inside the
+        // settings modal/backdrop or fell straight through to the document root.
+        std::string chain;
+        for (RefPtr a = node; a && chain.size() < 240; a = a->parentNode()) {
+            if (!chain.empty()) chain += " < ";
+            chain += describe(a.get());
+        }
         portLog((std::string("tap: x=") + std::to_string(x) + " y=" + std::to_string(y)
             + " cssVp=" + std::to_string(g_cssW) + "x" + std::to_string(g_cssH)
-            + " hit=" + tag.utf8().data() + " txt=" + txt.utf8().data()).c_str());
+            + " hit=" + tag.utf8().data() + " txt=" + txt.utf8().data()
+            + " chain=" + chain).c_str());
     }
 
     auto now = WallTime::now();
@@ -2034,6 +2659,12 @@ extern "C" void WebCoreBrowserTap(int x, int y)
         PortShowKeyboard(editable ? 1 : 0);
     }
     WebCoreBrowserKeepCompositing(8); // paint tap feedback / focus changes
+}
+
+extern "C" void WebCoreBrowserTap(int x, int y)
+{
+    __try { tapImpl(x, y); }
+    __except (rfCrashFilter(GetExceptionInformation())) { logKeyCrash("tap"); }
 }
 
 #if ENABLE(TOUCH_EVENTS)
@@ -2275,6 +2906,11 @@ extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale)
         g_deviceScale = deviceScale;
     g_cssW = static_cast<int>(std::ceil(g_winW / g_deviceScale));
     g_cssH = static_cast<int>(std::ceil(g_winH / g_deviceScale));
+    double newRaster = g_deviceScale > 3.0 ? 2.5 : g_deviceScale; // keep the I-01 cap consistent on rotate
+    if (newRaster != g_rasterScale) {
+        g_rasterScale = newRaster;
+        g_page->setDeviceScaleFactor(g_rasterScale);
+    }
     if (FrameView* view = g_page->mainFrame().view())
         view->resize(g_cssW, g_cssH);
     setPlatformScreenBounds(FloatRect(0, 0, g_cssW, g_cssH));

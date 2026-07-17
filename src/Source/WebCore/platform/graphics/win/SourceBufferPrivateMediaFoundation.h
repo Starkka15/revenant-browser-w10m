@@ -29,6 +29,11 @@ public:
     // media. We synthesize it from the addSourceBuffer content type (one track per buffer).
     void setTrackInfo(bool isVideo, const String& codecs) { m_isVideo = isVideo; m_codecs = codecs; }
 
+    // Reassert the WinRT buffer's real ranges after the shell's emergency memory trim bypassed
+    // removeCodedFrames (retries while Buffered transiently reads 0). Main thread only; sbCtx is
+    // validated against the live-instance set before any deref.
+    static void refreshRangesAfterExternalTrim(void* sbCtx, int retriesLeft);
+
 private:
     SourceBufferPrivateMediaFoundation(MediaSourcePrivateMediaFoundation&, void* sbHandle);
 

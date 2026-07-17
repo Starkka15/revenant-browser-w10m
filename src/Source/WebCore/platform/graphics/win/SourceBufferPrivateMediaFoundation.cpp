@@ -12,11 +12,27 @@
 #include "InbandTextTrackPrivate.h"
 #include "MediaDescription.h"
 #include <wtf/MainThread.h>
+#include <wtf/HashSet.h>
+#include <wtf/NeverDestroyed.h>
+#include <wtf/RunLoop.h>
 #include <wtf/text/AtomString.h>
 
 extern void PortImgLog(const char*);
 
 namespace WebCore {
+
+// Main-thread-only registry of live SourceBufferPrivateMediaFoundation instances. The WinRT MSE event
+// callbacks at the bottom of this file arrive on a threadpool/MTA thread carrying a raw void* that WebCore
+// may already have destroyed (navigation or MediaSource detach mid-append frees the SourceBuffer before the
+// queued completion runs -> use-after-free). We cannot capture a WeakPtr through the C ABI, so each instance
+// registers itself here; ctor/dtor and the marshalled main-thread lambda all run on the main thread, so
+// checking membership inside the lambda before dereferencing is race-free (the object cannot be freed between
+// the check and the call). This is the void*-ABI equivalent of the WeakPtr guard MediaPlayerPrivate uses.
+static WTF::HashSet<const void*>& sbLiveSet()
+{
+    static NeverDestroyed<WTF::HashSet<const void*>> set;
+    return set;
+}
 
 namespace {
 
@@ -51,10 +67,12 @@ SourceBufferPrivateMediaFoundation::SourceBufferPrivateMediaFoundation(MediaSour
     : m_mediaSource(&source)
     , m_sbHandle(sbHandle)
 {
+    sbLiveSet().add(this);
 }
 
 SourceBufferPrivateMediaFoundation::~SourceBufferPrivateMediaFoundation()
 {
+    sbLiveSet().remove(this);
     // The MseSourceBuffer is owned by the MseStreamSource (freed when the source is destroyed);
     // we only hold a borrowed handle, so nothing to release here.
 }
@@ -139,6 +157,38 @@ void SourceBufferPrivateMediaFoundation::onErrored(int hr)
     { char b[64]; snprintf(b, sizeof b, "mse: SourceBuffer ERROR hr=%d", hr); PortImgLog(b); }
     if (m_client)
         m_client->sourceBufferPrivateAppendError(true);
+}
+
+// Post-EMERGENCY-TRIM range refresh. The shell's background memory watcher trims buffered media
+// directly on the WinRT buffer (PortMseEmergencyTrim) without going through removeCodedFrames — so
+// WebCore's .buffered goes stale, YouTube believes the removed range is still appended, and playback
+// wedges in "buffering" the moment the play head needs it (observed: trim [0,55.7) at pos=65.7 →
+// stuck at 66s forever). The trimmer calls this note; we hop to the main thread and reassert the
+// WinRT buffer's REAL ranges. If Buffered transiently reads 0 (MediaEngine mid-flush — the reason
+// the spurious-UpdateEnded path deliberately does NOT refresh), retry a few times before giving up:
+// pushing an EMPTY range set would recreate the frozen-ads bug this file already fixed once.
+void SourceBufferPrivateMediaFoundation::refreshRangesAfterExternalTrim(void* sbCtx, int retriesLeft)
+{
+    if (!sbLiveSet().contains(sbCtx))
+        return; // SourceBuffer died between trim and refresh — nothing to do
+    auto* sb = static_cast<SourceBufferPrivateMediaFoundation*>(sbCtx);
+    double starts[32], ends[32];
+    int n = sb->m_sbHandle ? PortMseGetBuffered(sb->m_sbHandle, starts, ends, 32) : 0;
+    if (!n) {
+        if (retriesLeft > 0) {
+            RunLoop::main().dispatchAfter(Seconds { 0.5 }, [sbCtx, retriesLeft] { refreshRangesAfterExternalTrim(sbCtx, retriesLeft - 1); });
+            return;
+        }
+        PortImgLog("mse: post-trim refresh gave up (ranges still empty) - leaving WebCore ranges as-is");
+        return;
+    }
+    PortImgLog("mse: post-trim refresh -> reasserting real ranges to WebCore");
+    sb->pushBufferedRanges();
+}
+
+extern "C" void WebCoreMseSbNoteEmergencyTrim(void* sbCtx)
+{
+    callOnMainThread([sbCtx] { SourceBufferPrivateMediaFoundation::refreshRangesAfterExternalTrim(sbCtx, 6); });
 }
 
 void SourceBufferPrivateMediaFoundation::pushBufferedRanges()
@@ -230,7 +280,10 @@ extern "C" void WebCoreMseSbUpdateEnded(void* sbCtx)
     if (!sbCtx)
         return;
     callOnMainThread([sbCtx] {
-        static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onUpdateEnded();
+        // Re-validate on the main thread: WebCore may have destroyed this SourceBuffer between the WinRT
+        // event firing and this lambda running (navigation / MediaSource detach mid-append).
+        if (WebCore::sbLiveSet().contains(sbCtx))
+            static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onUpdateEnded();
     });
 }
 
@@ -239,7 +292,8 @@ extern "C" void WebCoreMseSbErrored(void* sbCtx, int hr)
     if (!sbCtx)
         return;
     callOnMainThread([sbCtx, hr] {
-        static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onErrored(hr);
+        if (WebCore::sbLiveSet().contains(sbCtx))
+            static_cast<WebCore::SourceBufferPrivateMediaFoundation*>(sbCtx)->onErrored(hr);
     });
 }
 

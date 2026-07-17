@@ -10,10 +10,14 @@
 // The MseStreamSource implements IMediaSource, which via IMFGetService(MF_MEDIASOURCE_SERVICE)
 // yields an IMFMediaSource — that is what our existing IMFMediaEngine (decode-to-texture +
 // accelerated compositing) plays, unchanged, via the source-resolver bridge in WebCore.
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -34,6 +38,8 @@ using namespace Windows::Storage::Streams;
 // Marshalled back on the UI thread (WinRT events fire there, same thread as the render pump).
 extern "C" void WebCoreMseSbUpdateEnded(void* sbCtx);
 extern "C" void WebCoreMseSbErrored(void* sbCtx, int hr);
+extern "C" void WebCoreMseSbNoteEmergencyTrim(void* sbCtx); // post-emergency-trim range refresh
+extern "C" unsigned WebCoreMemBudgetMseKeepBehindSec();     // per-device MSE keep-behind (memory tier)
 extern "C" void WebCoreMseSourceOpened(void* srcCtx);
 extern "C" void WebCoreMseSourceEnded(void* srcCtx);
 extern "C" void WebCoreMsePlayerFrame(void* playerCtx, const uint8_t* bgra, int width, int height, int stride);
@@ -62,6 +68,7 @@ struct MseSource {
     Windows::Foundation::EventRegistrationToken frameToken {}; // VideoFrameAvailable, unhooked at stop
     Microsoft::WRL::ComPtr<ID3D11Texture2D> rt;      // BGRA render target CopyFrameToVideoSurface writes into
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging; // CPU-readable copy we hand to WebCore
+    std::vector<struct MseBuffer*> buffers;          // source buffers (for the emergency memory trim)
     UINT texW { 0 };
     UINT texH { 0 };
 };
@@ -70,6 +77,13 @@ struct MseBuffer {
     MseSourceBuffer^ buffer;
     void* sbCtx { nullptr };
 };
+
+// Registry of live MSE sources so the shell's background memory watcher can emergency-trim buffered
+// media OFF the main thread (main is exactly what's stalled when memory races to the OS kill; WinRT
+// MF objects are agile, so Remove()/Buffered are safe from any thread). Guarded by s_mseRegistryLock;
+// PortMseDestroy unregisters under the same lock, so the trimmer can never touch a freed source.
+static std::mutex s_mseRegistryLock;
+static std::vector<struct MseSource*> s_mseSources;
 
 // Platform::String^ -> UTF-8 std::string (the C ABI into WebCore's curl fetcher speaks UTF-8).
 static std::string toUtf8(Platform::String^ s)
@@ -183,26 +197,81 @@ void* PortMseCreate(void* srcCtx)
         [srcCtx](MseStreamSource^, Object^) { PortImgLog("mse: MseStreamSource Opened"); WebCoreMseSourceOpened(srcCtx); });
     h->source->Ended += ref new TypedEventHandler<MseStreamSource^, Object^>(
         [srcCtx](MseStreamSource^, Object^) { PortImgLog("mse: MseStreamSource Ended"); WebCoreMseSourceEnded(srcCtx); });
+    {
+        std::lock_guard<std::mutex> lock(s_mseRegistryLock);
+        s_mseSources.push_back(h);
+    }
     return h;
 }
 
 void PortMseDestroy(void* srcH)
 {
     auto h = static_cast<MseSource*>(srcH);
+    {
+        std::lock_guard<std::mutex> lock(s_mseRegistryLock);
+        s_mseSources.erase(std::remove(s_mseSources.begin(), s_mseSources.end(), h), s_mseSources.end());
+    }
     h->closing = true;
     h->playerCtx = nullptr;
-    // `delete` on a C++/CX hat invokes IClosable::Close() (stops playback + frees the media pipeline)
-    // before the ref is dropped, so late VideoFrameAvailable events can't touch a freed MseSource.
-    if (h->player) { try { delete h->player; } catch (...) { } h->player = nullptr; }
-    PortImgLog("mse: source destroyed");
+    // `delete` on a C++/CX hat invokes IClosable::Close() (stops playback + frees the media pipeline).
+    // Doing that INLINE here froze the app hard: PortMseDestroy runs on the MAIN thread from
+    // ~MediaPlayerPrivateMediaFoundation during Document::commonTeardown, and a wedged MF pipeline can
+    // block Close() for 100+ seconds (measured: stage=a1:ctx IDLE(deadlock/blocked), 180s+, unkillable
+    // even by WDP terminate). Close on a threadpool thread instead — same shape as PortMsePlayerStop:
+    // detach the frame server + source first (makes Close trivial), then delete off the UI thread. The
+    // captured `player` hat keeps it alive until the worker finishes; `h` is freed inline (its player
+    // ref already transferred), so no late VideoFrameAvailable can reach it (playerCtx is null + the
+    // handler is unhooked below).
+    if (h->player) {
+        MediaPlayer^ player = h->player;
+        h->player = nullptr;
+        try { if (h->frameToken.Value) player->VideoFrameAvailable -= h->frameToken; } catch (...) { }
+        try {
+            Windows::System::Threading::ThreadPool::RunAsync(
+                ref new Windows::System::Threading::WorkItemHandler(
+                    [player](Windows::Foundation::IAsyncAction^) {
+                        try { player->Pause(); } catch (...) { }
+                        try { player->Source = nullptr; } catch (...) { }
+                        try { delete player; } catch (...) { }
+                        PortImgLog("mse: player closed (destroy worker)");
+                    }));
+        } catch (...) {
+            try { delete player; } catch (...) { } // fallback: close inline if dispatch fails
+        }
+    }
+    PortImgLog("mse: source destroyed (async close)");
     delete h;
+}
+
+// Codecs the device can't decode fast enough at video res. Kept in sync with
+// mseCodecsUndecodable() in MediaPlayerPrivateMediaFoundation.cpp; duplicated (not linked) because
+// this is a C++/CX TU and the check is a trivial ASCII substring scan.
+static bool mseTypeUndecodable(const char* type)
+{
+    if (!type) return false;
+    std::string t(type);
+    for (auto& ch : t) ch = (char)tolower((unsigned char)ch);
+    static const char* const bad[] = { "av01", "av1.", "vp09", "vp9", "vp08", "vp8",
+                                        "opus", "vorbis", "ac-3", "ec-3", "flac", "dts" };
+    for (auto* b : bad)
+        if (t.find(b) != std::string::npos) return true;
+    return false;
 }
 
 int PortMseIsTypeSupported(void* srcH, const char* type)
 {
+    // Reject undecodable codecs up front so YouTube's ABR selects H.264/AAC (RC1). Log every query so
+    // the on-device log shows exactly which types the page probes and which we gate.
+    bool gated = mseTypeUndecodable(type);
     auto h = static_cast<MseSource*>(srcH);
-    try { return h->source->IsContentTypeSupported(toPlatformString(type)) ? 1 : 0; }
-    catch (...) { return 0; }
+    int ok = 0;
+    if (!gated) {
+        try { ok = h->source->IsContentTypeSupported(toPlatformString(type)) ? 1 : 0; }
+        catch (...) { ok = 0; }
+    }
+    { char b[300]; snprintf(b, sizeof b, "mse: isTypeSupported type=%s gated=%d -> %d",
+        type ? type : "(null)", gated ? 1 : 0, ok); PortImgLog(b); }
+    return ok;
 }
 
 // Add a source buffer. sbCtx is the WebCore SourceBufferPrivate pointer for callbacks.
@@ -217,6 +286,10 @@ void* PortMseAddSourceBuffer(void* srcH, const char* type, void* sbCtx)
     auto b = new MseBuffer();
     b->buffer = sb;
     b->sbCtx = sbCtx;
+    {
+        std::lock_guard<std::mutex> lock(s_mseRegistryLock);
+        h->buffers.push_back(b);
+    }
     sb->UpdateEnded += ref new TypedEventHandler<MseSourceBuffer^, Object^>(
         [sbCtx](MseSourceBuffer^, Object^) { WebCoreMseSbUpdateEnded(sbCtx); });
     sb->ErrorOccurred += ref new TypedEventHandler<MseSourceBuffer^, Object^>(
@@ -266,6 +339,46 @@ void PortMseRemove(void* sbH, double startSeconds, double endSeconds)
     } catch (...) {
         PortImgLog("mse: Remove THREW (unknown)");
         WebCoreMseSbUpdateEnded(b->sbCtx);
+    }
+}
+
+// EMERGENCY memory trim, called from the shell's background memory watcher when app usage nears the
+// OS kill cap (>=92%) while the main thread may be stalled. Removes buffered media BEHIND playback
+// (keeps a 10s tail for instant rewind) directly on the WinRT buffers — MF frees the demuxed frames.
+// Deliberately does NOT signal WebCore: the resulting UpdateEnded lands in onUpdateEnded() with no
+// append/remove in flight and is ignored there ("spurious UpdateEnded" path preserves ranges); WebCore's
+// buffered view goes stale until the next append, which is acceptable against a certain OS kill.
+// Buffers mid-update are skipped (Remove would throw); a lost race just means that buffer is skipped.
+void PortMseEmergencyTrim()
+{
+    std::lock_guard<std::mutex> lock(s_mseRegistryLock);
+    for (auto* h : s_mseSources) {
+        if (h->closing || !h->player)
+            continue;
+        double pos = 0;
+        try { pos = h->player->PlaybackSession->Position.Duration / 1e7; } catch (...) { continue; }
+        // Keep-behind is per device: 8s on a 1GB device (trim harder — memory is the scarce
+        // resource that kills it on scroll+video), up to 30s on 3GB+. Set by the memory tier.
+        double cutoff = pos - static_cast<double>(WebCoreMemBudgetMseKeepBehindSec());
+        if (cutoff <= 0)
+            continue;
+        for (auto* b : h->buffers) {
+            try {
+                if (b->buffer->IsUpdating)
+                    continue;
+                auto ranges = b->buffer->Buffered;
+                if (!ranges->Size || ranges->GetAt(0).Start.Duration / 1e7 >= cutoff)
+                    continue; // nothing buffered behind the cutoff
+                b->buffer->Remove(TimeSpan { 0 }, ref new Platform::Box<TimeSpan>(TimeSpan { static_cast<long long>(cutoff * 1e7) }));
+                char m[96]; snprintf(m, sizeof m, "memwatch: MSE emergency trim [0, %.1fs) pos=%.1fs", cutoff, pos);
+                PortImgLog(m);
+                // Tell WebCore the ranges changed under it, or the page believes the removed span is
+                // still buffered and playback wedges in "buffering" when the play head reaches it.
+                WebCoreMseSbNoteEmergencyTrim(b->sbCtx);
+            } catch (Platform::Exception^ ex) {
+                char m[96]; snprintf(m, sizeof m, "memwatch: MSE trim THREW hr=0x%08lx (skipped)", (unsigned long)ex->HResult); PortImgLog(m);
+            } catch (...) { PortImgLog("memwatch: MSE trim THREW (skipped)"); }
+        }
     }
 }
 

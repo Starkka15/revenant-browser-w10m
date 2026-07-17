@@ -8,10 +8,23 @@
 #include "MediaSourcePrivateClient.h"
 #include "ShellMseBridge.h"
 #include "SourceBufferPrivateMediaFoundation.h"
+#include <wtf/HashSet.h>
+#include <wtf/MainThread.h>
+#include <wtf/NeverDestroyed.h>
 
 extern void PortImgLog(const char*);
 
 namespace WebCore {
+
+// Main-thread-only live registry (see the same pattern in SourceBufferPrivateMediaFoundation.cpp): the WinRT
+// MseStreamSource event callbacks below arrive on a threadpool thread with a raw void* that WebCore may have
+// destroyed on navigation. Register each instance; the callbacks marshal to the main thread and re-check
+// membership before dereferencing, which is race-free since ctor/dtor and the lambda all run on the main thread.
+static WTF::HashSet<const void*>& msLiveSet()
+{
+    static NeverDestroyed<WTF::HashSet<const void*>> set;
+    return set;
+}
 
 Ref<MediaSourcePrivateMediaFoundation> MediaSourcePrivateMediaFoundation::create(MediaPlayerPrivateMediaFoundation& player, MediaSourcePrivateClient& client)
 {
@@ -22,11 +35,13 @@ MediaSourcePrivateMediaFoundation::MediaSourcePrivateMediaFoundation(MediaPlayer
     : m_player(&player)
     , m_client(client)
 {
+    msLiveSet().add(this);
     m_srcHandle = PortMseCreate(this);
 }
 
 MediaSourcePrivateMediaFoundation::~MediaSourcePrivateMediaFoundation()
 {
+    msLiveSet().remove(this);
     for (auto& sb : m_sourceBuffers)
         sb->clearMediaSource();
     if (m_srcHandle)
@@ -115,16 +130,27 @@ void MediaSourcePrivateMediaFoundation::onEnded()
 } // namespace WebCore
 
 // ---- C ABI callbacks from the shell's WinRT MseStreamSource events ----
+// These fire on a WinRT threadpool/MTA thread. Marshal to the WebCore main thread (onOpened/onEnded touch
+// main-thread-affine state and the client) AND re-validate against the live registry, since the source can
+// be destroyed on navigation before the queued lambda runs.
 extern "C" void WebCoreMseSourceOpened(void* srcCtx)
 {
-    if (srcCtx)
-        static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onOpened();
+    if (!srcCtx)
+        return;
+    callOnMainThread([srcCtx] {
+        if (WebCore::msLiveSet().contains(srcCtx))
+            static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onOpened();
+    });
 }
 
 extern "C" void WebCoreMseSourceEnded(void* srcCtx)
 {
-    if (srcCtx)
-        static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onEnded();
+    if (!srcCtx)
+        return;
+    callOnMainThread([srcCtx] {
+        if (WebCore::msLiveSet().contains(srcCtx))
+            static_cast<WebCore::MediaSourcePrivateMediaFoundation*>(srcCtx)->onEnded();
+    });
 }
 
 #endif // ENABLE(MEDIA_SOURCE)
