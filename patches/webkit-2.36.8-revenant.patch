@@ -2107,6 +2107,30 @@ index 01976e0396..fb11967a6b 100644
  
      return getTimeZoneInformationForYear;
  }
+diff --git a/Source/WTF/wtf/FastMalloc.cpp b/Source/WTF/wtf/FastMalloc.cpp
+index f560f56b02..02fee9603f 100644
+--- a/Source/WTF/wtf/FastMalloc.cpp
++++ b/Source/WTF/wtf/FastMalloc.cpp
+@@ -276,7 +276,18 @@ TryMallocReturnValue tryFastRealloc(void* p, size_t n)
+     return realloc(p, n);
+ }
+ 
+-void releaseFastMallocFreeMemory() { }
++void releaseFastMallocFreeMemory()
++{
++#if OS(WINDOWS)
++    // USE(SYSTEM_MALLOC): freed allocations sit in the UCRT heap committed-but-unused and never return
++    // to the OS on their own. On the 1GB tier-0 device (Revenant I-11) this "committed free" heap is the
++    // ~136MB of page-driven growth that accumulates while browsing heavy pages, pushing the process past
++    // the 390MB PLM app limit -> the OS reaps it. _heapmin() coalesces the CRT free lists and returns the
++    // pages to the OS. WebCore's memory-pressure release (releaseMemory/critical) already calls this on
++    // its way out -- it was just a no-op stub, so the freed heap never shrank.
++    _heapmin();
++#endif
++}
+ void releaseFastMallocFreeMemoryForThisThread() { }
+ 
+ FastMallocStatistics fastMallocStatistics()
 diff --git a/Source/WTF/wtf/Int128.h b/Source/WTF/wtf/Int128.h
 index 9e60dab2fb..6d77d19eea 100644
 --- a/Source/WTF/wtf/Int128.h
@@ -4570,6 +4594,35 @@ index 7e56427a8e..8af6fae713 100644
      String search = m_associatedURL->search();
      m_pairs = search.startsWith('?') ? WTF::URLParser::parseURLEncodedForm(StringView(search).substring(1)) : WTF::URLParser::parseURLEncodedForm(search);
  }
+diff --git a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+index 611460277f..12cf504b27 100644
+--- a/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
++++ b/Source/WebCore/html/canvas/WebGLRenderingContextBase.cpp
+@@ -3199,15 +3199,20 @@ WebGLAny WebGLRenderingContextBase::getParameter(GCGLenum pname)
+     case GraphicsContextGL::MAX_COMBINED_TEXTURE_IMAGE_UNITS:
+         return getIntParameter(pname);
+     case GraphicsContextGL::MAX_CUBE_MAP_TEXTURE_SIZE:
++    case GraphicsContextGL::MAX_RENDERBUFFER_SIZE:
++    case GraphicsContextGL::MAX_TEXTURE_SIZE:
++        // FINGERPRINT COHERENCE (I-15): under the iOS-Safari WebGL mask, report the iPhone GPU's
++        // texture/renderbuffer size limit (16384) instead of this device's real 4096. A "4096" under an
++        // iPhone UA is a tell Cloudflare Turnstile flags. Read-only mask — real GL allocations still use
++        // the true hardware limit, and shader uniform/varying limits are NOT masked (masking those up
++        // would break shader compilation on 4096-class hardware).
++        if (scriptExecutionContext()->settingsValues().maskWebGLStringsEnabled)
++            return 16384;
+         return getIntParameter(pname);
+     case GraphicsContextGL::MAX_FRAGMENT_UNIFORM_VECTORS:
+         return getIntParameter(pname);
+-    case GraphicsContextGL::MAX_RENDERBUFFER_SIZE:
+-        return getIntParameter(pname);
+     case GraphicsContextGL::MAX_TEXTURE_IMAGE_UNITS:
+         return getIntParameter(pname);
+-    case GraphicsContextGL::MAX_TEXTURE_SIZE:
+-        return getIntParameter(pname);
+     case GraphicsContextGL::MAX_VARYING_VECTORS:
+         return getIntParameter(pname);
+     case GraphicsContextGL::MAX_VERTEX_ATTRIBS:
 diff --git a/Source/WebCore/html/shadow/DateTimeFieldElements.cpp b/Source/WebCore/html/shadow/DateTimeFieldElements.cpp
 index 1083caf938..b3360b94ca 100644
 --- a/Source/WebCore/html/shadow/DateTimeFieldElements.cpp
@@ -5076,11 +5129,23 @@ index f2c9640d46..5ae6614f01 100644
  }
  
  void ImageSource::startAsyncDecodingQueue()
+diff --git a/Source/WebCore/platform/graphics/cairo/BackingStoreBackendCairoImpl.cpp b/Source/WebCore/platform/graphics/cairo/BackingStoreBackendCairoImpl.cpp
+index c2bac67d80..473b67a294 100644
+--- a/Source/WebCore/platform/graphics/cairo/BackingStoreBackendCairoImpl.cpp
++++ b/Source/WebCore/platform/graphics/cairo/BackingStoreBackendCairoImpl.cpp
+@@ -36,6 +36,7 @@ static RefPtr<cairo_surface_t> createCairoImageSurfaceWithFastMalloc(const IntSi
+     RefPtr<cairo_surface_t> surface = adoptRef(cairo_image_surface_create_for_data(static_cast<unsigned char*>(surfaceData), CAIRO_FORMAT_ARGB32, size.width(), size.height(), stride));
+     cairo_surface_set_user_data(surface.get(), &s_surfaceDataKey, surfaceData, [](void* data) { fastFree(data); });
+     cairo_surface_set_device_scale(surface.get(), deviceScaleFactor, deviceScaleFactor);
++    trackCairoImageSurface(surface.get()); // I-11: attribute layer backing-store bytes in mempool:
+     return surface;
+ }
+ 
 diff --git a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp b/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
-index f45975091b..6ecd31bf74 100644
+index f45975091b..7d851efa5b 100644
 --- a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
 +++ b/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
-@@ -43,7 +43,7 @@
+@@ -43,12 +43,33 @@
  #include <wtf/UniqueArray.h>
  #include <wtf/Vector.h>
  
@@ -5089,7 +5154,33 @@ index f45975091b..6ecd31bf74 100644
  #include <cairo-win32.h>
  #endif
  
-@@ -314,7 +314,7 @@ IntSize cairoSurfaceSize(cairo_surface_t* surface)
+ namespace WebCore {
+ 
++// Revenant memory attribution (I-11) — live bytes of tracked cairo IMAGE surfaces. See header.
++std::atomic<unsigned long long> g_cairoSurfaceBytes { 0 };
++static const cairo_user_data_key_t s_revSurfBytesKey = { 0 };
++static void revSurfBytesDestroy(void* data)
++{
++    g_cairoSurfaceBytes.fetch_sub(reinterpret_cast<uintptr_t>(data), std::memory_order_relaxed);
++}
++void trackCairoImageSurface(cairo_surface_t* s)
++{
++    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE)
++        return;
++    int h = cairo_image_surface_get_height(s);
++    int stride = cairo_image_surface_get_stride(s);
++    if (h <= 0 || stride <= 0)
++        return;
++    unsigned long long bytes = static_cast<unsigned long long>(h) * static_cast<unsigned long long>(stride);
++    // Store the byte count in the surface's user data; the destructor fires on free and decrements.
++    if (cairo_surface_set_user_data(s, &s_revSurfBytesKey, reinterpret_cast<void*>(static_cast<uintptr_t>(bytes)), revSurfBytesDestroy) == CAIRO_STATUS_SUCCESS)
++        g_cairoSurfaceBytes.fetch_add(bytes, std::memory_order_relaxed);
++}
++
+ #if USE(CAIRO) && !PLATFORM(GTK)
+ const cairo_font_options_t* getDefaultCairoFontOptions()
+ {
+@@ -314,7 +335,7 @@ IntSize cairoSurfaceSize(cairo_surface_t* surface)
      switch (cairo_surface_get_type(surface)) {
      case CAIRO_SURFACE_TYPE_IMAGE:
          return IntSize(cairo_image_surface_get_width(surface), cairo_image_surface_get_height(surface));
@@ -5098,6 +5189,31 @@ index f45975091b..6ecd31bf74 100644
      case CAIRO_SURFACE_TYPE_WIN32:
          surface = cairo_win32_surface_get_image(surface);
          ASSERT(surface);
+diff --git a/Source/WebCore/platform/graphics/cairo/CairoUtilities.h b/Source/WebCore/platform/graphics/cairo/CairoUtilities.h
+index 33bf8fd1b2..a8be172a25 100644
+--- a/Source/WebCore/platform/graphics/cairo/CairoUtilities.h
++++ b/Source/WebCore/platform/graphics/cairo/CairoUtilities.h
+@@ -30,6 +30,7 @@
+ 
+ #include "GraphicsTypes.h"
+ #include "IntSize.h"
++#include <atomic>
+ #include <cairo.h>
+ 
+ #if USE(FREETYPE)
+@@ -46,6 +47,12 @@ class IntRect;
+ class Path;
+ class Region;
+ 
++// Revenant memory attribution (I-11): live bytes of the big cairo IMAGE surfaces (layer backing stores
++// + ImageBuffers — the software-raster memory behind composited layers). Tracked via a cairo user-data
++// destructor so it auto-decrements when the surface is freed. Read by the mempool: diagnostic line.
++extern std::atomic<unsigned long long> g_cairoSurfaceBytes;
++void trackCairoImageSurface(cairo_surface_t*);
++
+ #if USE(FREETYPE)
+ class CairoFtFaceLocker {
+ public:
 diff --git a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp b/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
 index c323044535..477005f870 100644
 --- a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
@@ -5200,6 +5316,26 @@ index c323044535..477005f870 100644
      auto xOffset = point.x();
      Vector<cairo_glyph_t> cairoGlyphs(numGlyphs);
      {
+diff --git a/Source/WebCore/platform/graphics/cairo/ImageBufferCairoImageSurfaceBackend.cpp b/Source/WebCore/platform/graphics/cairo/ImageBufferCairoImageSurfaceBackend.cpp
+index d33f5f56c3..0223ec7542 100644
+--- a/Source/WebCore/platform/graphics/cairo/ImageBufferCairoImageSurfaceBackend.cpp
++++ b/Source/WebCore/platform/graphics/cairo/ImageBufferCairoImageSurfaceBackend.cpp
+@@ -32,6 +32,7 @@
+ 
+ #if USE(CAIRO)
+ 
++#include "CairoUtilities.h"
+ #include "Color.h"
+ #include "ImageBackingStore.h"
+ #include <cairo.h>
+@@ -92,6 +93,7 @@ std::unique_ptr<ImageBufferCairoImageSurfaceBackend> ImageBufferCairoImageSurfac
+     cairo_surface_set_user_data(surface.get(), &s_surfaceDataKey, surfaceData, [](void* data) {
+         fastFree(data);
+     });
++    trackCairoImageSurface(surface.get()); // I-11: attribute ImageBuffer bytes in mempool:
+     if (cairo_surface_status(surface.get()) != CAIRO_STATUS_SUCCESS)
+         return nullptr;
+ 
 diff --git a/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp b/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp
 index 262b2fb902..f9449a40c5 100644
 --- a/Source/WebCore/platform/graphics/egl/GLContextEGL.cpp
@@ -8629,7 +8765,7 @@ index 033c912f3e..b9883d2008 100644
 +
 +#endif // USE(MEDIA_FOUNDATION)
 diff --git a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
-index 953df378ec..c81a1d327d 100644
+index 953df378ec..bf32601f0b 100644
 --- a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 +++ b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 @@ -25,56 +25,152 @@
@@ -8834,7 +8970,7 @@ index 953df378ec..c81a1d327d 100644
  }
  
  static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
-@@ -116,2888 +214,1480 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
+@@ -116,2888 +214,1522 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
      if (cachedTypes.get().size() > 0)
          return cachedTypes;
  
@@ -8886,6 +9022,10 @@ index 953df378ec..c81a1d327d 100644
 +// True if the codecs string names ANY codec this device cannot hardware-decode (and can't software-
 +// decode fast enough at video resolution). Used to keep YouTube's ABR off AV1/VP9/Opus so it selects
 +// the H.264/AAC renditions we can actually play. Shared by the MSE path here and PortMseIsTypeSupported.
++// Revenant per-device memory tier (0 = 1GB SD400/Adreno-305 device). Used to gate direct-<video>
++// canPlayType to H.264/AAC on tier-0 (I-14). Defined in WebCoreDriver.cpp.
++extern "C" unsigned WebCoreMemBudgetTier();
++
 +bool mseCodecsUndecodable(const String& codecs)
 +{
 +    String c = codecs.convertToASCIILowercase();
@@ -8981,6 +9121,21 @@ index 953df378ec..c81a1d327d 100644
 +        if (!codecs.isEmpty() && mseCodecsUndecodable(codecs))
 +            return MediaPlayer::SupportsType::IsNotSupported;
 +        return codecs.isEmpty() ? MediaPlayer::SupportsType::MayBeSupported : MediaPlayer::SupportsType::IsSupported;
++    }
++
++    // DIRECT <video> HONEST GATING (tier-0). The isMediaSource branch above gates codecs, but the
++    // direct-<video> canPlayType path below did NOT -- so canPlayType("video/mp4; codecs=hev1...") and
++    // webm/vp9 returned Supported, and sites (rule34's fluidplayer) PICKED HEVC/VP9, which the Adreno 305
++    // (Snapdragon 400) has NO hardware decoder for. MF then fails the load (MediaFailed 0xc00d36c4) and
++    // the page's player retry-storms -- recreating the MF pipeline over and over -- until the single core
++    // is pegged and the page freezes (I-14). On tier-0, report only what the hardware actually decodes
++    // (H.264/AAC); the site then serves its H.264 rendition (rule34/most sites offer one). Higher tiers
++    // keep the Store-extension path below (Adreno 530 / SD820 can HW-decode VP9/HEVC). hev1/hvc1 = HEVC
++    // (no HW decode on SD400), added on top of mseCodecsUndecodable's av01/vp9/vp8/opus/... set.
++    if (!codecs.isEmpty() && WebCoreMemBudgetTier() == 0) {
++        auto lc = codecs.convertToASCIILowercase();
++        if (mseCodecsUndecodable(codecs) || lc.contains("hev1"_s) || lc.contains("hvc1"_s))
++            return MediaPlayer::SupportsType::IsNotSupported;
 +    }
 +
 +    // WebM/OGG (VP8/VP9 + Opus/Vorbis) are handled by Media Foundation via the installed
@@ -9682,11 +9837,7 @@ index 953df378ec..c81a1d327d 100644
  
 -    if (!m_mediaSession)
 -        return false;
-+    BSTR urlString = SysAllocString(url.wideCharacters().data());
-+    HRESULT hr = m_mediaEngine->SetSource(urlString);
-+    SysFreeString(urlString);
-+    { extern void PortImgLog(const char*); char b[80]; snprintf(b, sizeof b, "mf: SetSource hr=0x%08lx", (unsigned long)hr); PortImgLog(b); }
- 
+-
 -    // Get the event from the event queue.
 -    HRESULT hr = m_mediaSession->EndGetEvent(asyncResult, &event);
 -    if (FAILED(hr))
@@ -9844,7 +9995,11 @@ index 953df378ec..c81a1d327d 100644
 -
 -    return true;
 -}
--
++    BSTR urlString = SysAllocString(url.wideCharacters().data());
++    HRESULT hr = m_mediaEngine->SetSource(urlString);
++    SysFreeString(urlString);
++    { extern void PortImgLog(const char*); char b[80]; snprintf(b, sizeof b, "mf: SetSource hr=0x%08lx", (unsigned long)hr); PortImgLog(b); }
+ 
 -HWND MediaPlayerPrivateMediaFoundation::hostWindow()
 -{
 -    if (m_player && m_player->cachedResourceLoader() && !m_player->cachedResourceLoader()->document()) {
@@ -9868,12 +10023,10 @@ index 953df378ec..c81a1d327d 100644
 -    Locker locker { m_mutexListeners };
 -
 -    m_listeners.add(listener);
- }
- 
+-}
+-
 -void MediaPlayerPrivateMediaFoundation::removeListener(MediaPlayerListener* listener)
-+#if ENABLE(MEDIA_STREAM)
-+void MediaPlayerPrivateMediaFoundation::load(MediaStreamPrivate&)
- {
+-{
 -    Locker locker { m_mutexListeners };
 -
 -    m_listeners.remove(listener);
@@ -9885,10 +10038,12 @@ index 953df378ec..c81a1d327d 100644
 -
 -    for (HashSet<MediaPlayerListener*>::const_iterator it = m_listeners.begin(); it != m_listeners.end(); ++it)
 -        (*it)->onMediaPlayerDeleted();
--}
--
+ }
+ 
 -void MediaPlayerPrivateMediaFoundation::setNaturalSize(const FloatSize& size)
--{
++#if ENABLE(MEDIA_STREAM)
++void MediaPlayerPrivateMediaFoundation::load(MediaStreamPrivate&)
+ {
 -    Locker locker { m_cachedNaturalSizeLock };
 -    m_cachedNaturalSize = size;
 +    // Media Foundation does not play WebRTC/getUserMedia MediaStreams. Report the
@@ -9976,7 +10131,9 @@ index 953df378ec..c81a1d327d 100644
 -}
 -
 -void MediaPlayerPrivateMediaFoundation::updateReadyState()
--{
++#if ENABLE(MEDIA_SOURCE)
++void MediaPlayerPrivateMediaFoundation::load(const URL&, const ContentType&, MediaSourcePrivateClient* client)
+ {
 -    COMPtr<IPropertyStore> prop;
 -
 -    // Get the property store from the media session.
@@ -10050,9 +10207,7 @@ index 953df378ec..c81a1d327d 100644
 -}
 -
 -void MediaPlayerPrivateMediaFoundation::onBufferingStopped()
-+#if ENABLE(MEDIA_SOURCE)
-+void MediaPlayerPrivateMediaFoundation::load(const URL&, const ContentType&, MediaSourcePrivateClient* client)
- {
+-{
 -    updateReadyState();
 -}
 -
@@ -11739,7 +11894,15 @@ index 953df378ec..c81a1d327d 100644
 -        if (m_playbackRate < 0) {
 -            // Reverse delta for reverse playback.
 -            timeDelta = -timeDelta;
--        }
++#endif
++    callOnMainThread([weakThis = m_weakThis, width, height]() mutable {
++        auto* self = weakThis.get();
++        if (!self)
++            return;
++        {
++            Locker locker { self->m_cachedNaturalSizeLock };
++            self->m_cachedNaturalSize = FloatSize(width, height);
+         }
 -
 -        LONGLONG frameDurationOneFourth = m_frameDuration / 4;
 -
@@ -11755,7 +11918,13 @@ index 953df378ec..c81a1d327d 100644
 -            nextSleepTime = (LONG)(nextSleepTime / fabsf(m_playbackRate));
 -
 -            presentNow = false;
--        }
++        if (self->m_readyState < MediaPlayer::ReadyState::HaveEnoughData) {
++            self->m_readyState = MediaPlayer::ReadyState::HaveEnoughData;
++            self->m_networkState = MediaPlayer::NetworkState::Loaded;
++            self->m_player->networkStateChanged();
++            self->m_player->readyStateChanged();
++            self->m_player->characteristicChanged();
+         }
 -    }
 -
 -    if (presentNow)
@@ -11777,22 +11946,6 @@ index 953df378ec..c81a1d327d 100644
 -    if (!scheduler)
 -        return static_cast<DWORD>(-1);
 -    return scheduler->schedulerThreadProcPrivate();
-+#endif
-+    callOnMainThread([weakThis = m_weakThis, width, height]() mutable {
-+        auto* self = weakThis.get();
-+        if (!self)
-+            return;
-+        {
-+            Locker locker { self->m_cachedNaturalSizeLock };
-+            self->m_cachedNaturalSize = FloatSize(width, height);
-+        }
-+        if (self->m_readyState < MediaPlayer::ReadyState::HaveEnoughData) {
-+            self->m_readyState = MediaPlayer::ReadyState::HaveEnoughData;
-+            self->m_networkState = MediaPlayer::NetworkState::Loaded;
-+            self->m_player->networkStateChanged();
-+            self->m_player->readyStateChanged();
-+            self->m_player->characteristicChanged();
-+        }
 +        self->m_player->sizeChanged();
 +#if USE(TEXTURE_MAPPER)
 +        // Mark the composited video layer dirty so the compositor re-samples (uploads) the new frame.
@@ -11870,6 +12023,22 @@ index 953df378ec..c81a1d327d 100644
 +                if (self->m_readyState > MediaPlayer::ReadyState::HaveCurrentData) {
 +                    self->m_readyState = MediaPlayer::ReadyState::HaveCurrentData;
 +                    self->m_player->readyStateChanged();
++                }
++            } else if (state == 3 || state == 4) {
++                // The session says Playing/Paused, but "rolling" is NOT "decoding": an undecodable
++                // stream (a malformed ad MP4, or a codec MF opens but can't actually decode) reports
++                // Playing yet produces NO output. Jumping straight to HaveEnoughData told WebCore the
++                // video was fully playable; with currentTime never advancing, HTMLMediaElement treated
++                // it as instantly-ended and re-seeked at CPU speed (measured 16735x) -> main-thread
++                // freeze, the whole page stuck (I-12). So the SESSION STATE only takes us to
++                // HaveCurrentData (the media is open). HaveEnoughData requires REAL progress -- a decoded
++                // video frame (onFrameServerFrame) or the position actually advancing for audio-only
++                // (onFrameServerTimeUpdate). A valid stream reaches it a beat later and plays normally;
++                // a wedged one honestly stays "loading" instead of freezing. AutoPlay still drives the
++                // engine's decode regardless of readyState, so this can't reintroduce the pause deadlock.
++                if (self->m_networkState < MediaPlayer::NetworkState::Loaded) {
++                    self->m_networkState = MediaPlayer::NetworkState::Loaded;
++                    self->m_player->networkStateChanged();
                  }
 -                wait = INFINITE;
 -                SetEvent(m_flushEvent.get());
@@ -11881,11 +12050,8 @@ index 953df378ec..c81a1d327d 100644
 -                    if (FAILED(hr))
 -                        m_exitThread = true;
 -                    processSamples = (wait != INFINITE);
-+            } else if (state == 3 || state == 4) {
-+                if (self->m_readyState < MediaPlayer::ReadyState::HaveEnoughData) {
-+                    self->m_readyState = MediaPlayer::ReadyState::HaveEnoughData;
-+                    self->m_networkState = MediaPlayer::NetworkState::Loaded;
-+                    self->m_player->networkStateChanged();
++                if (self->m_readyState < MediaPlayer::ReadyState::HaveCurrentData) {
++                    self->m_readyState = MediaPlayer::ReadyState::HaveCurrentData;
 +                    self->m_player->readyStateChanged();
 +                    self->m_player->characteristicChanged();
                  }
@@ -12026,6 +12192,16 @@ index 953df378ec..c81a1d327d 100644
 +            self->m_fsSeeking = false;
 +            extern void PortImgLog(const char*);
 +            PortImgLog("mse: seek settled via position (no SeekCompleted)");
++        }
++        // Real playback progress (position advanced past the start, and we're not mid-seek) is proof the
++        // stream actually decodes. Promote to HaveEnoughData here so AUDIO-ONLY streams -- which never
++        // trigger the video-frame path -- still become playable, while a stream stuck at ~0 (the wedged
++        // I-12 case) never does. Video already reaches HaveEnoughData via onFrameServerFrame; this is the
++        // audio-safe half of gating "ready" on genuine progress instead of the bare session state.
++        if (!self->m_fsSeeking && seconds > 0.1 && (self->m_fsIsHls || self->m_fsIsProgressive)
++            && self->m_readyState < MediaPlayer::ReadyState::HaveEnoughData) {
++            self->m_readyState = MediaPlayer::ReadyState::HaveEnoughData;
++            self->m_player->readyStateChanged();
 +        }
 +        self->m_player->timeChanged();
 +    });
