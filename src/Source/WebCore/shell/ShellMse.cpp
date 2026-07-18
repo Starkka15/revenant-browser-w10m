@@ -224,15 +224,24 @@ void PortMseDestroy(void* srcH)
     // handler is unhooked below).
     if (h->player) {
         MediaPlayer^ player = h->player;
+        // Keep the media source + its backing byte stream ALIVE inside the close worker until AFTER
+        // delete player. The progressive path hands MF an HttpRandomAccessStream (held by h->mediaSource);
+        // `delete h` below releases h's ref and the worker's `Source = nullptr` drops the player's ref, so
+        // WITHOUT these captures the stream is destructed BEFORE MF's source reader (RTWorkQ) finishes and
+        // an in-flight Seek/Read hits the disposed stream -> Platform::ObjectDisposedException on the MF
+        // worker thread -> crash (Rule34 video-select). Capturing extra refs ties their lifetime to Close.
+        auto mediaSource = h->mediaSource;
+        auto mseSource = h->source;
         h->player = nullptr;
         try { if (h->frameToken.Value) player->VideoFrameAvailable -= h->frameToken; } catch (...) { }
         try {
             Windows::System::Threading::ThreadPool::RunAsync(
                 ref new Windows::System::Threading::WorkItemHandler(
-                    [player](Windows::Foundation::IAsyncAction^) {
+                    [player, mediaSource, mseSource](Windows::Foundation::IAsyncAction^) {
                         try { player->Pause(); } catch (...) { }
                         try { player->Source = nullptr; } catch (...) { }
-                        try { delete player; } catch (...) { }
+                        try { delete player; } catch (...) { } // Close synchronously drains MF's source reader
+                        (void)mediaSource; (void)mseSource;     // released HERE, after Close -> no late Seek
                         PortImgLog("mse: player closed (destroy worker)");
                     }));
         } catch (...) {
@@ -849,6 +858,12 @@ void PortMsePlayerStop(void* srcH)
     if (h->player) {
         // Take ownership so we can null h->player immediately (no dangling events) and outlive `h`.
         MediaPlayer^ player = h->player;
+        // Keep the media source + its backing byte stream (progressive: HttpRandomAccessStream) alive in
+        // the worker until AFTER delete player, or an in-flight MF source-reader Seek (RTWorkQ) hits the
+        // disposed stream -> Platform::ObjectDisposedException -> crash (Rule34 video-select). See
+        // PortMseDestroy for the full note.
+        auto mediaSource = h->mediaSource;
+        auto mseSource = h->source;
         h->player = nullptr;
         // Stop the frame server FIRST: unhook VideoFrameAvailable so no CopyFrameToVideoSurface can
         // run against a player mid-teardown (an in-flight handler racing Close is a deadlock vector).
@@ -863,10 +878,11 @@ void PortMsePlayerStop(void* srcH)
         try {
             Windows::System::Threading::ThreadPool::RunAsync(
                 ref new Windows::System::Threading::WorkItemHandler(
-                    [player](Windows::Foundation::IAsyncAction^) {
+                    [player, mediaSource, mseSource](Windows::Foundation::IAsyncAction^) {
                         try { player->Pause(); } catch (...) { }
                         try { player->Source = nullptr; } catch (...) { }
                         try { delete player; } catch (...) { }
+                        (void)mediaSource; (void)mseSource; // released after Close -> no late Seek crash
                         PortImgLog("mse: player closed (worker)");
                     }));
         } catch (...) {

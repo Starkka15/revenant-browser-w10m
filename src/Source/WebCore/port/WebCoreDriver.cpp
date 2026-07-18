@@ -961,19 +961,25 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     extern int g_forcedWinW, g_forcedWinH;
     g_winW = g_forcedWinW > 0 ? g_forcedWinW : (size.width() > 0 ? size.width() : 480);
     g_winH = g_forcedWinH > 0 ? g_forcedWinH : (size.height() > 0 ? size.height() : 800);
-    g_deviceScale = deviceScale > 0 ? deviceScale : 1.0;
-    // Round the CSS viewport UP (ceil), not to-nearest. The page is painted back at
-    // g_deviceScale, so cssW*scale must be >= the physical window or a thin uncovered strip
-    // on the right/bottom shows the white clear color (the "white border"). ceil guarantees
-    // the content fully covers the surface (the sub-pixel overscan is clipped by glViewport).
-    g_cssW = static_cast<int>(std::ceil(g_winW / g_deviceScale));
-    g_cssH = static_cast<int>(std::ceil(g_winH / g_deviceScale));
-    // Cap the RASTER scale on extreme-DPR panels so backing textures don't exhaust GPU memory (I-01).
-    // 2.5x is still crisp on a 500+ppi screen; the composite transform (g_deviceScale) upscales to fill.
-    g_rasterScale = g_deviceScale > 3.0 ? 2.5 : g_deviceScale;
-    if (g_rasterScale != g_deviceScale)
-        portLog((std::string("browser: raster scale capped ") + std::to_string(g_deviceScale)
-            + " -> " + std::to_string(g_rasterScale) + " (GPU texture budget)").c_str());
+    g_deviceScale = deviceScale > 0 ? deviceScale : 1.0; // real panel dpr; kept only for the log below
+    // FINGERPRINT COHERENCE (I-15): present an iPhone-consistent viewport. Real hardware maps to NO
+    // iPhone -- the 640XL is 720 physical @ dpr 1.75 -> 412 CSS, and both "dpr 1.75" and a "412 CSS width"
+    // are Android values Cloudflare Turnstile flags under our iPhone UA. All our W10M panels are 9:16
+    // (720x1280 / 1080x1920 / 1440x2560) -- the exact aspect of the iPhone SE (375x667, dpr 2) -- so map
+    // to iPhone SE cleanly:
+    //   - g_deviceScale becomes the GEOMETRY scale (physical device-px per CSS px = winW/375): it drives
+    //     the composite transform (which fills the real surface), input px<->CSS, and the viewport clip.
+    //   - g_rasterScale = 2.0 is the REPORTED window.devicePixelRatio AND the backing raster resolution
+    //     (an iPhone-SE 2x). On >720p panels the 2x raster is composited up by the larger geometry scale
+    //     (a touch softer, but memory-light -- this also subsumes the old I-01 GPU-texture cap), while JS
+    //     sees a clean dpr 2. screen is pinned to 375x667 at setPlatformScreenBounds below.
+    static const double kSeCssW = 375.0;
+    g_cssW = static_cast<int>(kSeCssW);
+    g_cssH = static_cast<int>(std::lround(g_winH * kSeCssW / g_winW)); // preserve the panel's real aspect
+    g_deviceScale = g_winW / kSeCssW;   // geometry: physical device-px per CSS px (fills the surface)
+    g_rasterScale = 2.0;                // reported devicePixelRatio + backing raster (iPhone SE 2x)
+    portLog((std::string("browser: iOS-SE viewport css=") + std::to_string(g_cssW) + "x" + std::to_string(g_cssH)
+        + " geoScale=" + std::to_string(g_deviceScale) + " dpr=2").c_str());
     portLog((std::string("browser: window ") + std::to_string(g_winW) + "x" + std::to_string(g_winH)
         + " renderer=" + reinterpret_cast<const char*>(glGetString(GL_RENDERER))).c_str());
     // The shader budget of this GPU. D3D feature level 9_3 (Adreno 305) caps the FRAGMENT uniform
@@ -1074,6 +1080,14 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     // hit-testing are correct. Input arrives in device px and is converted to CSS px before dispatch.
     g_page->setDeviceScaleFactor(g_rasterScale); // capped on extreme-DPR (I-01); geometry uses g_deviceScale
     g_page->settings().setShouldAllowUserInstalledFonts(false);
+    // FINGERPRINT COHERENCE (I-15). We present as iOS 15.4 Safari, and iOS Safari did NOT ship the Web
+    // Notifications API until iOS 16.4 -- on 15.4 `window.Notification` is undefined. We were exposing it
+    // (Notification.permission = "denied"), which Cloudflare Turnstile's JS fingerprinter flags as an
+    // API a real iPhone-15.4 can't have -> re-challenge loop. Disable the setting so Notification is
+    // undefined, matching the identity. (Notification.idl is EnabledBySetting=NotificationsEnabled; with
+    // it off the object is gone, so the null-deref the PortNotificationClient guarded against can't occur
+    // either -- sites feature-detect `'Notification' in window`.)
+    g_page->settings().setNotificationsEnabled(false);
     // window.requestIdleCallback is implemented in 2.36.8 but gated off by default
     // (EnabledBySetting=requestIdleCallbackEnabled) → "ReferenceError: requestIdleCallback".
     // Modern cooperative schedulers (YouTube c3, React) defer non-critical render/build work
@@ -1176,7 +1190,7 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
         + " scale=" + std::to_string(g_deviceScale)).c_str());
     // Tell WebCore the real screen size (CSS px) so window.screen + @media (device-width) match the
     // device instead of the hardcoded 360x640 default. Fullscreen mobile => screen ~= viewport.
-    setPlatformScreenBounds(FloatRect(0, 0, g_cssW, g_cssH));
+    setPlatformScreenBounds(FloatRect(0, 0, 375, 667)); // I-15: window.screen = iPhone SE full screen (not the chrome-reduced viewport)
     PortChromeClient::setViewportSize(IntSize(g_cssW, g_cssH));
     WebCoreBrowserKeepCompositing(90); // brief bootstrap; content invalidations drive compositing during load
                                        // (a long force-window wastes ~2.5s compositing an idle post-load page)
@@ -1895,6 +1909,7 @@ extern unsigned g_texmapStoreCount;      // live TextureMapperTiledBackingStore 
 extern unsigned g_texmapLayerCount;      // live GraphicsLayerTextureMapper objects
 extern unsigned long long g_texmapPoolBytes; // BitmapTexturePool retained bytes
 extern unsigned g_texmapPoolCount;
+extern std::atomic<unsigned long long> g_cairoSurfaceBytes; // I-11: layer backing + ImageBuffer cairo bytes
 // bstat: backing-phase breakdown (defined in GraphicsLayerTextureMapper.cpp; see comment there).
 extern unsigned g_bsVisited, g_bsPainted, g_bsNdspFull, g_bsClipped, g_bsSelfHeal;
 extern unsigned g_bsInvFull, g_bsInvFullBig, g_bsInvRect, g_bsInvRectBig;
@@ -2140,11 +2155,19 @@ extern "C" void WebCoreBrowserRenderFrame()
             // fastMalloc heap (cairo surfaces, decoded image buffers, DOM, everything else).
             auto mallocStats = WTF::fastMallocStatistics();
             unsigned long long mallocKB = static_cast<unsigned long long>(mallocStats.committedVMBytes) / 1024;
-            char mb[400];
-            snprintf(mb, sizeof mb, "mempool: jsHeap=%lluKB resCache=%lluKB gpuTiles=%lluKB (stores=%u layers=%u) gpuPool=%lluKB (n=%u) malloc=%lluKB | appUsage=%lluMB (%llu%% of %lluMB) lvl=%d",
-                jsHeapKB, resCacheKB, WebCore::g_texmapTileBytes / 1024,
+            // I-11: cairo image-surface bytes (layer backing stores + ImageBuffers — the software-raster
+            // memory behind composited layers, fastMalloc-backed so mallocKB above misses it), and the
+            // explicit UNACCOUNTED remainder so the native-heap hog is finally visible instead of inferred.
+            unsigned long long tilesKB = WebCore::g_texmapTileBytes / 1024;
+            unsigned long long poolKB  = WebCore::g_texmapPoolBytes / 1024;
+            unsigned long long cairoKB = WebCore::g_cairoSurfaceBytes.load(std::memory_order_relaxed) / 1024;
+            long long otherKB = (long long)g_memUsedMB * 1024
+                - (long long)(jsHeapKB + resCacheKB + tilesKB + poolKB + cairoKB + mallocKB);
+            char mb[480];
+            snprintf(mb, sizeof mb, "mempool: jsHeap=%lluKB resCache=%lluKB gpuTiles=%lluKB (stores=%u layers=%u) gpuPool=%lluKB (n=%u) cairoSurf=%lluKB malloc=%lluKB other=%lldKB | appUsage=%lluMB (%llu%% of %lluMB) lvl=%d",
+                jsHeapKB, resCacheKB, tilesKB,
                 WebCore::g_texmapStoreCount, WebCore::g_texmapLayerCount,
-                WebCore::g_texmapPoolBytes / 1024, WebCore::g_texmapPoolCount, mallocKB,
+                poolKB, WebCore::g_texmapPoolCount, cairoKB, mallocKB, otherKB,
                 g_memUsedMB, g_memPct, g_memLimitMB, g_memLevel);
             portLog(mb);
 
@@ -2902,18 +2925,19 @@ extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale)
     g_forcedWinH = pxH;
     g_winW = pxW;
     g_winH = pxH;
-    if (deviceScale > 0)
-        g_deviceScale = deviceScale;
-    g_cssW = static_cast<int>(std::ceil(g_winW / g_deviceScale));
-    g_cssH = static_cast<int>(std::ceil(g_winH / g_deviceScale));
-    double newRaster = g_deviceScale > 3.0 ? 2.5 : g_deviceScale; // keep the I-01 cap consistent on rotate
-    if (newRaster != g_rasterScale) {
-        g_rasterScale = newRaster;
+    // I-15: keep the iPhone-SE mapping coherent across resize/rotation (375 CSS wide, geometry scale
+    // fills the new surface, reported dpr stays 2). Matches the init derivation above.
+    static const double kSeCssW = 375.0;
+    g_cssW = static_cast<int>(kSeCssW);
+    g_cssH = static_cast<int>(std::lround(g_winH * kSeCssW / g_winW));
+    g_deviceScale = g_winW / kSeCssW; // geometry scale for the new surface
+    if (g_rasterScale != 2.0) {
+        g_rasterScale = 2.0;
         g_page->setDeviceScaleFactor(g_rasterScale);
     }
     if (FrameView* view = g_page->mainFrame().view())
         view->resize(g_cssW, g_cssH);
-    setPlatformScreenBounds(FloatRect(0, 0, g_cssW, g_cssH));
+    setPlatformScreenBounds(FloatRect(0, 0, 375, 667)); // I-15: window.screen = iPhone SE full screen (not the chrome-reduced viewport)
     PortChromeClient::setViewportSize(IntSize(g_cssW, g_cssH));
     WebCoreBrowserKeepCompositing(30); // relayout after resize needs a repaint
     portLog((std::string("browser: resize px=") + std::to_string(pxW) + "x" + std::to_string(pxH)
