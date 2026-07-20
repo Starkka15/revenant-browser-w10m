@@ -75,6 +75,11 @@ static std::string toUtf8(const WTF::String& s)
     return std::string(c.data(), c.length());
 }
 
+// Defined in WebCoreDriver.cpp. Persists JSC's bytecode cache to disk; called from
+// dispatchDidFinishLoad below, because the cache was otherwise only ever written on eviction.
+// (Must be declared at file scope: an extern "C" declaration inside a function body is C2598.)
+extern "C" void WebCoreBytecodeCacheFlush();
+
 namespace WebCore {
 
 // Process-wide network session shared by the HTTP loader and document.cookie (one jar).
@@ -435,6 +440,11 @@ void PortFrameLoaderClient::dispatchDidFinishLoad()
         return;
     }
     m_loadComplete = true;
+    // Persist the bytecode this page compiled. Without this the disk cache only ever received scripts
+    // that happened to be EVICTED from the in-memory CodeCacheMap, so the next launch hit none of it
+    // (device log: "bcache: hit=0 miss=25 (0%)"). Load-complete is the right moment: the page's working
+    // set of scripts is known and the main thread is about to go idle.
+    WebCoreBytecodeCacheFlush();
     RunLoop::main().stop();
 }
 

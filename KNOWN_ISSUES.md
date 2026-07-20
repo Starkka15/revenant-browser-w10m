@@ -8,6 +8,61 @@ File paths are relative to the WebKit tree (`WebKit-2.36.8/`) after applying the
 
 ---
 
+## Status as of 2026-07-20 (start here)
+
+The tree builds, deploys and runs on a Lumia 640 XL. Everything below is measured on device, not
+inferred. **The single most useful habit for anyone picking this up: read the whole `debug.log`, not
+just the lines you expect.** Nearly every wrong turn in this project came from grepping for a theory
+instead of reading what the log actually said.
+
+### The headline open bug: video decodes but never draws
+
+    video: decoded=38.3fps drawn=0.0fps (0/77)
+    gate: last97 composited=97 skipped=0
+
+MediaFoundation decodes fine and we composite every frame, yet zero video frames reach the screen.
+A standalone MP4 URL **does** play — the failure only happens with video embedded in a page. The draw
+path bails at `MediaPlayerPrivateMediaFoundation::paintCurrentFrameToTextureMapper`: the upload block
+(`m_fsFrameDirty && fw>0 && fh>0 && m_fsPixels.size() >= fw*fh*4 && ensureFrameServerTexture(...)`)
+never succeeds, so `m_frameHasContent` stays false and the function early-returns. Proof: the
+`fsvid: draw tex=…` diagnostic just past that return appears **zero** times in a 12k-line log.
+Next step is to log all four terms separately in one build — do not guess which one fails.
+
+Related and possibly causal: a rule34 post starts **three** `<video>` pipelines at once. The tier-0
+single-decode slot (`g_tier0ActivePlayer`) was unsynchronised across the curl-worker, threadpool and
+main threads, so all three raced past the check and created players. That is now locked
+(`s_tier0SlotLock`), but the fix is **untested on device** — verify at most one `frame-server started`
+per eviction before trusting it.
+
+### Verified working this session
+
+- **HTTP/2** — was silently OFF (the BoringSSL migration branched from a pre-HTTP/2 config script).
+  149 responses now negotiate h2. See BUILD.md's warning about the `-h2` curl scripts.
+- **HTTP disk cache** — `CurlCacheManager` was compiled in, wired into the loader, and permanently
+  disabled because nothing ever called `setCacheDirectory()`. Now enabled (64MB under `LocalState`).
+- **Bytecode cache** — went from `hit=0 miss=25 (0%)` to `hit=23 miss=79 (22%)`. It was only ever
+  written on *eviction*; it now flushes on navigation-complete and on suspend.
+- **Memory-release storm** — releases 20 → 7 per session, stop-the-world GC 1398ms → 453ms.
+- **Frame accounting** — `GAP` is now 0; the previously unexplained time was the RunLoop block plus an
+  untimed rendering update. A worst-case frame reads `js=2337 update=883 composite=243`, i.e. **JS and
+  layout dominate; raster is ~7%**. Optimise accordingly — the compositor is not the problem.
+
+### Known-bad, unfixed
+
+- **AdaptiveMediaSource cannot resolve DNS** (`0x80072ee7`). AMS uses `Windows.Web.Http` → the system
+  resolver, bypassing the DoH workaround (`CURLOPT_DOH_URL`) that curl needs on this device. Any HLS
+  that reaches AMS fails on the network layer.
+- **~250MB of native heap is unattributed.** `mempool:` shows `jsHeap`/`resCache`/`gpuTiles` totalling
+  ~100MB against 350MB in use; the rest is CRT heap invisible under `USE_SYSTEM_MALLOC`
+  (`fastMallocStatistics()` returns 0). This is what OOM-kills the app on heavy pages, and no cache
+  release touches it. Needs `HeapWalk`-based reporting before anything can be fixed.
+- **Layer explosion:** 87% of compositing promotions are `[overlap,]` cascade — 50 layers / 39MB of
+  GPU tiles on one page. `Page::setCompositingPolicyOverride(Conservative)` is never called and
+  probably should be on tier-0.
+- **YouTube stops after ~1 minute.** Long-standing, cause unknown, MSE path.
+
+---
+
 ## 1. Some videos may not play (native HLS)  ·  impact: high  ·  difficulty: medium
 **State:** progressive MP4 and MSE fMP4 now play (ads, direct `<video src=…mp4>`, and MSE sites).
 The remaining gap is **native HLS** (`application/vnd.apple.mpegurl`): we now advertise it in

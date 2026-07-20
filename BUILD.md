@@ -78,9 +78,38 @@ where present (`patches/deps/`), then run the matching build script in `deps/`.
 | pixman | 0.42.2 | — | (meson cross build) |
 | harfbuzz | 4.4.1 | `patches/deps/harfbuzz.patch` | `deps/harfbuzz-build.bat` |
 | cairo | 1.18.2 | `patches/deps/cairo.patch` (DirectWrite font backend rewrite for UWP) | `deps/cairo-cfg.bat` + `deps/cairo-build.bat` |
-| OpenSSL | 3.0.14 | — (build script seds the generated makefile `/MT`→`/MD`) | `deps/openssl-cfg.bat` + `deps/openssl-build.bat` (`VC-WIN32-ARM-UWP`) |
-| nghttp2 | (HTTP/2 for curl) | — | `deps/nghttp2-build.bat` |
-| libcurl | 8.11.1 | — | `deps/curl-cfg.bat` + `deps/curl-build.bat` |
+| BoringSSL | (chromium-stable) | `deps/boringssl-uwp/` — **required**, see below | `deps/configure-boringssl-new.bat` + `deps/build-boringssl-new.bat` |
+| nghttp2 | 1.61.0 (HTTP/2 for curl) | — | `deps/nghttp2-build.bat` |
+| libcurl | 8.11.1 | — | `deps/curl-cfg-boringssl-h2.bat` + `deps/curl-build-boringssl-h2.bat` |
+| ~~OpenSSL~~ | 3.0.14 | — | `deps/openssl-*.bat` — **superseded by BoringSSL, kept for reference only** |
+
+### TLS: BoringSSL, not OpenSSL
+
+The TLS backend is **BoringSSL**. This is not a preference — Cloudflare Turnstile fingerprints the TLS
+ClientHello (JA3), and OpenSSL cannot emit the GREASE values a real Safari sends. That absence was the
+tell that kept the browser stuck in an endless re-challenge loop. BoringSSL can produce the iOS Safari
+ClientHello, which is what makes Cloudflare-protected sites usable at all.
+
+BoringSSL upstream has no ARM32-UWP build, so `deps/boringssl-uwp/` carries ours:
+- `CMakeLists.txt` — replaces upstream's; drops the tool/test targets, forces `/MD`, targets
+  `WindowsStore 10.0.16299.0`, and excludes the assembly that will not assemble for ARM32 UWP.
+- `uwp_compat.h` — shims the handful of Win32 APIs BoringSSL calls that AppContainer does not expose.
+
+Copy both over a fresh BoringSSL checkout before configuring.
+
+### curl must be built with HTTP/2 explicitly
+
+Use the `-h2` scripts. `deps/curl-cfg.bat` and `deps/curl-cfg-boringssl.bat` both pass
+`-DUSE_NGHTTP2=OFF` and are kept only for history — building with either silently produces an
+HTTP/1.1-only libcurl, which costs one TCP+TLS connection per parallel resource on image-heavy pages.
+Verify after building, rather than trusting the flag:
+
+```
+findstr USE_NGHTTP2 deps\curl\build-armuwp-bssl3\lib\curl_config.h
+rem must print:  #define USE_NGHTTP2 1
+```
+
+The configure script prints its `Features:` line too — check `HTTP2` appears in it.
 
 Notes:
 - Meson dep builds (cairo/harfbuzz/pixman) use `deps/cross-armuwp.txt`. They need the **native**
