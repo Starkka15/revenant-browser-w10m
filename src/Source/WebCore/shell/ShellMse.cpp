@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -62,7 +63,10 @@ struct MseSource {
     Windows::Media::Core::MediaSource^ mediaSource;
     Windows::Media::Playback::MediaPlayer^ player;
     void* playerCtx { nullptr };
-    bool closing { false }; // set before teardown so in-flight WinRT events stop calling into freed WebCore
+    // Set on the main thread before teardown; READ from WinRT/MF/threadpool callbacks. Atomic because a
+    // plain bool shared across threads has no ordering guarantee -- an in-flight event handler could
+    // observe a stale false and call into WebCore objects that are already being destroyed.
+    std::atomic<bool> closing { false };
     Microsoft::WRL::ComPtr<ID3D11Device> d3d;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3dCtx;
     Windows::Foundation::EventRegistrationToken frameToken {}; // VideoFrameAvailable, unhooked at stop
@@ -71,6 +75,51 @@ struct MseSource {
     std::vector<struct MseBuffer*> buffers;          // source buffers (for the emergency memory trim)
     UINT texW { 0 };
     UINT texH { 0 };
+    // REFCOUNT. PortMseDestroy used to `delete h` inline on the main thread with no wait, while async
+    // start paths still held the raw pointer: PortProgressivePlayerStart captures h into a
+    // concurrency::create_task that runs a BLOCKING curl range GET, and PortHlsPlayerStart captures it
+    // into an AdaptiveMediaSource completion handler. Both check h->closing and then keep dereferencing
+    // h for many more statements (h->mediaSource = ..., startFrameServerPlayer(h)), so a navigation
+    // during that window wrote into freed memory -- and left g_tier0ActivePlayer pointing at a dead
+    // handle for PortMsePlayerPlay to dereference later. Rule34's rapid preview -> post -> fluidplayer
+    // churn is exactly that window. Every async lambda now holds a strong ref for its whole body.
+    LONG refs { 1 };
+
+    // Own the source buffers. PortMseAddSourceBuffer new'd each MseBuffer into this vector and nothing
+    // ever deleted them -- PortMseDestroy freed the handle and leaked every element. There is no
+    // PortMseRemoveSourceBuffer at all (SourceBufferPrivateMediaFoundation::removedFromMediaSource just
+    // nulls its borrowed pointer), so one MseBuffer leaked per source buffer per <video>+MSE navigation.
+    // Bounded per navigation, but it accumulates across a session on element-swapping pages (Shorts).
+    ~MseSource()
+    {
+        for (auto* b : buffers)
+            delete b;
+        buffers.clear();
+    }
+};
+
+// closing is read from WinRT/threadpool callbacks and written from the main thread; make the access
+// explicit rather than relying on a plain bool being torn-free.
+static inline void mseAddRef(MseSource* h) { if (h) ::InterlockedIncrement(&h->refs); }
+static inline void mseRelease(MseSource* h)
+{
+    if (h && !::InterlockedDecrement(&h->refs))
+        delete h;
+}
+// Scoped strong ref for capture in async lambdas (C++/CX lambdas cannot capture by move, so this is
+// copied by value and each copy holds its own reference).
+struct MseSourceRef {
+    MseSource* p { nullptr };
+    explicit MseSourceRef(MseSource* h) : p(h) { mseAddRef(p); }
+    MseSourceRef(const MseSourceRef& o) : p(o.p) { mseAddRef(p); }
+    MseSourceRef& operator=(const MseSourceRef& o)
+    {
+        if (this != &o) { mseAddRef(o.p); mseRelease(p); p = o.p; }
+        return *this;
+    }
+    ~MseSourceRef() { mseRelease(p); }
+    MseSource* operator->() const { return p; }
+    operator MseSource*() const { return p; }
 };
 
 struct MseBuffer {
@@ -84,6 +133,29 @@ struct MseBuffer {
 // PortMseDestroy unregisters under the same lock, so the trimmer can never touch a freed source.
 static std::mutex s_mseRegistryLock;
 static std::vector<struct MseSource*> s_mseSources;
+
+// Tier-0 ONE-VIDEO-AT-A-TIME (I-16). A 1GB single-core device cannot run a grid of autoplaying <video>
+// previews: rule34's search grid spun up ~10 frame-server players -> an 11,000-iteration fluidplayer
+// seek storm -> main thread pegged -> nothing composited -> frozen. Real iPhones already cap INLINE
+// playback to a single video (starting a second pauses the first), so this is BOTH the tier-0 resource
+// fix AND coherent with our iOS identity. Only this handle may AutoPlay/decode on tier-0; the rest load
+// paused. A later play() takes over (pauses the previous). Cleared when the active handle is torn down.
+// The tier-0 single-decode slot, and the lock that makes check-and-claim ATOMIC.
+//
+// This was an unsynchronised global written from three different threads: startFrameServerPlayer runs
+// on a CURL WORKER thread for progressive video, on an MTA/threadpool thread for HLS, and on the main
+// thread for MSE. Device-verified consequence (rule34 post page, 2026-07-20): three <video> elements
+// probed at once, three worker threads all read g_tier0ActivePlayer as null before any of them wrote
+// it, so none saw an incumbent and ALL THREE created MediaPlayer pipelines. The log shows three
+// "frame-server started" lines in four lines of output with no eviction between them, on a device whose
+// whole policy is one decode at a time.
+//
+// Deliberately NOT s_mseRegistryLock: PortMseEmergencyTrim holds that across blocking WinRT calls
+// (Remove()/Buffered), and eviction below also does WinRT work -- sharing one lock invites a deadlock.
+// This lock only ever guards two pointer assignments; nothing blocking happens inside it.
+static struct MseSource* g_tier0ActivePlayer = nullptr;
+static std::mutex s_tier0SlotLock;
+extern "C" unsigned WebCoreMemBudgetTier();
 
 // Platform::String^ -> UTF-8 std::string (the C ABI into WebCore's curl fetcher speaks UTF-8).
 static std::string toUtf8(Platform::String^ s)
@@ -176,8 +248,19 @@ static void onVideoFrame(MseSource* h)
         h->d3dCtx->CopyResource(h->staging.Get(), h->rt.Get());
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (SUCCEEDED(h->d3dCtx->Map(h->staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
-            if (!h->closing && h->playerCtx)
-                WebCoreMsePlayerFrame(h->playerCtx, static_cast<const uint8_t*>(m.pData), static_cast<int>(w), static_cast<int>(hgt), static_cast<int>(m.RowPitch));
+            // TOCTOU: this handler runs on an MF thread. PortMsePlayerStop nulls playerCtx and unhooks
+            // VideoFrameAvailable, but unhooking does NOT wait for a handler already in flight -- one
+            // that passed the check could call into a MediaPlayerPrivate that is being destroyed. Snap
+            // the pointer once under the slot lock and re-check `closing` with it held, so teardown
+            // (which takes the same lock) cannot complete between the test and the call.
+            void* ctx = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+                if (!h->closing.load(std::memory_order_acquire))
+                    ctx = h->playerCtx;
+            }
+            if (ctx)
+                WebCoreMsePlayerFrame(ctx, static_cast<const uint8_t*>(m.pData), static_cast<int>(w), static_cast<int>(hgt), static_cast<int>(m.RowPitch));
             h->d3dCtx->Unmap(h->staging.Get(), 0);
         }
     } catch (...) { PortImgLog("mse: onVideoFrame EXCEPTION (swallowed)"); }
@@ -211,8 +294,15 @@ void PortMseDestroy(void* srcH)
         std::lock_guard<std::mutex> lock(s_mseRegistryLock);
         s_mseSources.erase(std::remove(s_mseSources.begin(), s_mseSources.end(), h), s_mseSources.end());
     }
-    h->closing = true;
-    h->playerCtx = nullptr;
+    { // free the tier-0 decode slot (locked: teardown can run on a worker thread)
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        if (g_tier0ActivePlayer == h) g_tier0ActivePlayer = nullptr;
+    }
+    { // Under the slot lock so an in-flight onVideoFrame cannot snapshot playerCtx across this point.
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        h->closing.store(true, std::memory_order_release);
+        h->playerCtx = nullptr;
+    }
     // `delete` on a C++/CX hat invokes IClosable::Close() (stops playback + frees the media pipeline).
     // Doing that INLINE here froze the app hard: PortMseDestroy runs on the MAIN thread from
     // ~MediaPlayerPrivateMediaFoundation during Document::commonTeardown, and a wedged MF pipeline can
@@ -249,7 +339,10 @@ void PortMseDestroy(void* srcH)
         }
     }
     PortImgLog("mse: source destroyed (async close)");
-    delete h;
+    // Drop the creation reference. If an async start task is still mid-flight holding a strong ref,
+    // the object outlives this call and is freed when that task finishes -- instead of being deleted
+    // out from under it (the use-after-free this refcount exists to prevent).
+    mseRelease(h);
 }
 
 // Codecs the device can't decode fast enough at video res. Kept in sync with
@@ -460,9 +553,84 @@ void* PortMseGetMFMediaSource(void* srcH)
 // and an HLS AdaptiveMediaSource (below). Expects h->mediaSource set; wires all session events.
 // All handlers capture `h` and read h->playerCtx live (guarded by h->closing) so a WinRT event
 // that fires during/after teardown can't call into a freed WebCore MediaPlayerPrivate.
+// Tear down a player to free the tier-0 decode slot, leaving the handle RE-STARTABLE. Deliberately
+// different from PortMsePlayerStop: that one is final teardown (sets closing, nulls playerCtx) because
+// WebCore's MediaPlayerPrivate is going away. Here the element is alive and may be played again, so the
+// handle keeps its playerCtx, mediaSource and closing=false, and a later startFrameServerPlayer() call
+// rebuilds the pipeline from scratch.
+//
+// Reclaiming the memory is the whole point: the old takeover path called Pause() and left the MF
+// pipeline (~50MB) resident, so the "cap" grew memory instead of bounding it.
+static void evictFrameServerPlayer(MseSource* h)
+{
+    if (!h || !h->player)
+        return;
+    // Same staged teardown as PortMsePlayerStop: unhook the frame server FIRST (an in-flight
+    // CopyFrameToVideoSurface racing Close is a deadlock vector), then Pause -> detach Source -> Close
+    // on a threadpool thread, keeping the media source and its backing byte stream alive until after
+    // delete so a late RTWorkQ Seek cannot hit a disposed stream (the I-13 crash).
+    MediaPlayer^ player = h->player;
+    auto mediaSource = h->mediaSource;
+    auto mseSource = h->source;
+    h->player = nullptr;
+    try { if (h->frameToken.Value) player->VideoFrameAvailable -= h->frameToken; } catch (...) { }
+    h->frameToken = Windows::Foundation::EventRegistrationToken {};
+    // Tell WebCore the element paused, rather than letting it stall silently waiting for frames that
+    // will never arrive. State 4 = Paused (see onFrameServerStateChanged).
+    try { if (!h->closing && h->playerCtx) WebCoreMsePlayerStateChanged(h->playerCtx, 4); } catch (...) { }
+    try {
+        Windows::System::Threading::ThreadPool::RunAsync(
+            ref new Windows::System::Threading::WorkItemHandler(
+                [player, mediaSource, mseSource](Windows::Foundation::IAsyncAction^) {
+                    try { player->Pause(); } catch (...) { }
+                    try { player->Source = nullptr; } catch (...) { }
+                    try { delete player; } catch (...) { }
+                    (void)mediaSource; (void)mseSource;
+                    PortImgLog("mse: evicted player closed (worker)");
+                }));
+    } catch (...) {
+        PortImgLog("mse: evict RunAsync threw");
+    }
+}
+
 static void startFrameServerPlayer(MseSource* h)
 {
     {
+        // Tier-0 single-decode policy: EVICT the incumbent, never refuse the newcomer.
+        //
+        // The previous shape (I-16) refused to create the pipeline when another video held the slot, and
+        // relied on PortMsePlayerPlay() to build it later. That escape hatch is unreachable by
+        // construction, which is why the device log shows "deferred-build: 0":
+        //   PortMsePlayerPlay <- MediaPlayerPrivateMediaFoundation::play() <- HTMLMediaElement::playPlayer()
+        //   which is gated on potentiallyPlaying() -> requires m_readyState >= HAVE_FUTURE_DATA.
+        // For progressive/HLS, readyState is driven ONLY by onFrameServerStateChanged / onFrameServerFrame
+        // / onFrameServerTimeUpdate -- all fired by handlers registered a few lines below, i.e. by the
+        // very pipeline we just refused to build. No pipeline -> no readyState -> no play() -> no build.
+        // And since no MediaFailed fires either, the element never even errors: networkState stays
+        // Loading forever, so a VAST wrapper (fluidplayer) waits on the ad's loadedmetadata indefinitely
+        // and the MAIN video never starts. MSE elements escaped this only because MediaSource sets
+        // readyState independently via monitorSourceBuffers().
+        //
+        // Eviction inverts it: the newcomer always gets a working pipeline, and the memory the cap was
+        // written to protect is actually reclaimed -- the old takeover path only called Pause(), which
+        // leaves the full ~50MB MF pipeline resident, so refusing new players while retaining old ones
+        // had the memory semantics exactly backwards.
+        // CHECK AND CLAIM UNDER ONE LOCK. Reading the slot, deciding to evict, and taking the slot must
+        // be a single atomic step or concurrent starts all lose the race together (see s_tier0SlotLock).
+        // The eviction itself happens OUTSIDE the lock: it dispatches WinRT teardown to a threadpool
+        // thread and must not run with a lock held.
+        bool tier0 = (WebCoreMemBudgetTier() == 0);
+        MseSource* toEvict = nullptr;
+        if (tier0) {
+            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+            if (g_tier0ActivePlayer && g_tier0ActivePlayer != h)
+                toEvict = g_tier0ActivePlayer;
+            g_tier0ActivePlayer = h; // claim immediately so a racing start sees us as the incumbent
+        }
+        if (toEvict) {
+            PortImgLog("mse: tier-0 single-decode -> evicting incumbent to free the slot");
+            evictFrameServerPlayer(toEvict);
+        }
         h->player = ref new MediaPlayer();
         h->player->IsVideoFrameServerEnabled = true;
         h->player->AutoPlay = true;
@@ -514,6 +682,13 @@ void PortMsePlayerStart(void* srcH, void* playerCtx)
         startFrameServerPlayer(h);
     } catch (Platform::Exception^ ex) {
         char b[128]; snprintf(b, sizeof b, "mse: MediaPlayer start FAILED hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
+        // Release the slot we claimed above -- otherwise it stays owned by a handle with no player and
+        // permanently blocks every other video on the page.
+        {
+            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+            if (g_tier0ActivePlayer == h)
+                g_tier0ActivePlayer = nullptr;
+        }
         WebCoreMsePlayerError(playerCtx, ex->HResult);
     }
 }
@@ -525,10 +700,13 @@ void PortMsePlayerStart(void* srcH, void* playerCtx)
 // SAME frame-server pipeline the MSE path already uses (audio auto-routes, video frames arrive on
 // VideoFrameAvailable). We present as iOS Safari, so sites (YouTube) hand us native HLS constantly —
 // this is a first-class path, not an edge case. Creation is async; playerCtx callbacks report state.
-void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx)
+// Start AdaptiveMediaSource playback on an EXISTING handle. Factored out of PortHlsPlayerStart so the
+// progressive path can divert to it mid-load: when a <video src> turns out to be an HLS playlist, the
+// handle has already been created and returned to WebCore, so we must reuse it rather than make a
+// second one WebCore knows nothing about. See the divert in PortProgressivePlayerStart's probe.
+static void hlsStartOnHandle(MseSource* h, const char* url, const char* userAgent)
 {
-    auto h = new MseSource(); // same handle type: player wiring + teardown are shared
-    h->playerCtx = playerCtx;
+    void* playerCtx = h->playerCtx;
     try {
         auto uri = ref new Windows::Foundation::Uri(toPlatformString(url));
         // Fetch the manifest/segments with the BROWSER'S identity. AMS's default HTTP stack sends a
@@ -541,8 +719,13 @@ void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx
                 PortImgLog("hls: UA TryParseAdd rejected (sending default UA)");
         }
         auto op = Windows::Media::Streaming::Adaptive::AdaptiveMediaSource::CreateFromUriAsync(uri, httpClient);
+        // Strong ref for the completion handler and every event handler it installs below: AMS creation
+        // is async and the DownloadFailed/state handlers outlive this function entirely, so capturing a
+        // raw h let a navigation free it while AMS was still calling back.
+        MseSourceRef hRef { h };
         op->Completed = ref new AsyncOperationCompletedHandler<Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationResult^>(
-            [h](IAsyncOperation<Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationResult^>^ a, AsyncStatus s) {
+            [hRef](IAsyncOperation<Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationResult^>^ a, AsyncStatus s) {
+                MseSource* h = hRef;
                 try {
                     if (h->closing)
                         return;
@@ -562,7 +745,8 @@ void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx
                     // Failures inside AMS are otherwise INVISIBLE (it retries internally; the player
                     // just never leaves Opening). Log every failed fetch with type + HTTP status.
                     ams->DownloadFailed += ref new TypedEventHandler<Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadFailedEventArgs^>(
-                        [h](Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadFailedEventArgs^ e) {
+                        [hRef](Windows::Media::Streaming::Adaptive::AdaptiveMediaSource^, Windows::Media::Streaming::Adaptive::AdaptiveMediaSourceDownloadFailedEventArgs^ e) {
+                            MseSource* h = hRef; // strong ref: this handler outlives PortHlsPlayerStart
                             try {
                                 int status = 0;
                                 if (e->HttpResponseMessage)
@@ -578,8 +762,11 @@ void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx
                                 if (uu.rfind("skd://", 0) == 0 && !h->closing && h->playerCtx) {
                                     PortImgLog("hls: FairPlay DRM key required (skd://) - UNPLAYABLE, failing element");
                                     void* ctx = h->playerCtx;
-                                    h->playerCtx = nullptr; // report once
-                                    h->closing = true;      // stop the retry storm from reaching us
+                                    { // same lock as onVideoFrame's snapshot
+                                        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+                                        h->playerCtx = nullptr; // report once
+                                        h->closing.store(true, std::memory_order_release); // stop the retry storm
+                                    }
                                     WebCoreMsePlayerError(ctx, (int)0x8004025E /* DRM not supported */);
                                 }
                             } catch (...) { PortImgLog("hls: DownloadFailed (no detail)"); }
@@ -633,6 +820,13 @@ void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx
         char b[96]; snprintf(b, sizeof b, "hls: create THREW hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
         WebCoreMsePlayerError(playerCtx, ex->HResult);
     }
+}
+
+void* PortHlsPlayerStart(const char* url, const char* userAgent, void* playerCtx)
+{
+    auto h = new MseSource(); // same handle type: player wiring + teardown are shared
+    h->playerCtx = playerCtx;
+    hlsStartOnHandle(h, url, userAgent);
     return h;
 }
 
@@ -787,7 +981,11 @@ void* PortProgressivePlayerStart(const char* url, const char* userAgent, const c
     std::string rf = referer ? referer : "";
     try {
         // The probe is a blocking curl GET, so it must not run on the WebCore main thread.
-        concurrency::create_task([h, u, ua, rf] {
+        // hRef holds a strong reference for the whole task body: this runs long (a blocking range GET)
+        // and a navigation in the meantime would otherwise free h underneath us.
+        MseSourceRef hRef { h };
+        concurrency::create_task([hRef, u, ua, rf] {
+            MseSource* h = hRef;
             try {
                 if (h->closing)
                     return;
@@ -804,12 +1002,64 @@ void* PortProgressivePlayerStart(const char* url, const char* userAgent, const c
                 }
                 if (h->closing)
                     return;
+
+                // HLS DISCOVERED MID-LOAD -> divert to AdaptiveMediaSource.
+                //
+                // The load-time HLS test (MediaPlayerPrivateMediaFoundation.cpp) matches ".m3u8" or
+                // "/hls_" in the URL, or a MIME containing "mpegurl". Ad CDNs defeat all three: the
+                // tsyndicate creative is served from an opaque token URL with NO extension and the
+                // response MIME is EMPTY at load time ("client: didReceiveResponse http=200 mime="),
+                // so it fell through to this progressive path -- and MediaFoundation cannot parse a
+                // text playlist as a byte stream, failing with MF_E_UNSUPPORTED_BYTESTREAM_TYPE
+                // (0xc00d36c4). fluidplayer then waits on the ad's loadedmetadata forever and the MAIN
+                // video never starts.
+                //
+                // The probe already fetched the content type and the first byte, so decide here. This
+                // is deliberately narrow: only an explicit playlist MIME or the #EXTM3U magic diverts.
+                // An MP4/WebM matches neither and continues down the progressive path unchanged.
                 if (rc != 0) {
                     // Names the refusal outright (403/404/curl code) instead of laundering it through
                     // MediaFoundation as "SRC_NOT_SUPPORTED".
                     if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, status ? status : -1);
                     return;
                 }
+                // HLS DISCOVERED MID-LOAD -> divert to AdaptiveMediaSource.
+                //
+                // Placed AFTER the rc check (a failed probe has no trustworthy content type) but BEFORE
+                // the !total check, because a live playlist legitimately has no content length -- the
+                // observed ad reported len=18446744073709551615 (unknown), which would otherwise fail
+                // the element here for the wrong reason.
+                //
+                // The load-time HLS test (MediaPlayerPrivateMediaFoundation.cpp) matches ".m3u8" or
+                // "/hls_" in the URL, or a MIME containing "mpegurl". Ad CDNs defeat all three: the
+                // tsyndicate creative comes from an opaque token URL with no extension and an EMPTY
+                // response MIME at load time ("client: didReceiveResponse http=200 mime="), so it fell
+                // through to the progressive path -- and MediaFoundation cannot parse a text playlist
+                // as a byte stream, failing with MF_E_UNSUPPORTED_BYTESTREAM_TYPE (0xc00d36c4). The
+                // page's VAST wrapper then waits on the ad's loadedmetadata forever and the MAIN video
+                // never starts.
+                //
+                // Deliberately NARROW so ordinary progressive video is untouched: an explicit playlist
+                // MIME always diverts; the '#' first byte (the start of #EXTM3U) only diverts when the
+                // server gave us no usable type at all. An MP4 starts with an ftyp box, never '#', but
+                // requiring an absent/generic MIME as well keeps a stray match from hijacking a working
+                // progressive stream.
+                {
+                    std::string ct(ctype);
+                    for (auto& c : ct) c = (char)tolower((unsigned char)c);
+                    const bool playlistMime = ct.find("mpegurl") != std::string::npos;
+                    const bool typeUnknown = ct.empty() || ct.find("octet-stream") != std::string::npos;
+                    const bool playlistMagic = (got >= 1 && first == '#' && typeUnknown);
+                    if (playlistMime || playlistMagic) {
+                        char b[200];
+                        snprintf(b, sizeof b, "prog: probe says HLS (mime=%d magic=%d type=%.60s) -> diverting to AdaptiveMediaSource",
+                            playlistMime ? 1 : 0, playlistMagic ? 1 : 0, ctype);
+                        PortImgLog(b);
+                        hlsStartOnHandle(h, u.c_str(), ua.c_str());
+                        return;
+                    }
+                }
+
                 if (!total) {
                     PortImgLog("prog: no content length -> cannot seek, failing element");
                     if (h->playerCtx) WebCoreMsePlayerError(h->playerCtx, -1);
@@ -853,8 +1103,15 @@ void PortProgressivePlayerDestroy(void* srcH)
 void PortMsePlayerStop(void* srcH)
 {
     auto h = static_cast<MseSource*>(srcH);
-    h->closing = true;
-    h->playerCtx = nullptr;
+    { // free the tier-0 decode slot (locked: teardown can run on a worker thread)
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        if (g_tier0ActivePlayer == h) g_tier0ActivePlayer = nullptr;
+    }
+    { // Under the slot lock so an in-flight onVideoFrame cannot snapshot playerCtx across this point.
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        h->closing.store(true, std::memory_order_release);
+        h->playerCtx = nullptr;
+    }
     if (h->player) {
         // Take ownership so we can null h->player immediately (no dangling events) and outlive `h`.
         MediaPlayer^ player = h->player;
@@ -896,7 +1153,42 @@ void PortMsePlayerStop(void* srcH)
 void PortMsePlayerPlay(void* srcH)
 {
     auto h = static_cast<MseSource*>(srcH);
+    // Tier-0 single decode slot: a real play() (user tap, or the page switching the active video) wins
+    // it. Evict the incumbent rather than just pausing it -- a paused MF pipeline still holds its ~50MB,
+    // which is what made the old "cap" grow memory instead of bounding it.
+    //
+    // If this element was evicted earlier its pipeline is gone but the handle is still valid, so rebuild
+    // it here. Unlike the old I-16 deferred-build this path is genuinely reachable: eviction reports
+    // Paused to WebCore and the element keeps a readyState from its previous life, and elements that
+    // were never evicted always got a pipeline at load, so play() is reached normally.
+    // Same locked check-and-claim as startFrameServerPlayer: this runs on the main thread but the slot
+    // is written from curl/threadpool workers too, so an unlocked read can miss or duplicate an evict.
+    if (WebCoreMemBudgetTier() == 0) {
+        MseSource* toEvict = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+            if (g_tier0ActivePlayer && g_tier0ActivePlayer != h) {
+                toEvict = g_tier0ActivePlayer;
+                g_tier0ActivePlayer = nullptr;
+            }
+        }
+        if (toEvict) {
+            evictFrameServerPlayer(toEvict); // outside the lock: dispatches WinRT teardown
+            PortImgLog("mse: tier-0 single-decode -> evicted previous active video (new play takes over)");
+        }
+    }
+    if (!h->player && h->mediaSource) {
+        PortImgLog("mse: rebuilding pipeline for played video (was evicted)");
+        startFrameServerPlayer(h); // claims the slot itself on success
+    }
     if (!h->player) { PortImgLog("mse: Play() SKIPPED - no player"); return; }
+    // Claim the slot only AFTER we know a pipeline exists (a failed build must not leave the slot owned
+    // by a handle with no player -- that would permanently block every other video on the page), and
+    // take the lock: this global is written from curl/threadpool workers as well as the main thread.
+    if (WebCoreMemBudgetTier() == 0) {
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        g_tier0ActivePlayer = h;
+    }
     try {
         int before = (int)h->player->PlaybackSession->PlaybackState;
         h->player->Play();

@@ -48,9 +48,13 @@
 #include "MemoryRelease.h"        // WebCore::releaseMemory (memory-pressure release)
 #include "CommonVM.h"
 #include "MemoryCache.h"
+#include <JavaScriptCore/CollectionScope.h>
+#include <JavaScriptCore/Completion.h>
 #include <JavaScriptCore/Heap.h>
+#include <JavaScriptCore/HeapObserver.h>
 #include <JavaScriptCore/VM.h>
 #include "BackForwardCache.h"
+#include "CurlCacheManager.h"
 #include <wtf/FastMalloc.h>
 #include <wtf/MemoryFootprint.h>
 #include <wtf/MemoryPressureHandler.h>
@@ -241,6 +245,22 @@ extern "C" void WebCoreBrowserLog(const char* msg) { if (msg) portLog(msg); }
 // Defined in GraphicsLayerTextureMapper.cpp: feeds the compositor the visible content band so it can
 // clip full-page repaints of the huge CSS-px content layer to what's on screen (perf).
 namespace WebCore { void setTexmapVisibleRect(int x, int y, int w, int h); }
+// The real viewport, for tile-scheduler raster priority (see TextureMapperTiledBackingStore).
+namespace WebCore { void setTexmapFocusRect(int x, int y, int w, int h); }
+
+// TILE SCHEDULER (TextureMapperTiledBackingStore.cpp). Raster is incremental: tiles nearest the
+// viewport are rastered first under a per-frame time budget, the rest stay dirty for later frames.
+// g_texmapPendingTiles > 0 means the page isn't fully painted yet, so the driver keeps compositing.
+namespace WebCore {
+class Color;
+extern double g_texmapRasterBudgetMs;
+extern unsigned g_texmapPendingTiles;
+extern unsigned g_texmapTilesRasteredLastFrame;
+extern bool g_texmapUseDisplayList;
+extern double g_texmapRecordMs;
+extern unsigned g_texmapRecordCalls;
+void setTexmapPlaceholderColor(const Color&);
+}
 
 // Install the JSC diag sink at WebCore.dll LOAD time (before any code runs, well before anything
 // touches JSC::initialize). JSC's JIT-reservation diagnostics (jitdiag: in ExecutableAllocator/VM)
@@ -338,6 +358,21 @@ static void applyMemoryCacheFromBudget()
     MemoryCache::singleton().setDeadDecodedDataDeletionInterval(Seconds { g_memBudget.tier == 0 ? 1.0 : 3.0 });
 }
 
+// App-writable data directory (LocalState), set by the shell before init. Declared up here because
+// ensureInit() needs it for the HTTP cache directory; the setter that fills it lives further down.
+static std::string g_dataPath;
+
+// Raw AppMemoryUsageLimit, recorded by the shell BEFORE WebCoreBrowserInitPanel. Deliberately separate
+// from WebCoreSetMemoryBudgetFromLimit: that one calls applyMemoryCacheFromBudget(), which touches the
+// MemoryCache and therefore cannot run until WebCore is up -- so the shell has to call it AFTER init,
+// which is too late for anything JSC snapshots during initialize()/VM construction (see forceRAMSize in
+// ensureInit). This setter only stores a number, so it is safe to call first.
+static unsigned long long g_startupAppLimitBytes = 0;
+extern "C" void WebCoreSetStartupMemoryLimit(unsigned long long appLimitBytes)
+{
+    g_startupAppLimitBytes = appLimitBytes;
+}
+
 extern "C" void WebCoreSetMemoryBudgetFromLimit(unsigned long long appLimitBytes)
 {
     unsigned limitMB = static_cast<unsigned>(appLimitBytes / (1024 * 1024));
@@ -348,6 +383,11 @@ extern "C" void WebCoreSetMemoryBudgetFromLimit(unsigned long long appLimitBytes
     if (limitMB < 512) {            // ~1GB device: commit binds ~50MB below the app cap
         b.tier = 0;
         b.effectiveCeilingMB = limitMB > 60 ? limitMB - 50 : limitMB;
+        // Kept at 12MB. (I-17 tried 48MB on the theory that decoded-image eviction was causing the
+        // ~20ms-per-image scroll raster -- MEASURED WRONG on device: with a 48MB cap resCache only
+        // reached 25MB, so nothing was being evicted and the image draw cost did not move. The real
+        // scroll cost is redundant re-rastering, ~12.4Mpx per window for a 0.84Mpx viewport, tracked
+        // separately. The larger cap only added footprint on a device that then reaped at 374/390MB.)
         b.memCacheTotalMB = 12;
         b.mseKeepBehindSec = 8;
     } else if (limitMB < 1400) {    // ~2GB device: cap itself is the ceiling (commit not binding)
@@ -374,6 +414,55 @@ extern "C" unsigned WebCoreMemBudgetEffectiveCeilingMB() { return g_memBudget.ef
 extern "C" int WebCoreMemBudgetTier() { return g_memBudget.tier; }
 extern "C" unsigned WebCoreMemBudgetMseKeepBehindSec() { return g_memBudget.mseKeepBehindSec; }
 
+// GC PAUSE VISIBILITY. Every collection on this port is STOP-THE-WORLD: Options.cpp force-disables
+// useConcurrentGC on any CPU that is not X86_64/ARM64 (exactly the JSVALUE64 platforms -- concurrent
+// marking must read a JSValue atomically, and on 32-bit it is two separate words), so Heap installs
+// SynchronousStopTheWorldMutatorScheduler. Every GC is therefore a full main-thread pause billed into
+// js= with nothing to distinguish it from script execution, and nothing in the port logged GC at all --
+// a multi-hundred-ms collection looked exactly like slow JS. Log scope + duration + heap size.
+//
+// Do NOT "fix" this by enabling concurrent GC on ARM32: same torn-JSValue hazard that makes concurrent
+// JIT unsound here, except in the collector, where the failure mode is heap corruption. The low-core
+// tuning in Options::overrideDefaults() is also inert for us -- maximumMutatorUtilization,
+// concurrentGCMaxHeadroom and minimumGCPauseMS are read ONLY by the two concurrent schedulers, never by
+// the stop-the-world one we actually run.
+class PortHeapObserver final : public JSC::HeapObserver {
+public:
+    void willGarbageCollect() final { m_start = MonotonicTime::now(); }
+    void didGarbageCollect(JSC::CollectionScope scope) final
+    {
+        double ms = (MonotonicTime::now() - m_start).milliseconds();
+        // Eden collections are routinely sub-millisecond and would flood the log on any allocation
+        // burst; only report pauses big enough to matter next to a 33ms frame.
+        if (ms < 5.0)
+            return;
+        unsigned long long heapKB = 0;
+        if (JSC::VM* vm = commonVMOrNull())
+            heapKB = static_cast<unsigned long long>(vm->heap.size()) / 1024;
+        char b[128];
+        snprintf(b, sizeof b, "gc: %s collection paused %.0fms (stop-the-world) heap=%lluKB",
+            scope == JSC::CollectionScope::Full ? "FULL" : "eden", ms, heapKB);
+        portLog(b);
+    }
+private:
+    MonotonicTime m_start;
+};
+static PortHeapObserver g_heapObserver;
+
+// The VM does not exist until the Page is created, so the observer has to be attached lazily rather
+// than during init. Cheap: one bool test per frame after the first success.
+static void installHeapObserverOnce()
+{
+    static bool s_installed = false;
+    if (s_installed)
+        return;
+    if (JSC::VM* vm = commonVMOrNull()) {
+        vm->heap.addObserver(&g_heapObserver);
+        s_installed = true;
+        portLog("gc: heap observer installed (stop-the-world pauses will be logged)");
+    }
+}
+
 static void ensureInit()
 {
     static bool inited = false;
@@ -395,6 +484,34 @@ static void ensureInit()
     // GetEnvironmentVariableA shim. Numeric option, so the thread_local-getenv-buffer trap
     // (OptionString keeping a raw pointer) does not apply.
     SetEnvironmentVariableA("JSC_jitMemoryReservationSize", "16777216");
+
+    // Point JSC's heap sizing at the cap that actually kills us, not at physical RAM. Heap.cpp uses
+    // Options::forceRAMSize() ? ... : ramSize(), and RAMSize.cpp returns ullTotalPhys -- ~1024MB on a
+    // 640XL whose AppContainer cap is 390MB. Two consequences, both bad:
+    //   - proportionalHeapSize() applies the 2x smallHeapGrowthFactor while the heap is below
+    //     ramSize * smallHeapRAMFraction = 256MB, so JSC will happily grow the JS heap toward 256MB
+    //     inside a 390MB budget it shares with the memory cache, GPU tiles and MSE buffers.
+    //   - criticalGCMemoryThreshold (0.80) computes against 1GB, so JSC only turns aggressive near
+    //     819MB -- i.e. never, because the OS terminates us at ~390MB first.
+    // The port already anchored MemoryPressureHandler and setMemoryFootprintOverride to the real limit;
+    // JSC's own heap was the one left reading physical RAM. Use the effective ceiling (the tier-0 kill
+    // line sits ~50MB under the cap because system commit binds first), matching the tiering in
+    // WebCoreSetMemoryBudgetFromLimit. Env var, not setOption: Heap::Heap snapshots this at VM
+    // construction and Options::initialize() runs inside JSC::initialize() below.
+    if (g_startupAppLimitBytes) {
+        unsigned limitMB = static_cast<unsigned>(g_startupAppLimitBytes / (1024 * 1024));
+        unsigned ceilingMB = (limitMB < 512) ? (limitMB > 60 ? limitMB - 50 : limitMB)
+                                             : (limitMB - limitMB / 20);
+        char rs[32];
+        snprintf(rs, sizeof rs, "%llu", static_cast<unsigned long long>(ceilingMB) * 1024 * 1024);
+        SetEnvironmentVariableA("JSC_forceRAMSize", rs);
+        char rb[160];
+        snprintf(rb, sizeof rb, "jscheap: forceRAMSize=%uMB (appLimit=%uMB) -- was defaulting to physical RAM",
+            ceilingMB, limitMB);
+        portLog(rb);
+    } else
+        portLog("jscheap: no startup app limit yet -- JSC heap will size against PHYSICAL RAM (check shell init order)");
+
     JSC::initialize();
     WTF::initializeMainThread();
 
@@ -440,13 +557,24 @@ static void ensureInit()
         if (cores < 1) cores = 1;
         unsigned worklist = static_cast<unsigned>(cores);                        // all cores may compile
         unsigned dfgThreads = static_cast<unsigned>(cores > 1 ? cores - 1 : 1);  // leave 1 core for main-thread JS
-        JSC::Options::useConcurrentJIT() = true;
+        // DO NOT re-enable useConcurrentJIT here. This used to force it true, overriding JSC's own
+        // decision, and that is UNSOUND on this architecture:
+        //   ENABLE_CONCURRENT_JS is defined only for ENABLE(JIT) && USE(JSVALUE64) (PlatformEnable.h:675).
+        //   ARM32 is not CPU(REGISTER64), so USE_JSVALUE32_64=1 and ENABLE(CONCURRENT_JS) is 0, and
+        //   Options.cpp:431-433 deliberately sets useConcurrentJIT()=false for us.
+        // WebKit's own comment on the gate: concurrent JS "requires that values get stored to
+        // atomically... not true at all on 32-bit platforms where values are composed of two separate
+        // sub-values." Forcing it on meant DFG plans compiled on background threads while the mutator
+        // mutated a non-atomic two-word JSValue -- a torn-read race by construction, and the leading
+        // suspect for the unexplained "DFG'd code infinite-loops on Google search" miscompile noted
+        // above. DFG stays ON; it now compiles synchronously on the main thread (slower per compile,
+        // correct). The thread caps below are harmless either way and are kept for the FTL/64-bit case.
         JSC::Options::numberOfWorklistThreads() = worklist;
         JSC::Options::numberOfDFGCompilerThreads() = dfgThreads;
         char cb[200];
         snprintf(cb, sizeof cb,
-            "jitthreads: cores=%d -> worklistThreads=%u dfgCompilerThreads=%u concurrentJIT=1 ftlCompiled=0",
-            cores, worklist, dfgThreads);
+            "jitthreads: cores=%d -> worklistThreads=%u dfgCompilerThreads=%u concurrentJIT=%d ftlCompiled=0 (32-bit: concurrent JIT unsound, left to JSC)",
+            cores, worklist, dfgThreads, JSC::Options::useConcurrentJIT() ? 1 : 0);
         portLog(cb);
     }
     // DFG DISASSEMBLY CAPTURE (debug, OFF by default): flip to true + load a minimal page to dump
@@ -502,6 +630,14 @@ static void ensureInit()
     {
         auto& mph = MemoryPressureHandler::singleton();
         mph.setLowMemoryHandler([](Critical critical, Synchronous synchronous) {
+            // Log it. This is the THIRD memory actuator (shell per-frame block, shell 250ms watcher,
+            // and this one) and it was the only silent one -- WebKit's periodic monitor fires it on its
+            // own 5s poll at the strict threshold, so releases were happening that never appeared in the
+            // log at all. Any wipe costs a re-decode/re-JIT storm, so they all need to be visible.
+            char b[96];
+            snprintf(b, sizeof b, "mem: WebKit pressure monitor -> releaseMemory(%s)",
+                critical == Critical::Yes ? "critical" : "normal");
+            portLog(b);
             WebCore::releaseMemory(critical, synchronous);
         });
         mph.setShouldLogMemoryMemoryPressureEvents(true);
@@ -514,6 +650,33 @@ static void ensureInit()
     // dropped promptly so offscreen thumbnails don't pin memory.
     applyMemoryCacheFromBudget();
     BackForwardCache::singleton().setMaxSize(0);
+
+    // NOTE: the GC observer canNOT be installed here -- commonVMOrNull() is still null at ensureInit()
+    // time because the VM is not created until the Page is. Installed lazily from the frame loop
+    // instead (installHeapObserverOnce), which was verified on-device: the first attempt logged nothing
+    // at all because this branch never ran.
+
+    // HTTP DISK CACHE. There was none: CurlCacheManager is compiled in and fully wired into the live
+    // load path (ResourceHandleCurl + CurlResourceHandleDelegate call getCachedResponse /
+    // didReceiveResponse / didReceiveData / didFinishLoading / didFail), but it constructs itself
+    // DISABLED -- "Call setCacheDirectory() to enable the Cache Manager" -- and the only caller of
+    // setCacheDirectory in the tree is WebKitLegacy/win/WebCache.cpp, which this port does not build.
+    // So every navigation re-fetched and re-decoded everything, with only a 12MB in-memory MemoryCache
+    // in front of it (itself wiped on every video load, and on any real memory pressure).
+    //
+    // Sized generously because this is FLASH, not RAM: only the index lives in memory. Under LocalState
+    // so it persists across launches, which is the point -- the win is cross-session, not just
+    // cross-navigation.
+    if (!g_dataPath.empty()) {
+        std::string cacheDir = g_dataPath + "\\httpcache";
+        auto& cache = CurlCacheManager::singleton();
+        cache.setStorageSizeLimit(64 * 1024 * 1024);
+        cache.setCacheDirectory(String::fromUTF8(cacheDir.c_str()));
+        char cb[220];
+        snprintf(cb, sizeof cb, "httpcache: enabled dir=%s limit=64MB", cacheDir.c_str());
+        portLog(cb);
+    } else
+        portLog("httpcache: NOT enabled -- no data path (shell must call WebCoreBrowserSetDataPath first)");
 }
 
 // Paint an already-laid-out frame view into a straight-RGBA8888 buffer.
@@ -748,6 +911,11 @@ namespace {
 double g_deviceScale = 1.0;   // device pixels per CSS pixel (mobile DPR) — GEOMETRIC scale: drives
                               // cssW/cssH, the root composite transform (fills the physical panel), and
                               // input/clip px<->CSS conversion. Stays at the true device DPR.
+// The SwapChainPanel's own DIP->physical scale (what the shell passes in as deviceScale, e.g. 1.75 on
+// the 640XL). Input arrives in panel DIPs; CSS is g_winW/375 device-px per CSS px. Before I-15 the CSS
+// viewport happened to equal the panel DIP size (412 vs 411) so coords were used 1:1 -- with the
+// iPhone-SE 375 viewport they are ~10% off, so dipToCss() below converts explicitly.
+double g_panelDipScale = 1.0;
 double g_rasterScale = 1.0;   // RASTER/DPR scale = min(g_deviceScale, cap). On extreme-DPR panels
                               // (Lumia 950 @ 3.5, 1440p) every backing store is a 3.5x D3D texture and
                               // YouTube's watch page exhausts the GPU texture budget -> E_OUTOFMEMORY on
@@ -872,7 +1040,6 @@ int g_forcedWinW = 0, g_forcedWinH = 0; // shell-supplied panel size; overrides 
 // persistent cookies (<path>\cookies.db) and persistent localStorage (<path>\localstorage). The
 // shell MUST call WebCoreBrowserSetDataPath() before WebCoreBrowserInit so the cookie session and
 // storage provider open the on-disk databases instead of falling back to in-memory.
-static std::string g_dataPath;
 extern "C" void WebCoreBrowserSetDataPath(const char* p) { g_dataPath = p ? p : ""; }
 namespace WebCorePort { const std::string& portDataPath() { return g_dataPath; } }
 
@@ -950,6 +1117,15 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
         portLog("browser: window GL context creation failed");
         return -1;
     }
+    // Present WITHOUT blocking on vsync. swapInterval() existed but was never called anywhere, so ANGLE
+    // ran at the EGL default of 1 and eglSwapBuffers blocked until the next vblank -- and it does that
+    // INSIDE XAML's CompositionTarget::Rendering callback, before XAML gets the thread back to commit
+    // its own frame. That serialises the pipeline (XAML raises Rendering -> whole engine frame -> block
+    // on vblank -> return -> XAML commits into the NEXT vblank) and costs a frame of latency for
+    // nothing. We do not lose pacing by dropping it: CompositionTarget::Rendering is already driven by
+    // DWM at vsync, so the frame rate is governed there. This is the untimed tail of x9:xaml-commit.
+    g_glContext->swapInterval(0);
+    portLog("gl: swapInterval(0) -- present does not block on vblank (XAML Rendering already vsync-paced)");
     // Turn on ANGLE's debug reporting so GL errors are logged at their source (see callback above).
     glEnable(GL_DEBUG_OUTPUT_KHR);
     glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR);
@@ -962,6 +1138,10 @@ extern "C" int WebCoreBrowserInit(void* coreWindow, const char* url, double devi
     g_winW = g_forcedWinW > 0 ? g_forcedWinW : (size.width() > 0 ? size.width() : 480);
     g_winH = g_forcedWinH > 0 ? g_forcedWinH : (size.height() > 0 ? size.height() : 800);
     g_deviceScale = deviceScale > 0 ? deviceScale : 1.0; // real panel dpr; kept only for the log below
+    // The shell's XAML pointer coords arrive in the SwapChainPanel's DIP space (panel physical /
+    // rasterizationScale). Keep that scale: after the I-15 viewport change the CSS width is no longer
+    // ~equal to the panel DIP width, so input needs an explicit DIP->CSS conversion (see dipToCss()).
+    g_panelDipScale = deviceScale > 0 ? deviceScale : 1.0;
     // FINGERPRINT COHERENCE (I-15): present an iPhone-consistent viewport. Real hardware maps to NO
     // iPhone -- the 640XL is 720 physical @ dpr 1.75 -> 412 CSS, and both "dpr 1.75" and a "412 CSS width"
     // are Android values Cloudflare Turnstile flags under our iPhone UA. All our W10M panels are 9:16
@@ -1837,6 +2017,57 @@ static unsigned g_composited300 = 0, g_skipped300 = 0; // rolling 300-frame gate
 static unsigned g_gateFrames = 0; // loop iterations in the CURRENT gate window (gate is time- OR frame-triggered)
 static double g_msJS = 0, g_msComposite = 0;           // rolling 300-frame CPU split: JS/RunLoop vs composite
 static double g_msBacking = 0, g_msPaint = 0, g_msSwap = 0; // composite sub-split: CPU raster+upload / GPU paint-submit / present-block
+
+// SCROLL-QUIET RASTER (I-18). Wall time of the last scroll delta (set in WebCoreBrowserScrollBy). The
+// backing store is a SOFTWARE cairo raster of the whole visible band on ONE thread -- the same thread
+// that services the scroll -- so rastering *during* a scroll loses the race every time: measured ~12.4Mpx
+// of raster per gate window for a 0.84Mpx viewport, PAINTEDfps collapsing to 1.0 while loopFps stayed
+// ~50, and bands of unpainted white that only filled in once you stopped. So we don't raster while the
+// finger is moving: scroll becomes a pure GPU composite of the tiles we already hold, and the raster runs
+// when scrolling settles. That inversion is also what makes a BIG render-ahead band affordable -- it's
+// paid for in the quiet moment instead of competing with the scroll.
+static MonotonicTime g_lastScrollTime;
+static const double kScrollQuietMs = 120.0; // settle window before we resume rastering
+// Tile-scheduler diagnostics: the retained page height (CSS px) the memory budget allows, and the
+// current scroll offset -- together they say whether a jump landed inside the retained window.
+static int g_lastKeepH = 0;
+static int g_lastScrollY = 0;
+// Last delivered video frame (set from WebCoreMsePlayerFrame).
+//
+// CORRECTION: frames do NOT arrive on the main thread -- the earlier comment here said they did and
+// that was wrong. WebCoreMsePlayerFrame runs on a MediaFoundation worker thread, stages pixels under
+// m_fsPixelsLock and marshals to main via callOnMainThread. The raster throttle below is still
+// justified, but by CPU/memory-bandwidth contention on a 4-core A7, not by thread sharing.
+//
+// Must be ATOMIC: written from the MF worker thread, read from the main thread. MonotonicTime wraps a
+// double, and on ARM32 an 8-byte load/store is NOT atomic -- a torn read yields a garbage timestamp and
+// therefore an arbitrary raster budget. Store milliseconds in a 32-bit atomic instead, which is a
+// single naturally-aligned word on this architecture.
+static std::atomic<uint32_t> g_lastVideoFrameMs { 0 };
+static std::atomic<uint32_t> g_lastVideoFrameArea { 0 };
+// The frame callback already carries the dimensions, so size gating needs no extra bookkeeping.
+extern "C" void WebCoreNoteVideoFrameDelivered(int width, int height)
+{
+    uint32_t ms = static_cast<uint32_t>(MonotonicTime::now().secondsSinceEpoch().milliseconds());
+    g_lastVideoFrameMs.store(ms, std::memory_order_relaxed);
+    uint32_t area = (width > 0 && height > 0) ? static_cast<uint32_t>(width) * static_cast<uint32_t>(height) : 0;
+    g_lastVideoFrameArea.store(area, std::memory_order_relaxed);
+}
+// True only when a video delivered a frame recently AND it is big enough to be worth protecting.
+// Gating on "any video at all" meant a single 200x100 autoplaying ad thumbnail (20K px) throttled the
+// WHOLE page's raster to 1/16th of the idle budget. 100K px ~ 480x208, i.e. a real player rather than a
+// decorative preview.
+static const uint32_t kMinProtectedVideoArea = 100000;
+static bool videoPlayingRecently()
+{
+    uint32_t last = g_lastVideoFrameMs.load(std::memory_order_relaxed);
+    if (!last)
+        return false;
+    if (g_lastVideoFrameArea.load(std::memory_order_relaxed) < kMinProtectedVideoArea)
+        return false;
+    uint32_t now = static_cast<uint32_t>(MonotonicTime::now().secondsSinceEpoch().milliseconds());
+    return (now - last) < 500;
+}
 // The main thread's OTHER half. JS and composite were the only two timers, and on the pages that
 // collapse to ~1 fps they account for barely a third of uiCPU (e.g. wall=2072 uiCPU=2062 JS=298
 // composite=345 -> 1419ms measured by nothing). The gap is everything BETWEEN them: the HTML
@@ -1882,8 +2113,14 @@ extern "C" void WebCoreBrowserSetMemStats(unsigned long long usedBytes, unsigned
         s_configured = true;
         MemoryPressureHandler::Configuration config {
             static_cast<size_t>(limitBytes),
-            0.5,            // conservative: compositor stops promoting speculative layers
-            0.65,           // strict
+            // Raised from 0.5/0.65. Conservative at 50% of a 390MB cap is ~195MB, which is ordinary
+            // steady state on this device -- it fired 12 times in one measured session, each one a
+            // stop-the-world full GC plus a cache wipe, while the reclaimable pools totalled ~26MB.
+            // The memory that actually grows here is native/CRT heap this handler cannot touch, so
+            // arming early buys nothing and costs re-decode + re-JIT. Conservative now arms at ~254MB
+            // and strict at ~293MB, still well below the ~340MB effective kill line.
+            0.65,           // conservative: compositor stops promoting speculative layers
+            0.75,           // strict
             std::nullopt,   // no self-kill; the OS owns that
             Seconds { 5 }   // poll often -- this page goes 140MB -> 270MB in seconds
         };
@@ -2214,12 +2451,47 @@ extern "C" void WebCoreBrowserRenderFrame()
     stage("a:enter");
     MonotonicTime tFrame0 = MonotonicTime::now();
     double frameUpdateMs = 0, frameIdleMs = 0, frameFlushMs = 0; // this frame's engine-side cost
+    // The two biggest items in a frame used to be missing from the per-frame accounting entirely, which
+    // is why GAP was large and meaningless:
+    //   frameJsMs  - the RunLoop block (curl completions, ALL WTF timers, page JS, microtask checkpoint)
+    //                was only ever summed into the 300-frame g_msJS accumulator and thrown away per frame.
+    //   frameForcedUpdateMs - WebCoreDriverRunRenderingUpdate() at the forced call site is billed to
+    //                nothing at all: frameUpdateMs closes before it runs. It does style, layout, rAF,
+    //                Intersection/ResizeObserver, CSS animations and a full GraphicsLayer tree flush.
+    // Note the rendering update has THREE entry points; the WTF-timer one fires inside RunLoop::iterate()
+    // and therefore lands inside frameJsMs, which is why `update` can read ~0 on an 800ms frame.
+    double frameJsMs = 0, frameForcedUpdateMs = 0;
     g_renderingUpdateDoneThisFrame = false; // one "update the rendering" per frame (see below)
 
     g_glContext->makeContextCurrent();
     stage("a1:ctx");
+    installHeapObserverOnce(); // VM exists by now; see the note in ensureInit()
     MonotonicTime tJS0 = MonotonicTime::now();
-    RunLoop::current().iterate(); // deliver curl completions, run timers (runs page JS)
+    // Iterate the RunLoop MORE THAN ONCE per frame, bounded.
+    //
+    // RunLoop::performWork() snapshots the queue on entry (m_currentIteration = exchange(m_nextIteration))
+    // so anything dispatched WHILE it runs is deferred to the next iterate(). A single resource is a
+    // chain of such dispatches -- response -> runOnWorkerThreadIfRequired -> worker flush -> body ->
+    // completion -- and with one iterate per frame each link costs a whole frame. On a page that has
+    // collapsed to a few fps that is seconds of pure scheduling latency for resources that already
+    // arrived. (There is a setWakeUpCallback hook, but it is not the lever here: this loop is not
+    // idle-blocked waiting to be woken, it is driven by XAML's CompositionTarget::Rendering, so a wake
+    // callback cannot make the next pump happen sooner. Draining more per pump can.)
+    //
+    // Bounded twice over -- passes AND wall time -- because each pass also runs page JS and WTF timers,
+    // so an unbounded drain would let a busy page eat the whole frame. Stops early the moment a pass
+    // does no new work, which is the common case.
+    {
+        static const int kMaxRunLoopPasses = 4;
+        static const double kRunLoopDrainBudgetMs = 20.0;
+        for (int pass = 0; pass < kMaxRunLoopPasses; ++pass) {
+            RunLoop::current().iterate(); // deliver curl completions, run timers (runs page JS)
+            if (!RunLoop::current().hasPendingWork())
+                break;
+            if ((MonotonicTime::now() - tJS0).milliseconds() >= kRunLoopDrainBudgetMs)
+                break;
+        }
+    }
     stage("a2:runloop");
 
     Frame& frame = g_page->mainFrame();
@@ -2238,7 +2510,8 @@ extern "C" void WebCoreBrowserRenderFrame()
     // and a permanent skeleton.)
     if (RefPtr doc = frame.document())
         doc->eventLoop().performMicrotaskCheckpoint();
-    g_msJS += (MonotonicTime::now() - tJS0).milliseconds(); // RunLoop (curl completions + page JS) + microtasks
+    frameJsMs = (MonotonicTime::now() - tJS0).milliseconds();
+    g_msJS += frameJsMs; // RunLoop (curl completions + page JS + WTF timers) + microtasks
     stage("b:post-microtask");
 
     // Shorts SPA-stall probe: YouTube fetches the reel data (reel_item_watch = 200) but the reel DOM /
@@ -2305,12 +2578,22 @@ extern "C" void WebCoreBrowserRenderFrame()
     // and the engine-driven path resumes, preserving the static-page idle savings.
     bool recentlyActive = (g_composeFrame < g_forceComposeUntil)
         || (g_composeFrame - g_lastActiveComposeFrame) < 30;
-    if (!g_renderingUpdateDoneThisFrame && recentlyActive)
+    // Snapshot BEFORE the forced call. The rupd: line below used to read this flag afterwards, by which
+    // point WebCoreDriverRunRenderingUpdate had already set it to true -- so it printed 1 unconditionally
+    // and could never answer the question it exists to answer (did the ENGINE arm the update, or did we
+    // force it?). That distinction matters: the engine-armed path runs inside VsyncTick and is timed,
+    // the forced path was not timed at all.
+    bool engineArmedUpdate = g_renderingUpdateDoneThisFrame;
+    if (!g_renderingUpdateDoneThisFrame && recentlyActive) {
+        MonotonicTime tForced0 = MonotonicTime::now();
         WebCoreDriverRunRenderingUpdate();
+        frameForcedUpdateMs = (MonotonicTime::now() - tForced0).milliseconds();
+    }
     { static unsigned s_rupdTick = 0;
       if ((++s_rupdTick % 120) == 5) {
-          char b[112]; snprintf(b, sizeof b, "rupd: updateRendering this frame=%d active=%d (engine-armed + activity-forced)",
-              g_renderingUpdateDoneThisFrame ? 1 : 0, recentlyActive ? 1 : 0);
+          char b[176]; snprintf(b, sizeof b, "rupd: engineArmed=%d forced=%d forcedMs=%.1f active=%d",
+              engineArmedUpdate ? 1 : 0,
+              (!engineArmedUpdate && recentlyActive) ? 1 : 0, frameForcedUpdateMs, recentlyActive ? 1 : 0);
           WebCorePort::portLog(b); } }
 
     // Idle period: run pending requestIdleCallback callbacks with a small per-frame budget — this is
@@ -2365,8 +2648,10 @@ extern "C" void WebCoreBrowserRenderFrame()
         double frameMs = (MonotonicTime::now() - tFrame0).milliseconds();
         if (frameMs >= 250) {
             char b[240];
-            snprintf(b, sizeof b, "SLOWFRAME frame=%u total=%.0fms SKIPPED-COMPOSITE | update=%.0fms idle=%.0fms flush=%.0fms",
-                g_composeFrame, frameMs, frameUpdateMs, frameIdleMs, frameFlushMs);
+            // js= and rupd= added: a SKIPPED-COMPOSITE frame reporting 250ms with every stage at zero was
+            // spending essentially all of it in the RunLoop block, which nothing here printed.
+            snprintf(b, sizeof b, "SLOWFRAME frame=%u total=%.0fms SKIPPED-COMPOSITE | js=%.0f rupd=%.0f update=%.0fms idle=%.0fms flush=%.0fms",
+                g_composeFrame, frameMs, frameJsMs, frameForcedUpdateMs, frameUpdateMs, frameIdleMs, frameFlushMs);
             portLog(b);
         }
         stage("f:skip-idle");
@@ -2418,7 +2703,41 @@ extern "C" void WebCoreBrowserRenderFrame()
                 // a usable scroll buffer at ~60% of the raster cost. (Tall pages invalidate as one united
                 // bounding rect, so this raster runs even when the real change is small -- keeping the
                 // band tight is the cheapest lever we have short of async/off-thread raster.)
-                int margin = g_cssH / 4;
+                // I-18: the quarter-screen band existed because we rastered it on EVERY scroll frame, so
+                // it had to stay tiny to be affordable -- which is exactly why a flick outran it and went
+                // white. Now that raster is deferred to the scroll-settle (see c3:updateBacking), the band
+                // is paid for in the quiet moment, so it can be a FULL screen each way: ~3 viewports of
+                // pre-rastered content to flick through instead of 1.5. Vertical only -- horizontal scroll
+                // is rare and widening that axis multiplies tiles for no benefit.
+                //
+                // PROGRESSIVE render-ahead (I-18b). The settle raster is ONE synchronous pass over the
+                // whole band, so handing it the full 3-viewport band makes the user wait on off-screen
+                // work before the content they are actually looking at appears -- "goes white for some
+                // time, then pops in". So ramp it: for the first stretch after scrolling stops, raster
+                // only the viewport + a small buffer (fast -> the screen fills), and widen to the full
+                // pre-render band once that's done and we're still idle.
+                // TILE SCHEDULER (replaces the render-ahead band). Raster is now incremental, prioritised
+                // nearest-viewport-first and bounded to ~10ms/frame inside the tiled backing store, so a
+                // big retained area no longer risks a multi-second stall -- which means this rect is no
+                // longer "how much can we afford to raster in one pass" but simply "how much page can we
+                // afford to KEEP as GPU tiles". Size it straight from the memory budget:
+                //   bytes per CSS px of page height = cssW * rasterScale^2 * 4
+                // At 375 CSS wide and rasterScale 2 that's ~6KB per CSS px, so a 32MB tile budget retains
+                // ~5600 CSS px -- the whole of a typical page (a rule34 post is ~4700), which is the
+                // "raster the whole page" behaviour we're after: any jump-scroll inside that range lands
+                // on already-rastered tiles. Only genuinely huge layouts (pornhub's 26412px video page)
+                // exceed it, and those degrade to a large moving window instead of dying.
+                unsigned tier = WebCoreMemBudgetTier();
+                double budgetBytes = (tier == 0) ? 32.0 * 1024 * 1024
+                                   : (tier == 1) ? 96.0 * 1024 * 1024
+                                                 : 256.0 * 1024 * 1024;
+                double bytesPerCssRow = static_cast<double>(g_cssW) * g_rasterScale * g_rasterScale * 4.0;
+                int keepH = bytesPerCssRow > 0 ? static_cast<int>(budgetBytes / bytesPerCssRow) : g_cssH * 3;
+                if (keepH < g_cssH * 2)
+                    keepH = g_cssH * 2; // always keep at least a screen either side
+                int margin = (keepH - g_cssH) / 2;
+                g_lastKeepH = keepH;
+                g_lastScrollY = vis.y();
                 int top = vis.y() - margin;
                 if (top < 0) top = 0;
                 // Horizontal band too. This used to hand over x=0, width=g_cssW unconditionally, which
@@ -2430,12 +2749,75 @@ extern "C" void WebCoreBrowserRenderFrame()
                 int left = vis.x() - marginX;
                 if (left < 0) left = 0;
                 WebCore::setTexmapVisibleRect(left, top, g_cssW + marginX * 2, vis.height() + margin * 2);
+                // The REAL viewport, used only to order raster (nearest-first). Distinct from the
+                // keep-rect above: that says what we RETAIN, this says what to paint FIRST. Handing the
+                // scheduler the keep-rect instead put its focus mid-page and rastered bottom-before-top.
+                WebCore::setTexmapFocusRect(vis.x(), vis.y(), vis.width(), vis.height());
+            }
+        }
+        // Placeholder colour for tiles the scheduler hasn't reached yet (see paintToTextureMapper).
+        // documentBackgroundColor() is the page's own background, so a dark site stays dark instead of
+        // flashing white -- the single most visible artifact of deferred raster.
+        if (g_contentClient.frame) {
+            if (WebCore::FrameView* fv = g_contentClient.frame->view()) {
+                WebCore::Color bg = fv->documentBackgroundColor();
+                if (bg.isValid())
+                    WebCore::setTexmapPlaceholderColor(bg);
             }
         }
         stage("c3:updateBacking");
+        // I-18: while the finger is actively moving, SKIP the software raster and just composite the
+        // tiles we already hold (the layer transform below still follows the scroll, so the page moves
+        // smoothly). Rastering here is a whole-visible-band cairo pass on this same thread and it simply
+        // cannot keep up with a scroll -- doing it anyway is what produced 1fps painting and white bands.
+        // Anything outside the already-rastered band shows blank for the duration of the flick and is
+        // filled in the moment scrolling settles (kScrollQuietMs), which is what the render-ahead band is
+        // for. A pending repaint is kept armed so the settle frame definitely rasters.
+        // I-18b: raster EVERY frame now, including mid-scroll. The old code skipped raster while the
+        // finger was down and rastered the whole band on settle -- that is what produced both remaining
+        // complaints: a flick outran the band and went white, and a JUMP (scrollbar drag, anchor link,
+        // End key) landed somewhere never rastered and then sat white waiting for the settle timer.
+        // The scheduler removes the reason for that trade: raster is capped at ~10ms/frame, so doing it
+        // during a scroll can't stall the frame, and it always spends that budget on the tiles nearest
+        // the CURRENT viewport -- so a jump re-targets raster instantly instead of waiting for quiet.
+        // ADAPTIVE RASTER BUDGET. Target is a usable browser, not a 60fps one: scrolling only has to
+        // stay near 30fps (~33ms/frame), and a stall is only a problem when it becomes a visible hiccup.
+        // So spend little while something is moving and a lot while idle, which converges the page in a
+        // couple of frames instead of trickling it in.
+        //   video playing -> 12ms : frame-server frames arrive on THIS thread; smooth playback wins.
+        //   scrolling     -> 24ms : leaves composite+swap headroom inside a ~33ms (30fps) frame.
+        //   idle          -> 200ms: nothing to stutter; finish the page. Still far under the ~1s bar.
+        {
+            MonotonicTime now = MonotonicTime::now();
+            bool videoPlaying = videoPlayingRecently();
+            bool scrolling = g_lastScrollTime
+                && (now - g_lastScrollTime).milliseconds() < kScrollQuietMs;
+            WebCore::g_texmapRasterBudgetMs = videoPlaying ? 12.0 : (scrolling ? 24.0 : 200.0);
+        }
+        WebCore::g_texmapPendingTiles = 0;
+        WebCore::g_texmapTilesRasteredLastFrame = 0;
         MonotonicTime tBacking0 = MonotonicTime::now();
         tmRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);
+        // Tiles still owing raster -> keep frames coming so the page converges to fully-painted while
+        // idle. That convergence is what makes a later jump land on already-rastered content.
+        if (WebCore::g_texmapPendingTiles)
+            WebCoreBrowserKeepCompositing(8);
         frameBackingMs = (MonotonicTime::now() - tBacking0).milliseconds();
+        // Scheduler diagnostic: rastered-this-frame vs still-owed, and what the raster actually cost.
+        // This is how we SEE whether the budget is holding (backMs should stay near g_texmapRasterBudgetMs
+        // and never spike into watchdog territory) and whether the page converges (pend -> 0 while idle).
+        {
+            static unsigned s_schedTick = 0;
+            if (WebCore::g_texmapPendingTiles || WebCore::g_texmapTilesRasteredLastFrame) {
+                if ((++s_schedTick % 15) == 1) {
+                    char b[160];
+                    snprintf(b, sizeof b, "tmsched: rastered=%u pend=%u backMs=%.1f budgetMs=%.1f keepH=%d scrollY=%d",
+                        WebCore::g_texmapTilesRasteredLastFrame, WebCore::g_texmapPendingTiles,
+                        frameBackingMs, WebCore::g_texmapRasterBudgetMs, g_lastKeepH, g_lastScrollY);
+                    portLog(b);
+                }
+            }
+        }
         g_msBacking += frameBackingMs; // CPU raster (cairo) + GL texture upload
         bstatHarvestFrame(g_bstatFrame); // snapshot+reset this frame's backing counters (printed on SLOWFRAME)
         stage("c4:beginPaint");
@@ -2479,10 +2861,19 @@ extern "C" void WebCoreBrowserRenderFrame()
     double frameMs = (MonotonicTime::now() - tFrame0).milliseconds();
     if (frameMs >= 250) {
         char b[320];
-        snprintf(b, sizeof b, "SLOWFRAME frame=%u total=%.0fms | update=%.0f idle=%.0f flush=%.0f composite=%.0f (backing=%.0f paint=%.0f[begin=%.0f tree=%.0f end=%.0f] swap=%.0f)",
-            g_composeFrame, frameMs, frameUpdateMs, frameIdleMs, frameFlushMs, compositeMs,
-            frameBackingMs, framePaintMs, framePaintBeginMs, framePaintTreeMs, framePaintEndMs, swapMs);
+        // gap = time inside this frame that NO measured stage accounts for. The device log showed
+        // total=830ms against update+composite=247ms, and SKIPPED-COMPOSITE frames of 250ms with every
+        // stage reading zero -- i.e. the biggest stalls are somewhere we don't currently time at all.
+        // Print it explicitly so it stops hiding in the arithmetic, plus the display-list record cost
+        // (the half of raster that can never be moved off the main thread).
+        double gapMs = frameMs - (frameJsMs + frameForcedUpdateMs + frameUpdateMs + frameIdleMs + frameFlushMs + compositeMs);
+        snprintf(b, sizeof b, "SLOWFRAME frame=%u total=%.0fms | js=%.0f rupd=%.0f update=%.0f idle=%.0f flush=%.0f composite=%.0f (backing=%.0f paint=%.0f[begin=%.0f tree=%.0f end=%.0f] swap=%.0f) GAP=%.0f record=%.1f/%u",
+            g_composeFrame, frameMs, frameJsMs, frameForcedUpdateMs, frameUpdateMs, frameIdleMs, frameFlushMs, compositeMs,
+            frameBackingMs, framePaintMs, framePaintBeginMs, framePaintTreeMs, framePaintEndMs, swapMs,
+            gapMs, WebCore::g_texmapRecordMs, WebCore::g_texmapRecordCalls);
         portLog(b);
+        WebCore::g_texmapRecordMs = 0;
+        WebCore::g_texmapRecordCalls = 0;
         // When the backing phase is the slow part, break it down: invalidation source, raster vs upload,
         // tile/texture churn. g_bstatFrame was harvested right after updateBackingStoreIncludingSubLayers,
         // so it describes exactly this frame.
@@ -2550,6 +2941,18 @@ extern "C" void WebCoreBrowserRenderFrameSafe()
 // pixelStep * -deltaY), so a drag that should increase scroll offset by dy uses deltaY = -dy.
 // C++ objects (PlatformWheelEvent) live here — __try cannot coexist with values needing unwind, so
 // the SEH wrapper is the separate extern "C" function below (same split as tapImpl/keyDownUpImpl).
+// Panel DIP -> CSS px. XAML pointer coords/deltas arrive in the SwapChainPanel's DIP space; WebCore
+// wants CSS. physical = dip * g_panelDipScale; css = physical / g_deviceScale (the geometry scale).
+// Before I-15 the CSS viewport ~equalled the panel DIP size (412 vs 411) so callers passed DIPs straight
+// through as CSS; with the iPhone-SE 375 viewport that is ~10% off (taps landed low/right, scroll
+// over-travelled), hence this explicit conversion on every coordinate entering WebCore.
+static inline int dipToCss(int v)
+{
+    if (g_deviceScale <= 0.0)
+        return v;
+    return static_cast<int>(std::lround(v * g_panelDipScale / g_deviceScale));
+}
+
 static void scrollByImpl(int dx, int dy, int x, int y)
 {
     using namespace WebCore;
@@ -2572,6 +2975,10 @@ extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y)
 {
     if (!g_page)
         return;
+    // panel DIPs -> CSS, for both the finger position (hit-tests the scrollable area) and the delta
+    // (over-travelled by ~10% after the I-15 viewport change).
+    dx = dipToCss(dx); dy = dipToCss(dy); x = dipToCss(x); y = dipToCss(y);
+    g_lastScrollTime = MonotonicTime::now(); // I-18: hold off raster while the finger is moving
     // handleWheelEvent runs the synchronous scroll -> style/layout -> compositing-update path (the
     // cmplayer: layer-promotion churn). A fault or C++ throw down there (crashprobe showed a repeated
     // 0xE06D7363 from a WinRT graphics call during layer rebuild) had NO handler on this path and,
@@ -2598,6 +3005,22 @@ extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y)
 // we're near the AppContainer limit (High/OverLimit) — do the aggressive release + also let JSC know it
 // is under pressure so it GCs harder and grows its heap less. Must run on the main thread (the shell's
 // render/UI thread). This is the lever that stops the 290MB spike -> memory-manager thrash -> 60s hang.
+// How much memory a release could ACTUALLY reclaim, in KB: the WebKit-owned pools that
+// releaseMemory() frees (MemoryCache resources + the JSC heap). Everything else the app is holding --
+// the 139-250MB that shows up as "other" in the mempool line, i.e. the CRT/native heap, MediaFoundation
+// buffers, GPU tiles -- is untouched by a release, so firing one when these two are small is pure cost:
+// a stop-the-world full GC plus a wipe of decoded images and JIT code we then immediately regenerate.
+// Measured on device: 20+ releases in a session, 1398ms of stop-the-world GC, with jsHeap=3.6MB and
+// resCache=5.2MB at the time -- i.e. ~26MB reclaimable against 162MB in use.
+extern "C" unsigned long long WebCoreBrowserReclaimableKB()
+{
+    using namespace WebCore;
+    unsigned long long kb = MemoryCache::singleton().size() / 1024;
+    if (JSC::VM* vm = commonVMOrNull())
+        kb += static_cast<unsigned long long>(vm->heap.size()) / 1024;
+    return kb;
+}
+
 extern "C" void WebCoreBrowserReleaseMemory(int critical)
 {
     using namespace WebCore;
@@ -2686,6 +3109,7 @@ static void tapImpl(int x, int y)
 
 extern "C" void WebCoreBrowserTap(int x, int y)
 {
+    x = dipToCss(x); y = dipToCss(y); // panel DIPs -> CSS (I-15 viewport change)
     __try { tapImpl(x, y); }
     __except (rfCrashFilter(GetExceptionInformation())) { logKeyCrash("tap"); }
 }
@@ -2897,6 +3321,34 @@ extern "C" int WebCoreBrowserCanGoForward() { return (g_page && g_page->backForw
 extern "C" void WebCoreBrowserReload() { if (g_page) g_page->mainFrame().loader().reload(); }
 extern "C" void WebCoreBrowserStop() { if (g_page) { g_page->mainFrame().loader().stopAllLoaders(); WebCoreBrowserKeepCompositing(8); } }
 extern "C" int WebCoreBrowserIsLoading() { return (g_loaderClient && !g_loaderClient->loadComplete()) ? 1 : 0; }
+
+// Persist JSC's bytecode cache to disk.
+//
+// WHY THIS EXISTS: the disk cache was effectively write-only-on-eviction. commitCachedBytecode() -- the
+// only function that touches disk -- is reachable from writeCodeBlock(), whose callers are
+// CodeCache::write(VM&) (never called anywhere in WebCore or this port; only jsc.cpp, the standalone
+// shell we do not build) and CodeCacheMap::pruneSlowCase(). So a script that stayed resident until the
+// app was killed was NEVER persisted, and CodeCacheMap grows its capacity adaptively under high
+// eviction -- meaning the JS-heavy pages we most want cached evicted least and therefore persisted
+// least. The device log confirmed it: "bcache: hit=0 miss=25 (0%)" with writeKB=1869, i.e. we were
+// writing only the trickle that happened to be evicted and hitting none of it on the next run.
+//
+// Called on navigation-complete and on app suspend, which is when the working set of scripts for a page
+// is known and the main thread is otherwise idle.
+extern "C" void WebCoreBytecodeCacheFlush()
+{
+    JSC::VM* vm = commonVMOrNull();
+    if (!vm)
+        return;
+    MonotonicTime t0 = MonotonicTime::now();
+    {
+        JSC::JSLockHolder locker(vm);
+        JSC::flushBytecodeCacheToDisk(*vm);
+    }
+    char b[96];
+    snprintf(b, sizeof b, "bcache: flush to disk took %.0fms", (MonotonicTime::now() - t0).milliseconds());
+    portLog(b);
+}
 extern "C" double WebCoreBrowserProgress() { return g_page ? g_page->progress().estimatedProgress() : 0.0; }
 
 extern "C" const char* WebCoreBrowserCurrentURL()

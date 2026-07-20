@@ -3,3 +3,4 @@
 *.appxbundle
 build-*/
 _install/
+*.bak

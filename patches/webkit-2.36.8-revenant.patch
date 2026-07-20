@@ -892,6 +892,42 @@ index f5dcb879c1..0574c2fc79 100644
  }
  
  class Encoder {
+diff --git a/Source/JavaScriptCore/runtime/Completion.cpp b/Source/JavaScriptCore/runtime/Completion.cpp
+index 3fbf1d8d33..15e1ef79d6 100644
+--- a/Source/JavaScriptCore/runtime/Completion.cpp
++++ b/Source/JavaScriptCore/runtime/Completion.cpp
+@@ -266,4 +266,13 @@ JSInternalPromise* importModule(JSGlobalObject* globalObject, const Identifier&
+     return globalObject->moduleLoader()->requestImportModule(globalObject, moduleKey, parameters, scriptFetcher);
+ }
+ 
++void flushBytecodeCacheToDisk(VM& vm)
++{
++    // CodeCache::write() walks the in-memory source-code map and commits each entry to the on-disk
++    // cache. Upstream only ever calls it from jsc.cpp (the standalone shell), so in an embedder the
++    // disk cache is written solely as a side effect of eviction -- see the note in Completion.h.
++    if (CodeCache* cache = vm.codeCache())
++        cache->write(vm);
++}
++
+ } // namespace JSC
+diff --git a/Source/JavaScriptCore/runtime/Completion.h b/Source/JavaScriptCore/runtime/Completion.h
+index 5698a85797..d619d95cba 100644
+--- a/Source/JavaScriptCore/runtime/Completion.h
++++ b/Source/JavaScriptCore/runtime/Completion.h
+@@ -77,4 +77,13 @@ JS_EXPORT_PRIVATE JSValue linkAndEvaluateModule(JSGlobalObject*, const Identifie
+ 
+ JS_EXPORT_PRIVATE JSInternalPromise* importModule(JSGlobalObject*, const Identifier& moduleKey, JSValue parameters, JSValue scriptFetcher);
+ 
++// Persist the VM's compiled-bytecode cache to the on-disk cache configured via
++// VM::setBytecodeCacheDirectory. Exposed here rather than requiring callers to include CodeCache.h,
++// which drags in SourceCodeKey.h and friends that are not exported outside JavaScriptCore.
++//
++// Needed because the disk cache is otherwise written ONLY when an entry is evicted from the in-memory
++// CodeCacheMap (commitCachedBytecode is reachable only via CodeCacheMap::pruneSlowCase), so scripts
++// that stay resident until process exit are never persisted at all.
++JS_EXPORT_PRIVATE void flushBytecodeCacheToDisk(VM&);
++
+ } // namespace JSC
 diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
 index 81a5c90965..a0472d3a81 100644
 --- a/Source/JavaScriptCore/runtime/Options.cpp
@@ -2472,6 +2508,40 @@ index db85f5062b..9e8bd5776d 100644
  #else
  #error "This configuration doesn't have a strong source of randomness."
  // WARNING: When adding new sources of OS randomness, the randomness must
+diff --git a/Source/WTF/wtf/RunLoop.cpp b/Source/WTF/wtf/RunLoop.cpp
+index 89736eb6b4..e6a5557ac5 100644
+--- a/Source/WTF/wtf/RunLoop.cpp
++++ b/Source/WTF/wtf/RunLoop.cpp
+@@ -109,6 +109,12 @@ bool RunLoop::isMain()
+     return runLoopHolder().isSet() && s_mainRunLoop == &RunLoop::current();
+ }
+ 
++bool RunLoop::hasPendingWork()
++{
++    Locker locker { m_nextIterationLock };
++    return !m_nextIteration.isEmpty();
++}
++
+ void RunLoop::performWork()
+ {
+     bool didSuspendFunctions = false;
+diff --git a/Source/WTF/wtf/RunLoop.h b/Source/WTF/wtf/RunLoop.h
+index 714bcdbaa6..3b8d3d7c59 100644
+--- a/Source/WTF/wtf/RunLoop.h
++++ b/Source/WTF/wtf/RunLoop.h
+@@ -86,6 +86,12 @@ public:
+ 
+     WTF_EXPORT_PRIVATE void dispatch(Function<void()>&&) final;
+     WTF_EXPORT_PRIVATE void dispatchAfter(Seconds, Function<void()>&&);
++
++    // True if work was dispatched that the last performWork() did not pick up. performWork snapshots
++    // the queue on entry, so anything dispatched DURING a pass lands here and would otherwise wait for
++    // the next iterate(). The UWP driver polls this to drain a resource's dispatch chain within one
++    // frame instead of one link per frame (see the bounded loop in WebCoreDriver.cpp).
++    WTF_EXPORT_PRIVATE bool hasPendingWork();
+ #if USE(COCOA_EVENT_LOOP)
+     WTF_EXPORT_PRIVATE static void dispatch(const SchedulePairHashSet&, Function<void()>&&);
+ #endif
 diff --git a/Source/WTF/wtf/SaturatedArithmetic.h b/Source/WTF/wtf/SaturatedArithmetic.h
 index 579b5b85c8..076db2ca87 100644
 --- a/Source/WTF/wtf/SaturatedArithmetic.h
@@ -5894,13 +5964,16 @@ index f737ab8fa0..7504cc3b1f 100644
      }
  
 diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp b/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
-index e24493b25d..76ad61ecb6 100644
+index e24493b25d..5dfb7efcdf 100644
 --- a/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/BitmapTexture.cpp
-@@ -32,15 +32,27 @@
+@@ -32,15 +32,73 @@
  #include "ImageBuffer.h"
  #include "TextureMapper.h"
  
++#include "DisplayList.h"
++#include "DisplayListReplayer.h"
++
 +#include <wtf/MonotonicTime.h>
 +
  namespace WebCore {
@@ -5912,6 +5985,49 @@ index e24493b25d..76ad61ecb6 100644
 +extern double g_bsBackPaintMs;
 +extern double g_bsBackCopyMs;
 +extern unsigned g_bsBackCalls;
++
++// PHASE B (B1): raster a tile by REPLAYING a display list recorded earlier this frame, instead of
++// walking the live render tree per tile. Coordinate setup is deliberately identical to the direct-paint
++// path below -- same ImageBuffer, same device-scale + translate -- so output should be pixel-identical;
++// the only difference is where the drawing commands come from. Replay reads no WebCore render objects,
++// which is what makes it movable to worker threads in B2.
++void BitmapTexture::updateContentsFromDisplayList(const DisplayList::DisplayList& displayList, const IntRect& targetRect, const IntPoint& offset, float scale)
++{
++    MonotonicTime rasterStart = MonotonicTime::now();
++    auto imageBuffer = ImageBuffer::create(targetRect.size(), RenderingMode::Unaccelerated, 1, DestinationColorSpace::SRGB(), PixelFormat::BGRA8);
++    if (!imageBuffer)
++        return;
++    MonotonicTime afterCreate = MonotonicTime::now();
++
++    GraphicsContext& context = imageBuffer->context();
++    context.setImageInterpolationQuality(InterpolationQuality::Default);
++    context.setTextDrawingMode(TextDrawingMode::Fill);
++
++    IntRect sourceRect(targetRect);
++    sourceRect.setLocation(offset);
++    sourceRect.scale(1 / scale);
++    context.applyDeviceScaleFactor(scale);
++    context.translate(-sourceRect.x(), -sourceRect.y());
++
++    MonotonicTime beforePaint = MonotonicTime::now();
++    DisplayList::Replayer replayer(context, displayList);
++    replayer.replay(sourceRect);
++    MonotonicTime afterPaint = MonotonicTime::now();
++
++    RefPtr<Image> image = imageBuffer->copyImage(DontCopyBackingStore);
++    if (!image)
++        return;
++
++    MonotonicTime rasterEnd = MonotonicTime::now();
++    g_bsRasterMs += (rasterEnd - rasterStart).milliseconds();
++    g_bsRasterPx += static_cast<unsigned long long>(targetRect.width()) * targetRect.height();
++    g_bsBackCreateMs += (afterCreate - rasterStart).milliseconds();
++    g_bsBackPaintMs += (afterPaint - beforePaint).milliseconds();
++    g_bsBackCopyMs += (rasterEnd - afterPaint).milliseconds();
++    g_bsBackCalls++;
++
++    updateContents(image.get(), targetRect, IntPoint());
++}
 +
  void BitmapTexture::updateContents(GraphicsLayer* sourceLayer, const IntRect& targetRect, const IntPoint& offset, float scale)
  {
@@ -5925,7 +6041,7 @@ index e24493b25d..76ad61ecb6 100644
  
      GraphicsContext& context = imageBuffer->context();
      context.setImageInterpolationQuality(InterpolationQuality::Default);
-@@ -52,12 +64,24 @@ void BitmapTexture::updateContents(GraphicsLayer* sourceLayer, const IntRect& ta
+@@ -52,12 +110,24 @@ void BitmapTexture::updateContents(GraphicsLayer* sourceLayer, const IntRect& ta
      context.applyDeviceScaleFactor(scale);
      context.translate(-sourceRect.x(), -sourceRect.y());
  
@@ -5950,6 +6066,30 @@ index e24493b25d..76ad61ecb6 100644
      updateContents(image.get(), targetRect, IntPoint());
  }
  
+diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTexture.h b/Source/WebCore/platform/graphics/texmap/BitmapTexture.h
+index 01d6a6c3bf..7102765f09 100644
+--- a/Source/WebCore/platform/graphics/texmap/BitmapTexture.h
++++ b/Source/WebCore/platform/graphics/texmap/BitmapTexture.h
+@@ -39,6 +39,7 @@ class FilterOperations;
+ class GraphicsLayer;
+ class Image;
+ class TextureMapper;
++namespace DisplayList { class DisplayList; }
+ 
+ // A 2D texture that can be the target of software or GL rendering.
+ class BitmapTexture : public RefCounted<BitmapTexture> {
+@@ -61,6 +62,11 @@ public:
+     virtual IntSize size() const = 0;
+     virtual void updateContents(Image*, const IntRect&, const IntPoint& offset) = 0;
+     void updateContents(GraphicsLayer*, const IntRect& target, const IntPoint& offset, float scale = 1);
++    // PHASE B: raster from a pre-recorded display list instead of walking the live render tree.
++    // Recording happens ONCE per frame on the main thread (cheap, no pixels); this replays it, which is
++    // where the actual cairo work is. Replay touches no WebCore render objects, so it is the step that
++    // can eventually move to worker threads -- that is the whole point of the display-list detour.
++    void updateContentsFromDisplayList(const DisplayList::DisplayList&, const IntRect& target, const IntPoint& offset, float scale);
+     virtual void updateContents(const void*, const IntRect& target, const IntPoint& offset, int bytesPerLine) = 0;
+     virtual bool isValid() const = 0;
+     inline Flags flags() const { return m_flags; }
 diff --git a/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp b/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp
 index 91e8ea8014..a5b5023887 100644
 --- a/Source/WebCore/platform/graphics/texmap/BitmapTextureGL.cpp
@@ -6294,7 +6434,7 @@ index 5f1476fd45..1241d7c558 100644
  // When converting a rounded rectangle to an array of floats, we need 12 elements. So the size of the array
  // required to contain the 10 rectangles is 12 * 10 = 120.
 diff --git a/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp b/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
-index f237be7458..04edc3c41a 100644
+index f237be7458..e7d261eae1 100644
 --- a/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/GraphicsLayerTextureMapper.cpp
 @@ -25,6 +25,11 @@
@@ -6402,7 +6542,7 @@ index f237be7458..04edc3c41a 100644
      m_needsDisplayRect.unite(rect);
      notifyChange(DisplayChange);
      addRepaintRect(rect);
-@@ -553,20 +612,124 @@ void GraphicsLayerTextureMapper::updateBackingStoreIncludingSubLayers(TextureMap
+@@ -553,20 +612,144 @@ void GraphicsLayerTextureMapper::updateBackingStoreIncludingSubLayers(TextureMap
          downcast<GraphicsLayerTextureMapper>(child.get()).updateBackingStoreIncludingSubLayers(textureMapper);
  }
  
@@ -6430,6 +6570,26 @@ index f237be7458..04edc3c41a 100644
 +    if (!s_texmapClipEnabled)
 +        return false;
 +    out = s_texmapVisibleRect;
++    return true;
++}
++
++// The REAL viewport (not the retained keep-rect above). The tile scheduler sorts raster order by
++// distance from this, so it must be where the user is actually looking. Feeding it the keep-rect
++// instead put the focus at the CENTRE of the retained window -- ~2795 CSS px down the page while the
++// user sat at scrollY=0 -- so the middle/bottom of the page rastered before the top. Keep the two
++// concepts separate: keep-rect = what we RETAIN as tiles, focus rect = what we PRIORITISE.
++static IntRect s_texmapFocusRect;
++static bool s_texmapFocusValid = false;
++void setTexmapFocusRect(int x, int y, int w, int h)
++{
++    s_texmapFocusRect = IntRect(x, y, w, h);
++    s_texmapFocusValid = (w > 0 && h > 0);
++}
++bool texmapFocusRect(IntRect& out)
++{
++    if (!s_texmapFocusValid)
++        return false;
++    out = s_texmapFocusRect;
 +    return true;
 +}
 +
@@ -6955,7 +7115,7 @@ index aa070b1748..eb85f3353c 100644
      GLuint m_vertexShader;
      GLuint m_fragmentShader;
 diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperTile.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperTile.cpp
-index c902dd5a00..0f30aa3886 100644
+index c902dd5a00..b9725db992 100644
 --- a/Source/WebCore/platform/graphics/texmap/TextureMapperTile.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/TextureMapperTile.cpp
 @@ -27,9 +27,15 @@ namespace WebCore {
@@ -6994,7 +7154,7 @@ index c902dd5a00..0f30aa3886 100644
      targetRect.intersect(dirtyRect);
      if (targetRect.isEmpty())
          return;
-@@ -61,7 +68,7 @@ void TextureMapperTile::updateContents(TextureMapper& textureMapper, GraphicsLay
+@@ -61,12 +68,33 @@ void TextureMapperTile::updateContents(TextureMapper& textureMapper, GraphicsLay
  
      if (!m_texture) {
          m_texture = textureMapper.createTexture();
@@ -7003,15 +7163,112 @@ index c902dd5a00..0f30aa3886 100644
      }
  
      m_texture->updateContents(sourceLayer, targetRect, sourceOffset, scale);
+ }
+ 
++// PHASE B: same geometry as the GraphicsLayer overload above, but the drawing commands come from a
++// display list recorded once for the frame rather than from a live render-tree walk per tile.
++void TextureMapperTile::updateContentsFromDisplayList(TextureMapper& textureMapper, const DisplayList::DisplayList& displayList, const IntRect& dirtyRect, float scale)
++{
++    IntRect tileRect = enclosingIntRect(m_rect);
++    IntRect targetRect = tileRect;
++    targetRect.intersect(dirtyRect);
++    if (targetRect.isEmpty())
++        return;
++    IntPoint sourceOffset = targetRect.location();
++
++    targetRect.move(-m_rect.x(), -m_rect.y());
++
++    if (!m_texture) {
++        m_texture = textureMapper.createTexture();
++        m_texture->reset(tileRect.size(), BitmapTexture::SupportsAlpha);
++    }
++
++    m_texture->updateContentsFromDisplayList(displayList, targetRect, sourceOffset, scale);
++}
++
+ void TextureMapperTile::paint(TextureMapper& textureMapper, const TransformationMatrix& transform, float opacity, const unsigned exposedEdges)
+ {
+     if (texture().get())
+diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperTile.h b/Source/WebCore/platform/graphics/texmap/TextureMapperTile.h
+index 2f4d89fbb5..89686bc03b 100644
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperTile.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperTile.h
+@@ -28,6 +28,7 @@
+ namespace WebCore {
+ 
+ class GraphicsLayer;
++namespace DisplayList { class DisplayList; }
+ 
+ class TextureMapperTile {
+ public:
+@@ -38,9 +39,39 @@ public:
+ 
+     void updateContents(TextureMapper&, Image*, const IntRect&);
+     void updateContents(TextureMapper&, GraphicsLayer*, const IntRect&, float scale = 1);
++    // PHASE B: raster this tile by replaying a display list recorded once for the whole frame.
++    void updateContentsFromDisplayList(TextureMapper&, const DisplayList::DisplayList&, const IntRect& dirtyRect, float scale);
+     WEBCORE_EXPORT virtual void paint(TextureMapper&, const TransformationMatrix&, float, const unsigned exposedEdges);
+     virtual ~TextureMapperTile() = default;
+ 
++    // INCREMENTAL RASTER (tile scheduler). The backing store no longer rasters every dirty tile in one
++    // synchronous pass -- that pass is what produced multi-second main-thread stalls (watchdog kills on
++    // tall pages) and, when we shrank it to a viewport band to stay affordable, white bands on flick and
++    // on jump-scroll. Instead each tile carries its OWN pending dirty region, the store rasters tiles
++    // nearest the viewport first under a per-frame time budget, and whatever doesn't fit stays dirty for
++    // the next frame. So the tile must remember what it owes: the layer clears m_needsDisplayRect after
++    // the pass, so a skipped tile would otherwise silently lose its invalidation and stay stale forever.
++    void markDirty(const IntRect& r)
++    {
++        IntRect clipped = r;
++        clipped.intersect(enclosingIntRect(m_rect));
++        if (clipped.isEmpty())
++            return;
++        if (m_dirtyRect.isEmpty())
++            m_dirtyRect = clipped;
++        else
++            m_dirtyRect.unite(clipped);
++    }
++    void markFullyDirty() { m_dirtyRect = enclosingIntRect(m_rect); }
++    inline bool isDirty() const { return !m_dirtyRect.isEmpty(); }
++    inline IntRect dirtyRect() const { return m_dirtyRect; }
++    inline void clearDirty() { m_dirtyRect = IntRect(); }
++    // False until this tile has actually been rastered at least once. A deferred tile can reach paint()
++    // before its first raster, and its texture contents are undefined at that point -- drawing it would
++    // show garbage. paintToTextureMapper fills these with the document background colour instead.
++    inline bool hasContent() const { return m_hasContent; }
++    inline void setHasContent(bool v) { m_hasContent = v; }
++
+     explicit TextureMapperTile(const FloatRect& rect)
+         : m_rect(rect)
+     {
+@@ -49,6 +80,8 @@ protected:
+     RefPtr<BitmapTexture> m_texture;
+ private:
+     FloatRect m_rect;
++    IntRect m_dirtyRect;          // pending raster debt, in scaled/contents coords
++    bool m_hasContent { false };  // has been rastered at least once (texture contents defined)
+ };
+ 
+ }
 diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
-index aa8c49b2d7..b5e262a313 100644
+index aa8c49b2d7..7e61e9e15b 100644
 --- a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
 +++ b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.cpp
-@@ -24,11 +24,34 @@
+@@ -21,14 +21,69 @@
+ 
+ #include "TextureMapperTiledBackingStore.h"
+ 
++#include "DisplayListRecorderImpl.h"
++#include "GraphicsContext.h"
++#include "GraphicsLayer.h"
  #include "ImageBuffer.h"
  #include "ImageObserver.h"
++#include "InMemoryDisplayList.h"
  #include "TextureMapper.h"
++#include <algorithm>
++#include <wtf/StdLibExtras.h>
 +#include <wtf/HashMap.h>
++#include <wtf/MonotonicTime.h>
 +#include <wtf/NeverDestroyed.h>
 +
 +namespace WebCorePort { void portLog(const char*); }
@@ -7034,15 +7291,58 @@ index aa8c49b2d7..b5e262a313 100644
 +// Defined in GraphicsLayerTextureMapper.cpp: the driver-supplied visible content band (CSS px, layer
 +// coords). Used to allocate GPU tiles ONLY for what's on screen.
 +bool texmapVisibleRectForTiling(IntRect&);
++// The real viewport, for raster PRIORITY (see the sort in updateContents).
++bool texmapFocusRect(IntRect&);
 +
 +// bstat counters (defined in GraphicsLayerTextureMapper.cpp; see the block comment there).
 +extern unsigned g_bsRetile, g_bsTilesCreated, g_bsTilesRecycled, g_bsTilesRemoved, g_bsScaleNuke;
 +extern float g_bsScaleMin, g_bsScaleMax;
 +
++// TILE SCHEDULER state. The budget is the hard guarantee that no single frame can stall the main
++// thread long enough for the W10M watchdog to kill us; ~10ms leaves room for composite+swap inside a
++// frame while still making real raster progress every frame.
++double g_texmapRasterBudgetMs = 10.0;
++unsigned g_texmapPendingTiles = 0;          // tiles still owing raster (summed over stores, per frame)
++unsigned g_texmapTilesRasteredLastFrame = 0;
++// PHASE B: display-list raster. Flag so the direct-paint path stays one toggle away on-device.
++// OFF by default: B1 crashed on the rule34 search page (process killed, no SEH marker, memory only
++// 137MB/390MB so not an OOM). Prime suspect is DrawGlyphsRecorder deconstruction on WinCairo, which the
++// recorder does by default and which this port has never exercised. The code stays in and one flag
++// flips it back on for the next attempt.
++bool g_texmapUseDisplayList = false;
++double g_texmapRecordMs = 0;     // main-thread recording cost (the part that CANNOT be parallelised)
++unsigned g_texmapRecordCalls = 0;
++
++static Color& placeholderColorStorage()
++{
++    static NeverDestroyed<Color> color { Color::white };
++    return color.get();
++}
++void setTexmapPlaceholderColor(const Color& c) { placeholderColorStorage() = c; }
++static const Color& texmapPlaceholderColor() { return placeholderColorStorage(); }
++
  void TextureMapperTiledBackingStore::updateContentsFromImageIfNeeded(TextureMapper& textureMapper)
  {
      if (!m_image)
-@@ -73,25 +96,83 @@ void TextureMapperTiledBackingStore::updateContentsScale(float scale)
+@@ -50,8 +105,16 @@ void TextureMapperTiledBackingStore::paintToTextureMapper(TextureMapper& texture
+ {
+     updateContentsFromImageIfNeeded(textureMapper);
+     TransformationMatrix adjustedTransform = transform * adjustedTransformForRect(targetRect);
+-    for (auto& tile : m_tiles)
++    for (auto& tile : m_tiles) {
++        // A tile the scheduler hasn't reached yet has an undefined texture (fresh or reset), so drawing
++        // it would show garbage. Fill with the document background instead -- on a dark page that reads
++        // as "content still coming", where white reads as "the browser broke".
++        if (!tile.hasContent() && !m_image) {
++            textureMapper.drawSolidColor(tile.rect(), adjustedTransform, texmapPlaceholderColor(), false);
++            continue;
++        }
+         tile.paint(textureMapper, adjustedTransform, opacity, calculateExposedTileEdges(rect(), tile.rect()));
++    }
+ }
+ 
+ void TextureMapperTiledBackingStore::drawBorder(TextureMapper& textureMapper, const Color& borderColor, float borderWidth, const FloatRect& targetRect, const TransformationMatrix& transform)
+@@ -73,25 +136,93 @@ void TextureMapperTiledBackingStore::updateContentsScale(float scale)
      if (m_contentsScale == scale)
          return;
  
@@ -7111,13 +7411,23 @@ index aa8c49b2d7..b5e262a313 100644
      if (!m_image)
          scaledSize.scale(m_contentsScale);
  
-+    // With gating on, use a finer tile grid so the band maps to a few small textures instead of one
-+    // giant maxTextureSize (up to 4096) tile that mostly covers off-screen content.
++    // Tile granularity IS the scheduler's granularity: raster is per-tile and all-or-nothing, so the
++    // per-frame budget can only bound work if a single tile fits inside it. Ungated we used to fall back
++    // to maxTextureSize (up to 4096), making a 750x10406 device-px page just ~3 tiles -- one tile = ~3M
++    // px = a measured 78ms raster, and only 3 buckets to prioritise between.
++    //
++    // Size from MEASURED throughput, not a guess. The device log reports raster=296ms/1.5Mpx on a
++    // text-heavy page, i.e. ~5K px/ms -- so a 1024x1024 tile (1M px) is ~200ms, which blows even the
++    // idle budget on a single tile, and 512x512 (262K px) is ~52ms. (An earlier ~38K px/ms estimate,
++    // inferred from a 78ms sample that turned out to be a partial dirty rect, was ~7x too optimistic
++    // and is what made 1024 look affordable.) 512 keeps one tile inside a couple of 30fps frames and
++    // gives the scheduler enough tiles to prioritise between. Cost: ~2 columns over our 750px-wide page
++    // and more draw calls, which is the trade for responsiveness on a weak GPU.
++    // NOTE: raster cost is content-dependent (glyphs/images dominate), not purely area-proportional, so
++    // treat these as order-of-magnitude, not exact.
 +    IntSize tileSize = tileSizeIn;
-+    if (gateToVisible) {
-+        tileSize.setWidth(std::min(tileSize.width(), 1024));
-+        tileSize.setHeight(std::min(tileSize.height(), 1024));
-+    }
++    tileSize.setWidth(std::min(tileSize.width(), 512));
++    tileSize.setHeight(std::min(tileSize.height(), 512));
 +
      Vector<FloatRect> tileRectsToAdd;
      Vector<int> tileIndicesToRemove;
@@ -7128,7 +7438,7 @@ index aa8c49b2d7..b5e262a313 100644
  
      // This method recycles tiles. We check which tiles we need to add, which to remove, and use as many
      // removable tiles as replacement for new tiles when possible.
-@@ -99,6 +180,8 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -99,6 +230,8 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
          for (float x = 0; x < scaledSize.width(); x += tileSize.width()) {
              FloatRect tileRect(x, y, tileSize.width(), tileSize.height());
              tileRect.intersect(rect());
@@ -7137,7 +7447,7 @@ index aa8c49b2d7..b5e262a313 100644
              tileRectsToAdd.append(tileRect);
          }
      }
-@@ -124,6 +207,13 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -124,6 +257,13 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
              tileIndicesToRemove.append(i);
      }
  
@@ -7151,7 +7461,7 @@ index aa8c49b2d7..b5e262a313 100644
      // Recycle removable tiles to be used for newly requested tiles.
      for (auto& rect : tileRectsToAdd) {
          if (!tileIndicesToRemove.isEmpty()) {
-@@ -131,6 +221,7 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
+@@ -131,22 +271,62 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
              TextureMapperTile& tile = m_tiles[tileIndicesToRemove.last()];
              tileIndicesToRemove.removeLast();
              tile.setRect(rect);
@@ -7159,7 +7469,12 @@ index aa8c49b2d7..b5e262a313 100644
  
              if (tile.texture())
                  tile.texture()->reset(enclosingIntRect(tile.rect()).size(), hasAlpha ? BitmapTexture::SupportsAlpha : 0);
-@@ -138,17 +229,51 @@ void TextureMapperTiledBackingStore::createOrDestroyTilesIfNeeded(const FloatSiz
++            // Recycled onto a new region: its texture was just reset, so the contents are undefined and
++            // the whole tile is owed. Without this the scheduler could display the stale/garbage texture
++            // of the tile's PREVIOUS location before getting around to rastering it here.
++            tile.setHasContent(false);
++            tile.markFullyDirty();
+             continue;
          }
  
          m_tiles.append(TextureMapperTile(rect));
@@ -7197,23 +7512,21 @@ index aa8c49b2d7..b5e262a313 100644
 +                bytes / 1024, gateToVisible ? 1 : 0, g_texmapTileBytes / 1024, g_texmapStoreCount);
 +            WebCorePort::portLog(b);
 +        }
-     }
- }
- 
++    }
++}
++
 +TextureMapperTiledBackingStore::~TextureMapperTiledBackingStore()
 +{
 +    auto& map = tileBytesByStore();
 +    if (auto it = map.find(this); it != map.end()) {
 +        g_texmapTileBytes -= it->value;
 +        map.remove(it);
-+    }
+     }
 +    g_texmapStoreCount = map.size();
-+}
-+
+ }
+ 
  void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper, Image* image, const FloatSize& totalSize, const IntRect& dirtyRect)
- {
-     createOrDestroyTilesIfNeeded(totalSize, textureMapper.maxTextureSize(), !image->currentFrameKnownToBeOpaque());
-@@ -159,8 +284,16 @@ void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper
+@@ -159,8 +339,126 @@ void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper
  void TextureMapperTiledBackingStore::updateContents(TextureMapper& textureMapper, GraphicsLayer* sourceLayer, const FloatSize& totalSize, const IntRect& dirtyRect)
  {
      createOrDestroyTilesIfNeeded(totalSize, textureMapper.maxTextureSize(), true);
@@ -7225,14 +7538,124 @@ index aa8c49b2d7..b5e262a313 100644
 +        effectiveDirty.unite(enclosingIntRect(m_newTilesDirtyRect));
 +        m_newTilesDirtyRect = FloatRect();
 +    }
++
++    // 1) Record the debt. Every tile the invalidation touches remembers its own share, so nothing is
++    //    lost when we don't get to it this frame.
      for (auto& tile : m_tiles)
 -        tile.updateContents(textureMapper, sourceLayer, dirtyRect, m_contentsScale);
-+        tile.updateContents(textureMapper, sourceLayer, effectiveDirty, m_contentsScale);
++        tile.markDirty(effectiveDirty);
++
++    // 2) Order by distance from the viewport. The whole point: what the user is LOOKING at rasters
++    //    first, and a jump-scroll re-prioritises instantly (the visible rect moved, so the tiles at the
++    //    destination are now nearest and go to the front) instead of waiting out a settle timer or a
++    //    full-band pass. Falls back to document order when the driver hasn't given us a viewport.
++    // Priority is measured from the REAL viewport, not the retained keep-rect: the keep-rect's centre
++    // sits in the middle of the retained window, which at the top of a page is thousands of CSS px below
++    // what the user is looking at (that inverted the raster order -- bottom filled before top).
++    IntRect focusRect;
++    bool haveVisible = texmapFocusRect(focusRect);
++    if (!haveVisible)
++        haveVisible = texmapVisibleRectForTiling(focusRect); // fallback: better than nothing
++    FloatRect scaledVisible(focusRect);
++    if (haveVisible)
++        scaledVisible.scale(m_contentsScale);
++    FloatPoint focus = haveVisible ? FloatPoint(scaledVisible.center()) : FloatPoint(rect().center());
++
++    Vector<unsigned> order;
++    order.reserveInitialCapacity(m_tiles.size());
++    for (unsigned i = 0; i < m_tiles.size(); ++i) {
++        if (m_tiles[i].isDirty())
++            order.append(i);
++    }
++    if (order.isEmpty())
++        return;
++
++    std::sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
++        auto dist = [&](unsigned i) -> float {
++            FloatPoint c = m_tiles[i].rect().center();
++            // Visible tiles sort ahead of everything; beyond that, nearest-first ring outward.
++            float bias = (haveVisible && m_tiles[i].rect().intersects(scaledVisible)) ? -1e9f : 0.f;
++            float dx = c.x() - focus.x(), dy = c.y() - focus.y();
++            return bias + dx * dx + dy * dy;
++        };
++        return dist(a) < dist(b);
++    });
++
++    // 3) Raster under a per-frame time budget. This is the property that makes the whole thing safe:
++    //    the main thread can never be held for more than one frame's worth of cairo, so the W10M
++    //    watchdog cannot fire no matter how tall or how heavy the page is. Whatever we skip stays dirty
++    //    and is picked up next frame, nearest-first, so the page converges to fully rastered while idle
++    //    -- which is what makes a later jump-scroll land on already-painted content.
++    //    ALWAYS raster at least one tile, or a budget that's already blown starves the scheduler.
++    MonotonicTime start = MonotonicTime::now();
++
++    // PHASE B (B1): record the frame's drawing ONCE, then replay it per tile. Recording walks the live
++    // render tree (main thread only, no pixels); replay is the cairo work and touches no render objects,
++    // which is what lets B2 move it to worker threads. Record cost is paid once regardless of tile count,
++    // so this should already be a small win on multi-tile frames even before threading.
++    // Kept behind a flag so we can A/B against the direct-paint path on-device rather than assume.
++    std::unique_ptr<DisplayList::InMemoryDisplayList> recorded;
++    double recordMs = 0;
++    if (g_texmapUseDisplayList && order.size() > 1) {
++        // Union of what we're about to raster, in source (CSS) coords -- the recording must cover every
++        // tile that will replay it.
++        IntRect unionScaled;
++        for (unsigned idx : order) {
++            if (unionScaled.isEmpty())
++                unionScaled = m_tiles[idx].dirtyRect();
++            else
++                unionScaled.unite(m_tiles[idx].dirtyRect());
++        }
++        FloatRect unionSource(unionScaled);
++        unionSource.scale(1 / m_contentsScale);
++
++        MonotonicTime recStart = MonotonicTime::now();
++        recorded = makeUnique<DisplayList::InMemoryDisplayList>();
++        {
++            GraphicsContextState state;
++            DisplayList::RecorderImpl recorder(*recorded, state, unionSource, AffineTransform());
++            sourceLayer->paintGraphicsLayerContents(recorder, enclosingIntRect(unionSource));
++        }
++        recordMs = (MonotonicTime::now() - recStart).milliseconds();
++        g_texmapRecordMs += recordMs;
++        g_texmapRecordCalls++;
++    }
++
++    unsigned done = 0;
++    for (unsigned idx : order) {
++        if (done && (MonotonicTime::now() - start).milliseconds() >= g_texmapRasterBudgetMs)
++            break;
++        TextureMapperTile& tile = m_tiles[idx];
++        if (recorded)
++            tile.updateContentsFromDisplayList(textureMapper, *recorded, tile.dirtyRect(), m_contentsScale);
++        else
++            tile.updateContents(textureMapper, sourceLayer, tile.dirtyRect(), m_contentsScale);
++        tile.clearDirty();
++        tile.setHasContent(true);
++        ++done;
++    }
++    g_texmapTilesRasteredLastFrame += done;
++
++    unsigned pending = 0;
++    for (auto& tile : m_tiles) {
++        if (tile.isDirty())
++            ++pending;
++    }
++    g_texmapPendingTiles += pending;
++}
++
++bool TextureMapperTiledBackingStore::hasPendingTiles() const
++{
++    for (auto& tile : m_tiles) {
++        if (tile.isDirty())
++            return true;
++    }
++    return false;
  }
  
  } // namespace WebCore
 diff --git a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.h b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.h
-index a6f9440e73..603e168d5c 100644
+index a6f9440e73..e2ceb6d465 100644
 --- a/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.h
 +++ b/Source/WebCore/platform/graphics/texmap/TextureMapperTiledBackingStore.h
 @@ -34,7 +34,9 @@ class TextureMapper;
@@ -7246,7 +7669,18 @@ index a6f9440e73..603e168d5c 100644
  
      void paintToTextureMapper(TextureMapper&, const FloatRect&, const TransformationMatrix&, float) override;
      void drawBorder(TextureMapper&, const Color&, float borderWidth, const FloatRect&, const TransformationMatrix&) override;
-@@ -64,6 +66,11 @@ private:
+@@ -46,6 +48,10 @@ public:
+ 
+     void setContentsToImage(Image* image) { m_image = image; }
+ 
++    // True while this store still owes raster work (tiles left dirty when the frame budget ran out).
++    // The driver polls the global counter below to keep frames coming until every tile has caught up.
++    bool hasPendingTiles() const;
++
+ private:
+     TextureMapperTiledBackingStore() = default;
+ 
+@@ -64,8 +70,26 @@ private:
      RefPtr<Image> m_image;
      float m_contentsScale { 1 };
      bool m_isScaleDirty { false };
@@ -7257,7 +7691,22 @@ index a6f9440e73..603e168d5c 100644
 +    FloatRect m_newTilesDirtyRect;
  };
  
++// Per-frame CPU raster budget for the tile scheduler, and the count of tiles still owing raster across
++// all stores (driver keeps compositing while this is non-zero). Defined in the .cpp.
++extern double g_texmapRasterBudgetMs;
++extern unsigned g_texmapPendingTiles;
++extern unsigned g_texmapTilesRasteredLastFrame;
++// PHASE B: display-list raster toggle + recording cost (the non-parallelisable half).
++extern bool g_texmapUseDisplayList;
++extern double g_texmapRecordMs;
++extern unsigned g_texmapRecordCalls;
++// Colour drawn for tiles that haven't been rastered yet (document background, set by the driver each
++// frame). Beats white: on dark sites a white flash is the single most visible artifact we have.
++void setTexmapPlaceholderColor(const Color&);
++
  } // namespace WebCore
+ 
+ #endif
 diff --git a/Source/WebCore/platform/graphics/win/DIBPixelData.cpp b/Source/WebCore/platform/graphics/win/DIBPixelData.cpp
 index d8d6f565d9..56a46528ba 100644
 --- a/Source/WebCore/platform/graphics/win/DIBPixelData.cpp
@@ -8765,7 +9214,7 @@ index 033c912f3e..b9883d2008 100644
 +
 +#endif // USE(MEDIA_FOUNDATION)
 diff --git a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
-index 953df378ec..bf32601f0b 100644
+index 953df378ec..7d6e3facdd 100644
 --- a/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 +++ b/Source/WebCore/platform/graphics/win/MediaPlayerPrivateMediaFoundation.cpp
 @@ -25,56 +25,152 @@
@@ -8970,7 +9419,7 @@ index 953df378ec..bf32601f0b 100644
  }
  
  static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
-@@ -116,2888 +214,1522 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
+@@ -116,2888 +214,1531 @@ static const HashSet<String, ASCIICaseInsensitiveHash>& mimeTypeCache()
      if (cachedTypes.get().size() > 0)
          return cachedTypes;
  
@@ -9025,6 +9474,9 @@ index 953df378ec..bf32601f0b 100644
 +// Revenant per-device memory tier (0 = 1GB SD400/Adreno-305 device). Used to gate direct-<video>
 +// canPlayType to H.264/AAC on tier-0 (I-14). Defined in WebCoreDriver.cpp.
 +extern "C" unsigned WebCoreMemBudgetTier();
++// Defined in WebCoreDriver.cpp: records that a video frame just arrived (and how big it was), so the
++// tile scheduler can yield raster time to real playback. Called from the MediaFoundation worker thread.
++extern "C" void WebCoreNoteVideoFrameDelivered(int width, int height);
 +
 +bool mseCodecsUndecodable(const String& codecs)
 +{
@@ -12237,6 +12689,12 @@ index 953df378ec..bf32601f0b 100644
 -            return hr;
 +extern "C" void WebCoreMsePlayerFrame(void* playerCtx, const uint8_t* bgra, int width, int height, int stride)
 +{
++    // Timestamp + size every delivered video frame. The tile scheduler backs its raster budget off
++    // while a REAL video is presenting, so playback wins over how fast the page finishes painting.
++    // (This runs on a MediaFoundation worker thread, not the main thread -- the contention is for CPU
++    // and memory bandwidth on a 4-core A7, not for the thread itself. The size is passed so a tiny
++    // autoplaying ad thumbnail cannot throttle the whole page's raster.)
++    WebCoreNoteVideoFrameDelivered(width, height);
 +    if (playerCtx)
 +        static_cast<WebCore::MediaPlayerPrivateMediaFoundation*>(playerCtx)->onFrameServerFrame(bgra, width, height, stride);
 +}
@@ -14475,7 +14933,7 @@ index ce11c7d861..94d4931a12 100644
  }
  
 diff --git a/Source/WebCore/platform/network/curl/CurlCacheEntry.cpp b/Source/WebCore/platform/network/curl/CurlCacheEntry.cpp
-index 219bcde551..c624bf0a2f 100644
+index 219bcde551..3ad17a5ae8 100644
 --- a/Source/WebCore/platform/network/curl/CurlCacheEntry.cpp
 +++ b/Source/WebCore/platform/network/curl/CurlCacheEntry.cpp
 @@ -43,7 +43,7 @@
@@ -14487,7 +14945,52 @@ index 219bcde551..c624bf0a2f 100644
  #include <wtf/text/StringToIntegerConversion.h>
  
  namespace WebCore {
-@@ -215,16 +215,15 @@ void CurlCacheEntry::didFinishLoading()
+@@ -101,12 +101,31 @@ bool CurlCacheEntry::isCached()
+ 
+ bool CurlCacheEntry::saveCachedData(const uint8_t* data, size_t size)
+ {
+-    if (!openContentFile())
+-        return false;
+-
+-    // Append
+-    FileSystem::writeToFile(m_contentFile, data, size);
++    // BUFFER, don't write per chunk. This runs on the MAIN THREAD for every received chunk, and curl
++    // hands us <=16KB at a time (CURLOPT_BUFFERSIZE is never raised), so a 1MB script was ~64 separate
++    // synchronous writes to eMMC on the thread that also runs JS, layout and raster. Accumulate instead
++    // and write once when the resource completes (flushPendingData below).
++    //
++    // Bounded so a large media resource cannot balloon the heap on a 390MB device: past the threshold
++    // we flush early, which is still one write per 2MB rather than one per 16KB.
++    m_pendingData.append(data, size);
++    if (m_pendingData.size() >= kPendingFlushThreshold)
++        return flushPendingData();
++    return true;
++}
+ 
++// Write everything buffered by saveCachedData in a single append. Called on completion and whenever the
++// in-memory buffer grows past the threshold.
++bool CurlCacheEntry::flushPendingData()
++{
++    if (m_pendingData.isEmpty())
++        return true;
++    if (!openContentFile()) {
++        m_pendingData.clear();
++        return false;
++    }
++    FileSystem::writeToFile(m_contentFile, m_pendingData.data(), m_pendingData.size());
++    m_pendingData.clear();
+     return true;
+ }
+ 
+@@ -210,21 +229,23 @@ void CurlCacheEntry::didFail()
+ 
+ void CurlCacheEntry::didFinishLoading()
+ {
++    // Single write for everything saveCachedData buffered during the transfer.
++    flushPendingData();
++    closeContentFile();
+     setIsLoading(false);
+ }
  
  void CurlCacheEntry::generateBaseFilename(const CString& url)
  {
@@ -14510,8 +15013,26 @@ index 219bcde551..c624bf0a2f 100644
      m_basename = baseNameBuilder.toString();
  }
  
+diff --git a/Source/WebCore/platform/network/curl/CurlCacheEntry.h b/Source/WebCore/platform/network/curl/CurlCacheEntry.h
+index fceb71efdc..1ac349c4bf 100644
+--- a/Source/WebCore/platform/network/curl/CurlCacheEntry.h
++++ b/Source/WebCore/platform/network/curl/CurlCacheEntry.h
+@@ -93,6 +93,13 @@ private:
+ 
+     bool openContentFile();
+     bool closeContentFile();
++
++    // Received body buffered in memory so the cache writes once per resource instead of once per
++    // ~16KB curl chunk on the main thread. Flushed on completion, or early past the threshold so a
++    // large resource cannot balloon the heap on a 390MB device.
++    bool flushPendingData();
++    static constexpr size_t kPendingFlushThreshold = 2 * 1024 * 1024;
++    Vector<uint8_t> m_pendingData;
+ };
+ 
+ } // namespace WebCore
 diff --git a/Source/WebCore/platform/network/curl/CurlContext.cpp b/Source/WebCore/platform/network/curl/CurlContext.cpp
-index 728cb88bfb..28c49f0f3f 100644
+index 728cb88bfb..34c16600b0 100644
 --- a/Source/WebCore/platform/network/curl/CurlContext.cpp
 +++ b/Source/WebCore/platform/network/curl/CurlContext.cpp
 @@ -45,6 +45,9 @@
@@ -14552,10 +15073,19 @@ index 728cb88bfb..28c49f0f3f 100644
  
      if (!curl)
          return;
-@@ -297,6 +305,48 @@ CurlHandle::CurlHandle()
+@@ -297,6 +305,57 @@ CurlHandle::CurlHandle()
      curl_easy_setopt(m_handle, CURLOPT_NOSIGNAL, 1L);
      curl_easy_setopt(m_handle, CURLOPT_COOKIEFILE, nullptr);
  
++    // Keep pooled connections alive. The worker now parks for a grace period instead of exiting the
++    // moment the queue drains (see CurlRequestScheduler::stopThreadIfNoMoreJobRunning), so connections
++    // genuinely persist between request waves -- but an idle TCP connection behind mobile CGNAT (the
++    // 10.x transport this device uses on cellular) gets silently reaped by the carrier NAT, and the
++    // reuse then stalls until it times out and re-handshakes. TCP keepalives hold the mapping open.
++    curl_easy_setopt(m_handle, CURLOPT_TCP_KEEPALIVE, 1L);
++    curl_easy_setopt(m_handle, CURLOPT_TCP_KEEPIDLE, 30L);
++    curl_easy_setopt(m_handle, CURLOPT_TCP_KEEPINTVL, 30L);
++
 +    // W10M/UWP: the local gateway resolver (DNS 192.168.x.1) returns CURLE_COULDNT_RESOLVE_HOST
 +    // (code 6) for some hosts — notably Cloudflare Turnstile's interactive-challenge backend
 +    // brunhild.challenges.cloudflare.com — which stalls the CF challenge in an endless
@@ -14601,7 +15131,7 @@ index 728cb88bfb..28c49f0f3f 100644
      enableShareHandle();
      enableAllowedProtocols();
      enableAcceptEncoding();
-@@ -346,11 +396,15 @@ void CurlHandle::enableSSLForHost(const String& host)
+@@ -346,11 +405,15 @@ void CurlHandle::enableSSLForHost(const String& host)
  
      setSslCtxCallbackFunction(willSetupSslCtxCallback, this);
  
@@ -15022,7 +15552,7 @@ index 92b74697bc..ff87ab9cd6 100644
      bool m_isEnabledDownloadToFile { false };
      String m_downloadFilePath;
 diff --git a/Source/WebCore/platform/network/curl/CurlRequestScheduler.cpp b/Source/WebCore/platform/network/curl/CurlRequestScheduler.cpp
-index 2457bb4d7c..5ec0af6c74 100644
+index 2457bb4d7c..e2b1669aea 100644
 --- a/Source/WebCore/platform/network/curl/CurlRequestScheduler.cpp
 +++ b/Source/WebCore/platform/network/curl/CurlRequestScheduler.cpp
 @@ -32,6 +32,8 @@
@@ -15034,7 +15564,38 @@ index 2457bb4d7c..5ec0af6c74 100644
  namespace WebCore {
  
  CurlRequestScheduler::CurlRequestScheduler(long maxConnects, long maxTotalConnections, long maxHostConnections)
-@@ -152,6 +154,7 @@ void CurlRequestScheduler::workerThread()
+@@ -113,9 +115,29 @@ void CurlRequestScheduler::stopThreadIfNoMoreJobRunning()
+     ASSERT(!isMainThread());
+ 
+     Locker locker { m_mutex };
+-    if (m_activeJobs.size() || m_taskQueue.size())
++    if (m_activeJobs.size() || m_taskQueue.size()) {
++        m_idleSince = MonotonicTime::nan(); // busy again -- restart the idle clock next time we drain
++        return;
++    }
++
++    // IDLE GRACE PERIOD. This used to stop the thread the instant the queue drained, which tears down
++    // the whole curl multi handle at the end of workerThread() -- and with it the ENTIRE connection
++    // cache (curl_multi_cleanup). Pages fetch in JS-driven waves (lazy images, XHR, SPA route changes),
++    // so the next wave paid a full TCP + TLS handshake per connection, re-ran the 121-cert CA parse per
++    // connection, and re-negotiated HTTP/2 -- and the next add() from the main thread hit a blocking
++    // m_thread->waitForCompletion() JOIN in startOrWakeUpThread().
++    //
++    // Keeping the thread parked for a while costs one idle thread sitting in curl_multi_poll (which
++    // already has a 5s timeout, so it is not a spin) and preserves connection reuse, TLS session
++    // resumption and the HTTP/2 session across the gaps between waves.
++    if (std::isnan(m_idleSince.secondsSinceEpoch().value())) {
++        m_idleSince = MonotonicTime::now();
++        return;
++    }
++    if ((MonotonicTime::now() - m_idleSince).seconds() < kCurlThreadIdleGraceSeconds)
+         return;
+ 
++    WebCorePort::portLog("curl: worker idle past grace period -> stopping thread (connection cache drops)");
+     m_runThread = false;
+ }
+ 
+@@ -152,6 +174,7 @@ void CurlRequestScheduler::workerThread()
  {
      ASSERT(!isMainThread());
  
@@ -15042,7 +15603,7 @@ index 2457bb4d7c..5ec0af6c74 100644
      {
          Locker locker { m_multiHandleMutex };
          m_curlMultiHandle.emplace();
-@@ -169,11 +172,14 @@ void CurlRequestScheduler::workerThread()
+@@ -169,11 +192,14 @@ void CurlRequestScheduler::workerThread()
  
          executeTasks();
  
@@ -15058,6 +15619,22 @@ index 2457bb4d7c..5ec0af6c74 100644
  
          // check the curl messages indicating completed transfers
          // and free their resources
+diff --git a/Source/WebCore/platform/network/curl/CurlRequestScheduler.h b/Source/WebCore/platform/network/curl/CurlRequestScheduler.h
+index dbc0bf99d4..1bf39d6dcc 100644
+--- a/Source/WebCore/platform/network/curl/CurlRequestScheduler.h
++++ b/Source/WebCore/platform/network/curl/CurlRequestScheduler.h
+@@ -68,6 +68,11 @@ private:
+     Lock m_mutex;
+     RefPtr<Thread> m_thread;
+     bool m_runThread { false };
++    // When the worker last went idle (NaN while busy). The thread is kept parked for a grace period so
++    // the curl connection cache -- and with it TLS session resumption and the HTTP/2 session -- survives
++    // the gaps between JS-driven request waves. See stopThreadIfNoMoreJobRunning().
++    MonotonicTime m_idleSince { MonotonicTime::nan() };
++    static constexpr double kCurlThreadIdleGraceSeconds = 45.0;
+ 
+     Vector<Function<void()>> m_taskQueue;
+     HashSet<CurlRequestSchedulerClient*> m_activeJobs;
 diff --git a/Source/WebCore/platform/network/curl/CurlResourceHandleDelegate.cpp b/Source/WebCore/platform/network/curl/CurlResourceHandleDelegate.cpp
 index 3897e01c6d..f02745c626 100644
 --- a/Source/WebCore/platform/network/curl/CurlResourceHandleDelegate.cpp
@@ -15110,19 +15687,21 @@ index 024bc4e9ae..695bd71420 100644
      bool cancelledOrClientless();
      ResourceHandleClient* client() const;
 diff --git a/Source/WebCore/platform/network/curl/CurlSSLVerifier.cpp b/Source/WebCore/platform/network/curl/CurlSSLVerifier.cpp
-index 54f9a64b41..aabde53173 100644
+index 54f9a64b41..ca9a584e4e 100644
 --- a/Source/WebCore/platform/network/curl/CurlSSLVerifier.cpp
 +++ b/Source/WebCore/platform/network/curl/CurlSSLVerifier.cpp
-@@ -30,6 +30,8 @@
+@@ -30,6 +30,10 @@
  #if USE(CURL)
  #include "CurlContext.h"
  #include "CurlSSLHandle.h"
 +#include <openssl/pem.h>
 +#include <openssl/x509.h>
++
++namespace WebCorePort { void portLog(const char*); }
  
  namespace WebCore {
  
-@@ -43,10 +45,20 @@ CurlSSLVerifier::CurlSSLVerifier(void* sslCtx)
+@@ -43,10 +47,45 @@ CurlSSLVerifier::CurlSSLVerifier(void* sslCtx)
      SSL_CTX_set_app_data(ctx, this);
      SSL_CTX_set_verify(ctx, SSL_CTX_get_verify_mode(ctx), verifyCallback);
  
@@ -15134,20 +15713,45 @@ index 54f9a64b41..aabde53173 100644
 +    // store. W10M/UWP: OpenSSL's file-based CA load (CURLOPT_CAINFO) fails (curl code
 +    // 77) and the LibreSSL SSL_CTX_load_verify_mem isn't available, so do it by hand
 +    // with core OpenSSL — works regardless of file access.
++    // PARSE THE BUNDLE ONCE, SHARE IT. This used to run for EVERY CurlHandle, i.e. every new TLS
++    // connection: 121 certificates / 182KB of PEM, each base64-decoded, DER-parsed and inserted into a
++    // fresh store, on a Snapdragon 400. With the connection limits raised to 32 total / 10 per host, a
++    // thumbnail-heavy page paid that repeatedly. X509_STORE is refcounted, so build it once and hand
++    // every SSL_CTX a reference instead.
++    //
++    // Thread-safety: function-local static initialisation is thread-safe (C++11 magic statics), and the
++    // bundle contents come from the CurlContext singleton so every caller would build an identical
++    // store -- first caller wins.
 +    if (auto data = std::get_if<CertificateInfo::Certificate>(&sslHandle.getCACertInfo())) {
-+        if (::BIO* bio = ::BIO_new_mem_buf(data->data(), static_cast<int>(data->size()))) {
-+            X509_STORE* store = ::SSL_CTX_get_cert_store(ctx);
-+            while (X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) {
-+                ::X509_STORE_add_cert(store, cert);
-+                ::X509_free(cert);
++        static X509_STORE* s_sharedCAStore = [&]() -> X509_STORE* {
++            X509_STORE* store = ::X509_STORE_new();
++            if (!store)
++                return nullptr;
++            int loaded = 0;
++            if (::BIO* bio = ::BIO_new_mem_buf(data->data(), static_cast<int>(data->size()))) {
++                while (X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) {
++                    ::X509_STORE_add_cert(store, cert);
++                    ::X509_free(cert);
++                    ++loaded;
++                }
++                ::BIO_free(bio);
 +            }
-+            ::BIO_free(bio);
++            char b[96];
++            snprintf(b, sizeof b, "curl: CA bundle parsed ONCE into shared X509_STORE (%d certs)", loaded);
++            WebCorePort::portLog(b);
++            return store;
++        }();
++
++        if (s_sharedCAStore) {
++            // set_cert_store takes ownership of one reference, so add one for this SSL_CTX.
++            ::X509_STORE_up_ref(s_sharedCAStore);
++            ::SSL_CTX_set_cert_store(ctx, s_sharedCAStore);
 +        }
 +    }
  
  #if (!defined(LIBRESSL_VERSION_NUMBER))
      const auto& signatureAlgorithmsList = sslHandle.getSignatureAlgorithmsList();
-@@ -58,6 +70,38 @@ CurlSSLVerifier::CurlSSLVerifier(void* sslCtx)
+@@ -58,6 +97,38 @@ CurlSSLVerifier::CurlSSLVerifier(void* sslCtx)
      if (!curvesList.isEmpty())
          SSL_CTX_set1_curves_list(ctx, curvesList.utf8().data());
  

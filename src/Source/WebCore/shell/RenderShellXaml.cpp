@@ -45,11 +45,15 @@ extern "C" void WebCoreBrowserLog(const char*);
 extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale);
 extern "C" void WebCoreBrowserTap(int x, int y);
 extern "C" void WebCoreSetMemoryBudgetFromLimit(unsigned long long appLimitBytes);
+// Lightweight: records the cap only, safe to call BEFORE WebCoreBrowserInitPanel (see call site).
+extern "C" void WebCoreSetStartupMemoryLimit(unsigned long long appLimitBytes);
 extern "C" void WebCoreBrowserTouch(int identifier, int phase, int x, int y); // 0=down 1=move 2=up 3=cancel
 extern "C" void WebCoreBrowserScrollBy(int dx, int dy, int x, int y);
 extern "C" void WebCoreBrowserNavigate(const char* url);
 extern "C" void WebCoreBrowserKeepCompositing(unsigned frames);
 extern "C" void WebCoreBrowserReleaseMemory(int critical); // release WebKit caches on memory pressure
+extern "C" void WebCoreBytecodeCacheFlush();               // persist JSC bytecode cache to disk
+extern "C" unsigned long long WebCoreBrowserReclaimableKB(); // WebKit-owned memory a release could free
 extern "C" void WebCoreBrowserMemEmergency(); // background watcher -> frame pump: release at first opportunity
 extern "C" void PortMseEmergencyTrim();       // off-main-thread MSE buffered-media trim (ShellMse.cpp)
 extern "C" void WebCoreBrowserSetMemStats(unsigned long long usedBytes, unsigned long long limitBytes,
@@ -107,14 +111,26 @@ public:
                 WebCorePort::portLog("app: LEAVING-BACKGROUND");
             });
         Suspending += ref new Windows::UI::Xaml::SuspendingEventHandler(
-            [](Platform::Object^, Windows::ApplicationModel::SuspendingEventArgs^) {
+            [](Platform::Object^, Windows::ApplicationModel::SuspendingEventArgs^ e) {
                 // SHRINK BEFORE WE SLEEP. A suspended app is kept in memory only if the OS can afford
                 // it; W10M terminates the fat ones to reclaim RAM. We were being suspended holding
                 // 206MB and getting reclaimed -- the log shows ENTERED-BACKGROUND -> SUSPENDING ->
                 // (no RESUMING) -> a cold relaunch. The suspends where we held less all resumed fine.
                 // This hook existed and did nothing; dropping the caches here is the entire point of it.
-                WebCorePort::portLog("app: XAML-SUSPENDING -> releaseMemory(critical) before sleep");
-                WebCoreBrowserReleaseMemory(1);
+                //
+                // TAKE A DEFERRAL. Without one the OS may consider this handler complete the moment it
+                // returns and suspend us mid-wipe -- and the work below (full cache release + JSC GC,
+                // plus a bytecode flush) is exactly the kind of thing that gets cut off. The PLM budget
+                // is ~5s, so the deferral is completed as soon as we are done rather than held.
+                Windows::ApplicationModel::SuspendingDeferral^ deferral = nullptr;
+                try { if (e && e->SuspendingOperation) deferral = e->SuspendingOperation->GetDeferral(); } catch (...) { }
+                WebCorePort::portLog("app: XAML-SUSPENDING -> flush bytecode + releaseMemory(critical) before sleep");
+                // Persist compiled bytecode while we still can: this is the other moment (besides
+                // load-complete) when the working set is known, and it directly buys cold-start time on
+                // the next launch.
+                try { WebCoreBytecodeCacheFlush(); } catch (...) { }
+                try { WebCoreBrowserReleaseMemory(1); } catch (...) { }
+                try { if (deferral) deferral->Complete(); } catch (...) { }
             });
     }
 
@@ -367,6 +383,14 @@ private:
                 auto data = toUtf8(ApplicationData::Current->LocalFolder->Path);
                 WebCoreBrowserSetDataPath(data.c_str());
             } catch (...) { }
+            // Record this device's memory cap BEFORE InitPanel. JSC snapshots its heap-sizing inputs
+            // during JSC::initialize()/VM construction (inside InitPanel), so the full
+            // WebCoreSetMemoryBudgetFromLimit call below — which cannot run until WebCore is up,
+            // because it resizes the MemoryCache — is far too late to stop JSC sizing its heap against
+            // physical RAM (1GB) instead of the 390MB cap. This setter only stores the number.
+            try {
+                WebCoreSetStartupMemoryLimit(Windows::System::MemoryManager::AppMemoryUsageLimit);
+            } catch (...) { }
             // Hold the property set in a ^ local across the InitPanel call — a bare temporary
             // would be released before ANGLE finishes using it (freed native window -> crash).
             auto props = makeScaledPanel(raw);
@@ -511,6 +535,15 @@ private:
     void onRendering(Object^, Object^)
     {
         WebCoreBrowserRenderFrameSafe();
+        // EVERYTHING below runs on the XAML UI thread and used to be completely unguarded, while the
+        // engine frame above is SEH-wrapped. That asymmetry is a process-kill path: the WinRT
+        // MemoryManager reads and the XAML property writes below can throw Platform::Exception, which
+        // propagates out of this handler into XAML -> UnhandledException -> fail-fast. It is exactly
+        // the shape of the reported "GPU failure reaching x9:xaml-commit kills the app" -- the failure
+        // never had to be fatal, it just had nothing to catch it. Note every OTHER MemoryManager read
+        // in this file (startup, watcher thread) was already wrapped; this one was missed.
+        // This target is built /ZW /EHsc so real C++ catch works here (unlike WebCore, which is /EHs-).
+        try {
         WebCoreBrowserStage("x1:shell-mem");
 
         // Periodic memory-usage sample (every ~120 frames ≈ 2s). Uses the UWP app-memory API so we
@@ -563,20 +596,55 @@ private:
             // threshold without ever tripping it -- and the coarse AppMemoryUsageLevel sat at Medium
             // the whole way, so `rose` never fired either. Guard at 70%, and re-release every 5s while
             // we stay above it, so a fast climber gets shrunk before it reaches the cap.
-            bool rose = level > m_lastMemLevel;
-            bool sustainedCritical = level >= 2 && (!m_lastMemReleaseTick || now - m_lastMemReleaseTick >= 5000);
+            //
+            // AppMemoryUsageLevel ALONE must never drive a release. It is a system-wide commit signal,
+            // not our share of our own cap: on a 1GB 640XL running this app plus a MediaFoundation
+            // pipeline, High(2) is the normal steady state. `sustainedCritical` had no percentage term,
+            // so it fired a full synchronous wipe every 5 seconds forever -- observed on-device at
+            // 137MB/390MB (35%), where there is nothing to reclaim. That wipe drops the memory cache,
+            // decoded images, font/glyph caches and JIT-linked code, so the app spent the session
+            // re-decoding and re-JITting work it had just thrown away -- which inflated the raster and
+            // JS timings we were tuning against. Gate it on real usage, same as overPct.
+            // `rose` must be gated on percentage too. It was not, so ANY level transition fired a
+            // release regardless of usage -- and AppMemoryUsageLevel oscillates 0<->1 in normal
+            // operation, which produced six releases at pct=50% in a single measured session. (This is
+            // the same bug as the level>=2 one fixed above; I gated the two named conditions and left
+            // the third in the same `if` ungated.)
+            bool rose = level > m_lastMemLevel && pct >= 60;
+            bool sustainedCritical = level >= 2 && pct >= 70 && (!m_lastMemReleaseTick || now - m_lastMemReleaseTick >= 5000);
             bool overPct = pct >= 70 && (!m_lastMemReleaseTick || now - m_lastMemReleaseTick >= 5000);
-            if ((level >= 1 && (rose || sustainedCritical)) || overPct) {
+            // Is there anything worth reclaiming? releaseMemory only frees WebKit-owned memory (the
+            // MemoryCache and the JSC heap). On device those totalled ~26MB while the app held 162MB --
+            // the rest is native/CRT heap, MF buffers and GPU tiles, none of which a release touches.
+            // Firing anyway costs a stop-the-world full GC (~20ms) plus a wipe of decoded images and
+            // JIT-linked code that gets regenerated seconds later. Measured: 1398ms of GC in one
+            // session, 28 FULL collections on a 3.4MB heap. Skip unless there is real ballast --
+            // except when we are genuinely near the cap, where even a small win is worth having.
+            const unsigned long long reclaimableKB = WebCoreBrowserReclaimableKB();
+            const bool worthReclaiming = (reclaimableKB >= 32 * 1024) || (pct >= 85) || (level >= 3);
+            if (((level >= 1 && (rose || sustainedCritical)) || overPct) && !worthReclaiming) {
+                // Log the skip so this stays visible rather than looking like the pressure code died.
+                char sb[128];
+                sprintf_s(sb, sizeof sb, "mem: pressure level=%d pct=%llu%% -> SKIP release (only %lluKB reclaimable)",
+                    level, pct, reclaimableKB);
+                WebCoreBrowserLog(sb);
+                m_lastMemReleaseTick = GetTickCount64(); // don't re-evaluate every frame
+            } else if ((level >= 1 && (rose || sustainedCritical)) || overPct) {
+                // Critical is decided by OUR usage, not the coarse system level. pct >= 85 means we are
+                // genuinely close to the cap; level >= 3 (OverLimit) is the one level value that really
+                // does mean this app is over its own limit, so it still counts. level >= 2 (High) does
+                // NOT -- that was the bug above, and it made every 5s tick a full wipe at 35% usage.
+                const bool wantCritical = (pct >= 85) || (level >= 3);
                 char rb[96];
                 sprintf_s(rb, sizeof rb, "mem: pressure level=%d pct=%llu%% -> releaseMemory(%s)",
-                    level, pct, (level >= 2 || pct >= 85) ? "critical" : "normal");
+                    level, pct, wantCritical ? "critical" : "normal");
                 WebCoreBrowserLog(rb);
                 // Match the decision to the log line above: critical (full wipe: memory cache, decoded
                 // images, fonts, JIT-linked code) ONLY at High/OverLimit or >=85%. The 70% guard fires a
                 // NORMAL release. Passing critical at 70% made every 5s tick a full wipe on pages that
                 // live at 80% (YouTube: 25 critical releases in one session, usage never dropped -- the
                 // wipes were pure re-decode/re-JIT jank with zero relief).
-                WebCoreBrowserReleaseMemory((level >= 2 || pct >= 85) ? 1 : 0);
+                WebCoreBrowserReleaseMemory(wantCritical ? 1 : 0);
                 m_lastMemReleaseTick = GetTickCount64();
             }
             m_lastMemLevel = level;
@@ -606,6 +674,16 @@ private:
         // Last marker before returning to XAML: a stall showing x9 means the freeze is in XAML's own
         // frame commit / DWM present, not in any of our code.
         WebCoreBrowserStage("x9:xaml-commit");
+        } catch (Platform::Exception^ ex) {
+            // Survive it. A failed chrome update or memory read is never worth killing the browser for,
+            // and it is recoverable -- the next frame retries. Log the HRESULT so it stays visible.
+            char b[128];
+            sprintf_s(b, sizeof b, "shell: onRendering EXCEPTION hr=0x%08X (survived, chrome may be stale)",
+                (unsigned)ex->HResult);
+            WebCoreBrowserLog(b);
+        } catch (...) {
+            WebCoreBrowserLog("shell: onRendering unknown exception (survived)");
+        }
     }
 
     FontIcon^ reloadIcon() { return safe_cast<FontIcon^>(m_reloadBtn->Content); }
