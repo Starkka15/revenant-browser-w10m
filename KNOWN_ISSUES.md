@@ -8,6 +8,10 @@ File paths are relative to the WebKit tree (`WebKit-2.36.8/`) after applying the
 
 ---
 
+> **The ordered plan for picking this back up is [TASK.md](TASK.md)** — phased, with the evidence and
+> effort behind each item, and a list of things already ruled out. This file is the *state*; TASK.md is
+> the *plan*.
+
 ## Status as of 2026-07-20 (start here)
 
 The tree builds, deploys and runs on a Lumia 640 XL. Everything below is measured on device, not

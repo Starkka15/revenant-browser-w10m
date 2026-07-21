@@ -21,7 +21,8 @@
 
 > **Project status:** paused as of **2026-07-20**. The tree builds, deploys and runs. Current state,
 > including exactly where the video bug sits and what to try next, is in
-> [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — start there.
+> [KNOWN_ISSUES.md](KNOWN_ISSUES.md), and the ordered plan for picking it back up is
+> [TASK.md](TASK.md) — start with those two.
 
 Revenant is a port of **WebKit 2.36.8** (the WinCairo port) to **Windows 10 Mobile**, running
 **on-device** on ARM32 UWP hardware (developed/tested on a **Nokia Lumia 640 XL**, Adreno 305,
@@ -103,6 +104,7 @@ log its four sub-conditions in a single build and see which one fails — not to
 | `deps/` | Per-dependency ARM32-UWP build scripts + ICU build + meson cross file |
 | `docs/` | Design specs (feasibility, build SPEC, non-headless render, feature parity, tabs) |
 | [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | **Current state + open bugs, with the device evidence for each. Start here.** |
+| [`TASK.md`](TASK.md) | **Ordered work plan** — phased, with the evidence and effort behind each item |
 
 Not vendored, fetch from upstream: the WebKit tree, BoringSSL, curl, nghttp2, ICU, and
 `Source/ThirdParty/wamr` (34MB). [BUILD.md](BUILD.md) lists every version and build script.
@@ -190,7 +192,8 @@ starting over. PRs and cross-pollination between the projects are genuinely welc
 A modern browser is a community-scale effort — this is opened in that spirit. Forks, patches, and PRs
 welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the (patch-based) workflow and dev loop, and
 **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for open problems with file pointers so you can pick something
-scoped rather than cold-starting on a WebKit port.
+scoped rather than cold-starting on a WebKit port. **[TASK.md](TASK.md)** is the ordered plan — it says
+what to do first and why, and lists what has already been ruled out so you don't repeat it.
 
 **Active development is paused as of 2026-07-20.** The tree builds, deploys and runs, and the open
 problems are written up with the device evidence behind each one. If you want to pick something up,
