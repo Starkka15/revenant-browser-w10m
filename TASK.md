@@ -28,27 +28,20 @@ Companion docs: [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (state + open bugs), [BUILD.m
 
 ## Device note: 640 XL vs 950
 
-The plan below was derived on a **Lumia 640 XL** (Snapdragon 400, 4×Cortex-A7, 1GB RAM → **tier-0**,
-390MB cap, Adreno 305, D3D feature level 9_3).
+**Target device is the 640 XL** (Snapdragon 400, 4×Cortex-A7, 1GB → **tier-0**, 390MB cap, Adreno 305,
+D3D FL9_3). Everything below was derived there.
 
-A **Lumia 950** is Snapdragon 808 (2×A57 + 4×A53), **2GB RAM → tier-1, ~900MB cap**, Adreno 418. That
-changes several things and the difference is itself diagnostic:
+The **950** (Snapdragon 808, 2GB → **tier-1**, ~900MB cap, Adreno 418) exercises the same code on
+different hardware. Code-path differences that will change observed behaviour there:
 
-- **Tier-1 takes a different budget branch** (`WebCoreSetMemoryBudgetFromLimit`, `WebCoreDriver.cpp:376`):
-  memCache 48MB not 12MB, MSE keep-behind 20s not 8s, and the tier-0-only single-video decode slot
-  (`g_tier0ActivePlayer`) **does not apply at all**. Media will behave differently — that is expected,
-  not a regression.
-- **The video draw bug is suspected to be a scheduling race** (see T-1). A faster CPU may hide it. If
-  video works on the 950 and not the 640 XL, that *supports* the race hypothesis rather than refuting
-  the bug — do not close it on 950 evidence alone.
-- **More memory means the OOM path may not reproduce.** Test memory items on the 640 XL.
-- **Adreno 418 supports a higher D3D feature level.** Anything currently blamed on FL9_3 should be
-  re-checked there before being treated as a hardware limit.
-
-**Recommendation: keep the 640 XL as the reference device.** It is the constraint that makes this port
-honest. Use the 950 for comfort, and for A/B when a finding is timing- or memory-dependent.
-
----
+- **Different budget branch** (`WebCoreSetMemoryBudgetFromLimit`, `WebCoreDriver.cpp:376`): memCache
+  48MB not 12MB, MSE keep-behind 20s not 8s.
+- **The single-video decode slot is tier-0 only.** `g_tier0ActivePlayer` and the eviction path around it
+  do not run on the 950 — including the slot-race fix in T-0.2, which cannot reproduce there.
+- **Adreno 418 supports a higher D3D feature level**, so anything attributed to FL9_3 needs re-checking
+  before it counts as a hardware limit.
+- **T-1 (video draw) is a suspected scheduling race.** A faster CPU may resolve it the other way, so the
+  two devices disagreeing is itself a signal about the hypothesis.
 
 ## Phase 0 — costs nothing, do first (no build)
 
