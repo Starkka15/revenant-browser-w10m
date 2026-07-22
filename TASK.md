@@ -342,6 +342,78 @@ reclaim them under disk pressure.
 
 ---
 
+## Phase 6 — incomplete APIs (scan of 2026-07-22)
+
+Found by reading the port + mediastream layers. **Verified by reading each function** — an automated
+scan for empty bodies had a high false-positive rate (`createFrame`, `userAgent` and the ServiceWorker
+fetch client all read as "empty" and are fully implemented), so only confirmed items are listed.
+
+### T-6.1 · `shouldGoToHistoryItem` returns `false` — ALL back/forward navigation is dead
+`port/PortFrameLoaderClient.cpp:731`. `HistoryController::goToItem` — the function behind every
+back/forward navigation — does:
+```cpp
+if (!m_frame.loader().client().shouldGoToHistoryItem(targetItem))
+    return;
+```
+We inherited the `EmptyClients` null-client default (`EmptyClients.cpp:1031` returns false), which is
+correct for a do-nothing client and wrong for a real one. WebKitLegacy/win returns `true`.
+**One-line fix.** Affects the hardware Back button, `history.back()` and `history.go(-1)`.
+
+This also explains the reported "hardware back just closes the app", which the app-model audit could not
+account for (it correctly found `SystemNavigationManager::BackRequested` *is* registered):
+- **mid-session:** `canGoBackOrForward(-1)` is true → the shell marks the event handled and calls
+  `goBackOrForward(-1)` → blocked here → **back appears dead**.
+- **start of history:** `canGoBack` false → event unhandled → the OS closes the app.
+
+### T-6.2 · Form controls compiled in but non-functional
+`port/PortChromeClient.cpp` — all return `nullptr`, while the features are **enabled** in
+`cmakeconfig.h`:
+- `createColorChooser` (`:77`) with `ENABLE_INPUT_TYPE_COLOR 1` → `<input type=color>` does nothing
+- `createDataListSuggestionPicker` (`:81`) with `ENABLE_DATALIST_ELEMENT 1` → `<datalist>` dead
+- `createDateTimeChooser` (`:85`) — `ENABLE_DATE_AND_TIME_INPUT_TYPES` is **not** defined, so this stub
+  is moot unless that flag is turned on
+
+### T-6.3 · HTTP authentication cannot be answered
+`canAuthenticateAgainstProtectionSpace` → `false` (`:275`) and
+`dispatchDidReceiveAuthenticationChallenge` → empty (`:269`). Any site behind 401 Basic/Digest is
+unreachable: no prompt, no way to supply credentials. `shouldUseCredentialStorage` → `false` (`:259`).
+
+### T-6.4 · WebRTC: signaling and data channels only, no media either way
+Deliberate phase-1 scoping (documented in `LibWebRTCProviderWinCairo.cpp`), recorded here so the
+remaining work is explicit. **Working:** `RTCPeerConnection`, DTLS identity (`rtc::InitializeSSL()` is
+called once — added because Turnstile's probe faulted without it), ICE gathering (device log:
+`candidates=16`, `setLocalDescription ok`), builtin **audio** codec factories.
+
+**Stubbed:**
+| Stub | File | Consequence |
+|---|---|---|
+| all 3 capture factories return error strings | `mediastream/RealtimeMediaSourceCenterWinCairo.cpp` | `getUserMedia`: no camera, mic or screen share |
+| `audioSamplesAvailable` → `{ }` | `mediastream/libwebrtc/RealtimeMediaSourcesWinCairo.cpp` | outgoing audio never sends samples |
+| `videoSampleAvailable` → `{ }`, `createBlackFrame` → nullptr | same | outgoing video never sends frames |
+| **`OnFrame` → `{ }`** | same | **incoming video frames are received and discarded** |
+| `createEncoderFactory` / `createDecoderFactory` → nullptr | `mediastream/libwebrtc/LibWebRTCProvider.cpp:377-385` | no video codecs at all |
+
+The audio device module is the dummy `LibWebRTCAudioModule`, so there is no real audio I/O even with
+codecs present. Net effect: a call negotiates, gathers candidates and completes DTLS, then nothing
+renders. `RTCDataChannel` (SCTP) is the one path that needs no codecs — **untested, not claimed**.
+
+Note `OnFrame` being empty is the WebRTC twin of T-1: the frame arrives and never reaches the screen.
+
+**Manifest dependency:** `microphone`/`webcam` are correctly *absent* today, matching the capture stubs.
+They become **required** the moment capture is implemented — see T-5.9.
+
+### T-6.5 · Already tracked elsewhere, confirmed at source
+`runOpenPanel` empty (T-5.10), `startDownload` + `convertMainResourceLoadToDownload` empty (T-5.10),
+`dispatchCreatePage` → nullptr (`window.open`), `createPasteboardStrategy` → nullptr (T-5.6).
+
+### Verified COMPLETE — do not chase
+`createFrame` (full subframe implementation with child client wiring), `userAgent` (full identity
+logic), `PortServiceWorkerFetchClient::didReceiveResponse` / `didReceiveData` / `didNotHandle` (all
+real). `canCachePage` → `false` is **deliberate** — the back/forward cache is disabled by design
+(`BackForwardCache::setMaxSize(0)`).
+
+---
+
 ## Explicitly NOT worth doing
 
 - **Force `CompositingPolicy::Conservative`.** It only affects 3D transforms, canvas and `will-change` —
@@ -375,5 +447,5 @@ reclaim them under disk pressure.
 | Does `HeapSummary` resolve under AppContainer? | T-1.5 — log either outcome |
 | Does the SIP's autocorrect survive as backspace+retype? | Type "teh " into a web `<input>`, read `INPUT:` lines |
 | Does the URL TextBox steal typed characters? | Tap a web field, type, watch whether the address bar changes |
-| Is hardware Back actually broken? | `SystemNavigationManager::BackRequested` **is** registered and only declines when `canGoBackOrForward(-1)` is false — which is correct at the start of history. The README claim may be stale; verify before fixing |
+| ~~Is hardware Back actually broken?~~ | **ROOT-CAUSED — see T-6.1.** The shell hook is fine; `shouldGoToHistoryItem` returns `false` so the navigation is blocked one layer deeper. One-line fix. |
 | Does video work on the 950? | If yes and it fails on the 640 XL, that supports the T-1 race hypothesis |
