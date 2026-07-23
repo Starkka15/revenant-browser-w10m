@@ -31,13 +31,19 @@ Companion docs: [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (state + open bugs), [BUILD.m
 **Target device is the 640 XL** (Snapdragon 400, 4×Cortex-A7, 1GB → **tier-0**, 390MB cap, Adreno 305,
 D3D FL9_3). Everything below was derived there.
 
-The **950** (Snapdragon 808, 2GB → **tier-1**, ~900MB cap, Adreno 418) exercises the same code on
-different hardware. Code-path differences that will change observed behaviour there:
+The **950** (Snapdragon 808, **3GB / 32GB**, Adreno 418) exercises the same code on different
+hardware. The AppMemoryUsageLimit scales with device RAM, so a 3GB device lands at **tier-1 at minimum,
+likely tier-2** — read the actual cap from the `membudget:` log line on first launch. Code-path
+differences that will change observed behaviour there:
 
-- **Different budget branch** (`WebCoreSetMemoryBudgetFromLimit`, `WebCoreDriver.cpp:376`): memCache
-  48MB not 12MB, MSE keep-behind 20s not 8s.
+- **Different budget branch** (`WebCoreSetMemoryBudgetFromLimit`, `WebCoreDriver.cpp:376`): tier-1 is
+  memCache 48MB / MSE keep-behind 20s; tier-2 is memCache 96MB and a much higher ceiling. Either way
+  the tier-0 survival constraints relax hard.
 - **The single-video decode slot is tier-0 only.** `g_tier0ActivePlayer` and the eviction path around it
-  do not run on the 950 — including the slot-race fix in T-0.2, which cannot reproduce there.
+  do not run above tier-0 — including the slot-race fix in T-0.2, which cannot reproduce there.
+- **The tier-0 memory-survival work (release gating, the 250MB attribution, MSE forward trim) is largely
+  moot above tier-0.** The device-independent bugs (video draw, input, @font-face, back button, HLS DNS)
+  are what matter on the 950.
 - **Adreno 418 supports a higher D3D feature level**, so anything attributed to FL9_3 needs re-checking
   before it counts as a hardware limit.
 - **T-1 (video draw) is a suspected scheduling race.** A faster CPU may resolve it the other way, so the
