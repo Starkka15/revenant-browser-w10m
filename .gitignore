@@ -4,3 +4,7 @@
 build-*/
 _install/
 *.bak
+
+# Local build config — copy env.example.bat to env.bat and fill in YOUR paths.
+# env.bat holds machine-specific paths and must never be committed.
+/env.bat

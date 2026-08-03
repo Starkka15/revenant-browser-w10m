@@ -1,10 +1,12 @@
 @echo off
-set CM=Z:\w10m-webengine\tools\cmake\bin\cmake.exe
-set INST=Z:\w10m-webengine\deps\_install
-"%CM%" -S Z:\w10m-webengine\deps\curl -B Z:\w10m-webengine\deps\curl\build-armuwp ^
-  -G "Visual Studio 17 2022" -A ARM -T v142,host=x64 ^
+if not defined ROOT call "%~dp0..\env.bat"
+if not defined ROOT ( echo [!] env.bat not found - copy env.example.bat to env.bat and edit it & exit /b 1 )
+set CM=%CMAKE%
+set INST=%ROOT%\deps\_install
+"%CM%" -S %ROOT%\deps\curl -B %ROOT%\deps\curl\build-armuwp ^
+  -G "%VSGEN%" -A ARM -T v142,host=x64 ^
   -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0.16299.0 ^
-  -DCMAKE_TOOLCHAIN_FILE=Z:\w10m-webengine\cmake\Toolchain-W10M-ARM32-UWP.cmake ^
+  -DCMAKE_TOOLCHAIN_FILE=%ROOT%\cmake\Toolchain-W10M-ARM32-UWP.cmake ^
   -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DCURL_DISABLE_INSTALL=ON ^
   -DCURL_USE_OPENSSL=ON -DCURL_USE_SCHANNEL=OFF ^
   -DOPENSSL_ROOT_DIR=%INST% -DOPENSSL_INCLUDE_DIR=%INST%\include ^

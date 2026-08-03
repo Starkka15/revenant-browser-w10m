@@ -1,15 +1,17 @@
 @echo off
-set PATH=Z:\w10m-webengine\deps\tools\bin;%PATH%
-set CM=Z:\w10m-webengine\tools\cmake\bin\cmake.exe
-set I=Z:/w10m-webengine/deps/_install
-set PKG_CONFIG_PATH=Z:\w10m-webengine\deps\_install\lib\pkgconfig
-set PKGCONF=C:/Users/Starkka15/AppData/Local/Programs/Python/Python314/Lib/site-packages/pkgconf/.bin/pkgconf.exe
-"%CM%" -S Z:\w10m-webengine\WebKit-2.36.8 -B Z:\w10m-webengine\build-wincairo ^
-  -G "Visual Studio 17 2022" -A ARM -T v142,host=x64 ^
+if not defined ROOT call "%~dp0..\env.bat"
+if not defined ROOT ( echo [!] env.bat not found - copy env.example.bat to env.bat and edit it & exit /b 1 )
+set PATH=%ROOT%\deps\tools\bin;%PATH%
+set CM=%CMAKE%
+set I=%ROOT%/deps/_install
+set PKG_CONFIG_PATH=%ROOT%\deps\_install\lib\pkgconfig
+set PKGCONF=%PKGCONF%
+"%CM%" -S %ROOT%\WebKit-2.36.8 -B %ROOT%\build-wincairo ^
+  -G "%VSGEN%" -A ARM -T v142,host=x64 ^
   -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0.16299.0 ^
-  -DCMAKE_TOOLCHAIN_FILE=Z:\w10m-webengine\cmake\Toolchain-W10M-ARM32-UWP.cmake ^
-  -DPORT=WinCairo -DENABLE_WEBGL=ON -DENABLE_WEBGL2=OFF -Dangle_is_winuwp=TRUE -Dtarget_os=winuwp -Dangle_enable_d3d9=FALSE -DGPERF_EXECUTABLE=Z:/w10m-webengine/deps/tools/bin/gperf.exe -DBISON_EXECUTABLE=Z:/w10m-webengine/deps/tools/bin/bison.exe -DFLEX_EXECUTABLE=Z:/w10m-webengine/deps/tools/bin/flex.exe -DCMAKE_PREFIX_PATH=%I% -DPKG_CONFIG_EXECUTABLE=%PKGCONF% ^
-  -DICU_ROOT=Z:/w10m-webengine/icu -DICU_INCLUDE_DIR=Z:/w10m-webengine/icu/include ^
+  -DCMAKE_TOOLCHAIN_FILE=%ROOT%\cmake\Toolchain-W10M-ARM32-UWP.cmake ^
+  -DPORT=WinCairo -DENABLE_WEBGL=ON -DENABLE_WEBGL2=OFF -Dangle_is_winuwp=TRUE -Dtarget_os=winuwp -Dangle_enable_d3d9=FALSE -DGPERF_EXECUTABLE=%ROOT%/deps/tools/bin/gperf.exe -DBISON_EXECUTABLE=%ROOT%/deps/tools/bin/bison.exe -DFLEX_EXECUTABLE=%ROOT%/deps/tools/bin/flex.exe -DCMAKE_PREFIX_PATH=%I% -DPKG_CONFIG_EXECUTABLE=%PKGCONF% ^
+  -DICU_ROOT=%ROOT%/icu -DICU_INCLUDE_DIR=%ROOT%/icu/include ^
   -DENABLE_JIT=ON -DENABLE_DFG_JIT=ON -DENABLE_C_LOOP=OFF -DUSE_CAPSTONE=OFF -DENABLE_DISASSEMBLER=OFF ^
   -DENABLE_WEB_CRYPTO=ON -DENABLE_MEDIA_SOURCE=ON -DENABLE_WEBASSEMBLY=ON -DUSE_MEDIA_FOUNDATION=ON ^
   -DENABLE_WEB_AUDIO=OFF -DENABLE_OFFSCREEN_CANVAS=ON -DENABLE_SERVICE_WORKER=ON ^
@@ -27,4 +29,4 @@ set PKGCONF=C:/Users/Starkka15/AppData/Local/Programs/Python/Python314/Lib/site-
   -DCMAKE_EXE_LINKER_FLAGS="onecore.lib /FORCE:MULTIPLE" -DCMAKE_SHARED_LINKER_FLAGS="onecore.lib /FORCE:MULTIPLE"
 echo WINCAIRO_CFG=%ERRORLEVEL%
 rem Re-add AppContainer network capabilities that CMake strips from the manifest on every configure.
-powershell -NoProfile -ExecutionPolicy Bypass -File Z:\w10m-webengine\patch-manifest.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0patch-manifest.ps1"

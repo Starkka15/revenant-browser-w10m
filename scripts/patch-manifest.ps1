@@ -1,10 +1,16 @@
-# Rebrands the CMake-generated appx manifest to "Revenant" (display name, tiles, splash, publisher)
-# and injects the AppContainer network capabilities. CMake regenerates package.appxManifest on every
-# configure/build WITHOUT these (it uses the target name "WebCoreRenderShell" + placeholder logos),
-# so this runs between build passes (build-shell.bat) to apply them durably. Idempotent.
-$m = 'Z:\w10m-webengine\build-wincairo\Source\WebCore\WebCoreRenderShell.dir\package.appxManifest'
+# Rebrands the CMake-generated appx manifest to "Revenant" (display name, tiles, splash, publisher),
+# sets the release version, and injects the AppContainer network capabilities. CMake regenerates
+# package.appxManifest on every configure/build WITHOUT these (it uses the target name
+# "WebCoreRenderShell" + placeholder logos), so this runs between build passes (build-shell.bat) to
+# apply them durably. Idempotent. Requires the ROOT environment variable (set by env.bat).
+if (-not $env:ROOT) { Write-Output 'ROOT_NOT_SET (source env.bat first)'; exit 1 }
+$m = "$env:ROOT\build-wincairo\Source\WebCore\WebCoreRenderShell.dir\package.appxManifest"
 if (-not (Test-Path $m)) { Write-Output 'MANIFEST_NOT_FOUND'; exit 0 }
 $c = Get-Content -Raw $m
+
+# --- Release version. UWP Identity Version is numeric x.x.x.x (no -alpha suffix); bump per release. ---
+$REVENANT_VERSION = '0.0.1.1'
+$c = $c -replace '(<Identity[^>]*\bVersion=")[0-9.]+(")', "`${1}$REVENANT_VERSION`${2}"
 
 # --- Rebrand: name + publisher ---
 $c = $c.Replace('<DisplayName>WebCoreRenderShell</DisplayName>', '<DisplayName>Revenant</DisplayName>')
@@ -34,4 +40,4 @@ if ($c -notmatch 'internetClient') {
 }
 
 Set-Content -Path $m -Value $c -NoNewline
-Write-Output 'MANIFEST_PATCHED_REVENANT'
+Write-Output "MANIFEST_PATCHED_REVENANT v$REVENANT_VERSION"

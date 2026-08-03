@@ -3,10 +3,14 @@
 > ## ⚠️ VERY EARLY ALPHA
 > This is a hobbyist proof-of-concept, not a usable daily browser. Expect rough edges and crashes.
 > **Specifically:**
-> - **Video does not appear in pages.** It decodes at full frame rate and never reaches the screen —
->   see [the open bug](#the-headline-open-bug-video-decodes-but-never-draws) below. A standalone
->   `.mp4` URL *does* play.
-> - **YouTube stops after about a minute.**
+> - **Video is H.264-only.** H.264 `<video>` now renders **in-page** (composited frame-server path —
+>   the old "decodes but never draws" bug is fixed for H.264). Other codecs (VP9/AV1/etc.) do **not**
+>   draw, so many sites show a blank/black player. A standalone `.mp4` (H.264) URL plays.
+> - **YouTube stops after about a minute** (on the H.264 path it does reach).
+> - **Tall, media-heavy pages can still crash or tile incorrectly.** Large image/video grids
+>   (search-result pages and similar) may close the app or render with fragmented / misaligned /
+>   blank tiles. A structural media + rasterisation rework has landed but is **not fully resolved
+>   on-device yet** — this is the top active bug.
 > - **Pages run slowly** — these are ~2013-era ARM32 phones; even with the JIT and DFG JIT doing
 >   their best, heavy modern JavaScript is a lot to ask of the hardware. Measured: JS and layout are
 >   ~93% of a worst-case frame; rasterisation is ~7%.
@@ -19,10 +23,11 @@
 > browsing, logins/forms, and standards support far beyond EdgeHTML. Treat it as a "look, it's
 > possible" milestone, not a finished product.
 
-> **Project status:** paused as of **2026-07-20**. The tree builds, deploys and runs. Current state,
-> including exactly where the video bug sits and what to try next, is in
-> [KNOWN_ISSUES.md](KNOWN_ISSUES.md), and the ordered plan for picking it back up is
-> [TASK.md](TASK.md) — start with those two.
+> **Project status:** under active development. Latest build **v0.0.1.1-alpha**. The tree builds,
+> deploys, and runs. Hit a bug? See **[ISSUES.md](ISSUES.md)** — a **scrubbed `debug.log` is
+> required** with every report. Building it yourself: human steps in **[BUILD.md](BUILD.md)**,
+> AI-assisted setup in **[AI-HELPER.md](AI-HELPER.md)**; current known issues in
+> **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**, ordered plan in **[TASK.md](TASK.md)**.
 
 Revenant is a port of **WebKit 2.36.8** (the WinCairo port) to **Windows 10 Mobile**, running
 **on-device** on ARM32 UWP hardware (developed/tested on a **Nokia Lumia 640 XL**, Adreno 305,
@@ -59,18 +64,24 @@ binaries — you fetch those from upstream and apply our changes (see [BUILD.md]
 Everything here is measured on a Lumia 640 XL, with the log line that shows it. Full detail and
 next steps: [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-### The headline open bug: video decodes but never draws
+### Video: H.264 only (the "never draws" bug is fixed for H.264)
 
-    video: decoded=38.3fps drawn=0.0fps (0/77)
-    gate: last97 composited=97 skipped=0
+H.264 `<video>` now renders **in-page**. The earlier headline bug — Media Foundation decoded at full
+rate but **zero** frames reached the screen (`video: decoded=38.3fps drawn=0.0fps`), isolated to the
+texture-upload path in `MediaPlayerPrivateMediaFoundation::paintCurrentFrameToTextureMapper` — is
+resolved: decoded frames now reach the compositor through the frame-server path. What remains:
 
-Media Foundation decodes at full rate, the page composites *every* frame, and **zero** video frames
-reach the screen. Opening the same `.mp4` directly plays fine — the failure only occurs for video
-embedded in a page. It is isolated to one block in
-`MediaPlayerPrivateMediaFoundation::paintCurrentFrameToTextureMapper`: the texture-upload condition
-never succeeds, so the function early-returns before drawing. Proof: the `fsvid:` diagnostic that
-sits immediately past that return appears **zero** times in a 12,000-line log. The next step is to
-log its four sub-conditions in a single build and see which one fails — not to guess.
+- **Only H.264 draws.** VP9/AV1 and other codecs do not, so many sites (and non-H.264 YouTube
+  streams) still show a blank/black player.
+- **YouTube stops after ~1 minute** on the H.264 path it does reach.
+
+### The top active bug: tall media-heavy pages crash or tile badly
+
+Large image/video grids (search-result pages and similar) can **close the app** or render with
+**fragmented / misaligned / blank tiles**. A structural media + rasterisation rework has landed
+(concurrent-decode cap across memory tiers, one shared readback D3D device, contents-scale pinning to
+kill the tile-grid "nuke" storm, a per-frame raster budget, and tile-creation caps) but is **not
+fully resolved on-device yet**. This is the highest-priority open issue.
 
 ### Other known-bad
 
@@ -85,7 +96,8 @@ log its four sub-conditions in a single build and see which one fails — not to
 - **Performance** — ~2013 ARM32 CPUs. A worst-case frame measured `js=2337ms update=883ms
   composite=243ms`: **JS and layout dominate; rasterisation is ~7%.** Optimise accordingly.
 - **Missing platform features** — `window.open`/popups (breaks some OAuth logins), file upload,
-  some JS dialogs / platform pickers, WebAssembly.
+  some JS dialogs / platform pickers. (WebAssembly now works, incl. modules with imports, via a
+  bundled WAMR runtime.)
 - **Stability** — crashes happen; this is alpha.
 
 ## Repository layout
@@ -195,12 +207,12 @@ welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the (patch-based) workfl
 scoped rather than cold-starting on a WebKit port. **[TASK.md](TASK.md)** is the ordered plan — it says
 what to do first and why, and lists what has already been ruled out so you don't repeat it.
 
-**Active development is paused as of 2026-07-20.** The tree builds, deploys and runs, and the open
-problems are written up with the device evidence behind each one. If you want to pick something up,
-the highest-value item by a distance is the video draw bug at the top of
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md): it is narrowed to a single `if` condition, the diagnostic that
-would identify which term fails is one `snprintf` away, and fixing it makes video work in pages —
-which is the difference between a demo and something usable.
+**Under active development.** The tree builds, deploys and runs, and the open problems are written up
+with the device evidence behind each one. If you want to pick something up, the highest-value item by
+a distance is the **tall media-heavy page crash / broken tiling** (top of
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md)): a structural media + rasterisation rework has landed but isn't
+fully resolved on-device, and fixing it is the difference between "video works in isolation" and
+"real image/video-grid pages don't fall over."
 
 ## Credits / license
 
