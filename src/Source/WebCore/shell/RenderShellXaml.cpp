@@ -135,9 +135,33 @@ public:
     }
 
 protected:
-    virtual void OnLaunched(LaunchActivatedEventArgs^) override
+    virtual void OnLaunched(LaunchActivatedEventArgs^ args) override
     {
         WebCorePort::portLog("revenant: OnLaunched");
+
+        // RE-ACTIVATION GUARD. OnLaunched runs on EVERY activation -- tapping the tile while the app is
+        // already running, resuming from a terminated state, or a redeploy -- not just the first launch.
+        // This function builds the whole UI tree and registers the CoreWindow key handlers, and none of
+        // that was guarded, so every extra activation added ANOTHER set of handlers to the same
+        // CoreWindow. Device-confirmed: after three activations one keypress logged three KeyDown and
+        // three CharacterReceived events, and the page's autocomplete requests walked q=v -> q=vv ->
+        // q=vvv. Typing "v" put "vvv" in the field.
+        //
+        // Second, quieter bug from the same cause: m_inited guards only the WebCore engine init, so a
+        // re-activation built a BRAND NEW SwapChainPanel and made it the window content while the engine
+        // stayed bound to the previous one -- rendering into an orphaned panel.
+        //
+        // The standard UWP shape is to build the tree only when there is no content yet, then activate.
+        if (Window::Current->Content) {
+            char b[128];
+            snprintf(b, sizeof b, "revenant: OnLaunched RE-ACTIVATION (prevExec=%d) -- reusing existing UI, not rebuilding",
+                args ? static_cast<int>(args->PreviousExecutionState) : -1);
+            WebCorePort::portLog(b);
+            Window::Current->Activate();
+            WebCoreBrowserForceRepaint(); // fresh backbuffers after the OS invalidated them
+            return;
+        }
+
         setupLog();
         loadCACert();
 
@@ -162,6 +186,13 @@ protected:
         m_panel->PointerPressed += ref new PointerEventHandler(this, &RevenantApp::onPointerPressed);
         m_panel->PointerMoved += ref new PointerEventHandler(this, &RevenantApp::onPointerMoved);
         m_panel->PointerReleased += ref new PointerEventHandler(this, &RevenantApp::onPointerReleased);
+        // A system gesture (edge swipe), an incoming call, or a PLM suspend ends a touch with
+        // PointerCaptureLost / PointerCanceled -- NOT PointerReleased. Without these the touch point is
+        // never erased from the driver's active-touch map, so every subsequent touch event carries an
+        // extra stale point (pages read 2+ points as a pinch) and the map grows unboundedly, since
+        // PointerId is monotonic. Route both to phase 3 = TouchCancel, which the driver already handles.
+        m_panel->PointerCaptureLost += ref new PointerEventHandler(this, &RevenantApp::onPointerCancelled);
+        m_panel->PointerCanceled += ref new PointerEventHandler(this, &RevenantApp::onPointerCancelled);
         m_panel->SizeChanged += ref new SizeChangedEventHandler(this, &RevenantApp::onSizeChanged);
         root->Children->Append(m_panel);
 
@@ -819,6 +850,17 @@ private:
             m_lastX = x; m_lastY = y;
         }
     }
+    void onPointerCancelled(Object^, PointerRoutedEventArgs^ e)
+    {
+        if (isTouch(e)) {
+            int x = m_lastX, y = m_lastY;
+            toDip(e, x, y);
+            WebCoreBrowserTouch(pointerId(e), 3, x, y); // touchcancel -> driver erases the point
+        }
+        // Deliberately no synthetic tap here: a cancelled gesture is not a click.
+        m_pressed = false;
+    }
+
     void onPointerReleased(Object^, PointerRoutedEventArgs^ e)
     {
         if (isTouch(e)) {

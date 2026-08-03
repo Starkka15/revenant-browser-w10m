@@ -1,0 +1,71 @@
+diff --git a/core/shared/platform/windows/win_thread.c b/core/shared/platform/windows/win_thread.c
+index 1f6a57e..28e61b0 100644
+--- a/core/shared/platform/windows/win_thread.c
++++ b/core/shared/platform/windows/win_thread.c
+@@ -159,7 +159,12 @@ os_thread_sys_init()
+     if (os_mutex_init(&thread_data_list_lock) != BHT_OK)
+         goto fail5;
+ 
+-    if ((module = GetModuleHandle((LPCTSTR) "kernel32"))) {
++    /* GetModuleHandle() is a desktop-only Win32 API; it is not available to UWP/WindowsStore
++       apps (unresolved __imp_GetModuleHandle at link). GetModuleHandleExW is the app-partition
++       equivalent. GetCurrentThreadStackLimits itself is UWP-allowed, so the GetProcAddress lookup
++       still succeeds; if the module can't be resolved the pointer stays NULL and WAMR falls back. */
++    module = NULL;
++    if (GetModuleHandleExW(0, L"kernel32", &module) && module) {
+         *(void **)&GetCurrentThreadStackLimits_Kernel32 =
+             GetProcAddress(module, "GetCurrentThreadStackLimits");
+     }
+diff --git a/core/version.h b/core/version.h
+index 4e0b9f1..e3f7fa7 100644
+--- a/core/version.h
++++ b/core/version.h
+@@ -1,24 +1,24 @@
+-/*
+- * Copyright (C) 2019 Intel Corporation.  All rights reserved.
+- * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+- */
+-
+-/*
+- * version.h.in is a template file.  version.h is a generated file.
+- * Please do not edit both files directly.
+- *
+- * Any changes to the version should be done in build-scripts/version.cmake.
+- *
+- * Continue to maintain the version.h for certain embedded platforms.
+- */
+-
+-#ifndef _WAMR_VERSION_H_
+-#define _WAMR_VERSION_H_
+-
+-/* clang-format off */
+-#define WAMR_VERSION_MAJOR 2
+-#define WAMR_VERSION_MINOR 4
+-#define WAMR_VERSION_PATCH 5
+-/* clang-format on */
+-
+-#endif
++/*
++ * Copyright (C) 2019 Intel Corporation.  All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++ */
++
++/*
++ * version.h.in is a template file.  version.h is a generated file.
++ * Please do not edit both files directly.
++ *
++ * Any changes to the version should be done in build-scripts/version.cmake.
++ *
++ * Continue to maintain the version.h for certain embedded platforms.
++ */
++
++#ifndef _WAMR_VERSION_H_
++#define _WAMR_VERSION_H_
++
++/* clang-format off */
++#define WAMR_VERSION_MAJOR 2
++#define WAMR_VERSION_MINOR 4
++#define WAMR_VERSION_PATCH 5
++/* clang-format on */
++
++#endif

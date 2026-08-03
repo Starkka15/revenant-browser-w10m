@@ -1,0 +1,88 @@
+diff --git a/lib/http.c b/lib/http.c
+index 35e7085..30e903b 100644
+--- a/lib/http.c
++++ b/lib/http.c
+@@ -4182,14 +4182,18 @@ CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
+     result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_SCHEME),
+                              scheme, strlen(scheme));
+   }
+-  if(!result && authority) {
+-    result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_AUTHORITY),
+-                             authority, strlen(authority));
+-  }
++  /* Revenant: iOS Safari pseudo-header order is :method,:scheme,:path,:authority (m,s,p,a).
++     curl's native order is m,s,a,p (authority before path). Emit :path before :authority to
++     match Safari -- the Akamai h2 fingerprint encodes this order and Cloudflare Turnstile checks
++     it against our iOS Safari UA/TLS-JA3. (Order is semantically irrelevant to servers.) */
+   if(!result && req->path) {
+     result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_PATH),
+                              req->path, strlen(req->path));
+   }
++  if(!result && authority) {
++    result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_AUTHORITY),
++                             authority, strlen(authority));
++  }
+   for(i = 0; !result && i < Curl_dynhds_count(&req->headers); ++i) {
+     e = Curl_dynhds_getn(&req->headers, i);
+     if(!h2_non_field(e->name, e->namelen)) {
+diff --git a/lib/http2.c b/lib/http2.c
+index dbe6f1a..407bd93 100644
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -102,14 +102,19 @@
+ static size_t populate_settings(nghttp2_settings_entry *iv,
+                                 struct Curl_easy *data)
+ {
+-  iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
+-  iv[0].value = Curl_multi_max_concurrent_streams(data->multi);
++  (void)data;
++  /* Revenant: emit the iOS Safari 17 HTTP/2 SETTINGS fingerprint verbatim -- order AND values
++     (Akamai "2:0;4:2097152;3:100"). We already present an iOS Safari UA and a pinned iOS TLS-JA3
++     ClientHello; a stock curl/nghttp2 SETTINGS frame under that mask is exactly the h2-fingerprint
++     mismatch Cloudflare Turnstile scores against, causing intermittent re-challenge loops. Match it. */
++  iv[0].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;         /* 2:0 */
++  iv[0].value = 0;
+ 
+-  iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
+-  iv[1].value = H2_STREAM_WINDOW_SIZE_INITIAL;
++  iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE; /* 4:2097152 (2 MiB, Safari) */
++  iv[1].value = 2097152;
+ 
+-  iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
+-  iv[2].value = data->multi->push_cb != NULL;
++  iv[2].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS; /* 3:100 */
++  iv[2].value = 100;
+ 
+   return 3;
+ }
+@@ -599,10 +604,13 @@ static CURLcode cf_h2_ctx_open(struct Curl_cfilter *cf,
+     }
+   }
+ 
+-  rc = nghttp2_session_set_local_window_size(ctx->h2, NGHTTP2_FLAG_NONE, 0,
+-                                             HTTP2_HUGE_WINDOW_SIZE);
++  /* Revenant: emit the iOS Safari connection WINDOW_UPDATE (increment 10485760) as the first
++     WINDOW_UPDATE frame, instead of curl's ~1GB HTTP2_HUGE_WINDOW_SIZE. The Akamai h2 fingerprint
++     reads this first frame's increment; 1GB screams "not a browser". submit_window_update also
++     raises our local connection flow-control window (default 65535 -> ~10.5MB), which is ample. */
++  rc = nghttp2_submit_window_update(ctx->h2, NGHTTP2_FLAG_NONE, 0, 10485760);
+   if(rc) {
+-    failf(data, "nghttp2_session_set_local_window_size() failed: %s(%d)",
++    failf(data, "nghttp2_submit_window_update(conn) failed: %s(%d)",
+           nghttp2_strerror(rc), rc);
+     result = CURLE_HTTP2;
+     goto out;
+@@ -1871,9 +1879,10 @@ static void h2_pri_spec(struct cf_h2_ctx *ctx,
+   struct Curl_data_priority *prio = &data->set.priority;
+   struct h2_stream_ctx *depstream = H2_STREAM_CTX(ctx, prio->parent);
+   int32_t depstream_id = depstream ? depstream->id : 0;
+-  nghttp2_priority_spec_init(pri_spec, depstream_id,
+-                             sweight_wanted(data),
+-                             data->set.priority.exclusive);
++  (void)depstream_id;
++  /* Revenant: iOS Safari HEADERS priority = weight 255, no dependency, non-exclusive, and it sends
++     NO standalone PRIORITY frames (Akamai PRIORITY section "0"). Match it for the h2 fingerprint. */
++  nghttp2_priority_spec_init(pri_spec, 0, 255, 0);
+   data->state.priority = *prio;
+ }
+ 

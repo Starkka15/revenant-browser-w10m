@@ -204,6 +204,26 @@ public:
         callback(WTFMove(deletedIdentifiers)); // lock released before callback
     }
 
+    // Live totals for the mempool/cachestorage diagnostic. This store is in-memory only, has no size
+    // cap and no eviction, is never cleared on navigation, and is NOT touched by WebCore::releaseMemory
+    // -- so on a service-worker site (YouTube, Google, Twitter, Reddit all cache.put() their JS bundles,
+    // fonts and images) it grows monotonically and lands entirely in mempool's unattributed other=.
+    // Measuring it is the cheapest way to confirm or eliminate it as the bulk of that number.
+    void totals(unsigned& caches, unsigned& records, unsigned long long& bytes)
+    {
+        Locker locker { m_lock };
+        caches = m_caches.size();
+        records = 0;
+        bytes = 0;
+        for (auto& entry : m_caches.values()) {
+            if (!entry)
+                continue;
+            records += entry->records.size();
+            for (auto& r : entry->records)
+                bytes += r.responseBodySize;
+        }
+    }
+
 private:
     PortCacheStore() = default;
 
@@ -212,6 +232,10 @@ private:
     HashMap<ClientOrigin, PortOriginCaches> m_originCaches;
     uint64_t m_nextCacheIdentifier { 0 };
 };
+
+// Live store pointer for diagnostics only (set by the provider ctor; the provider owns the store for
+// process life). Read by PortCacheStorageTotals below.
+static PortCacheStore* s_liveStoreForDiagnostics = nullptr;
 
 // The connection WebCore talks to. Every method forwards to the shared store synchronously
 // (in-process — no IPC round trip) and invokes its completion handler exactly once.
@@ -285,6 +309,10 @@ private:
         : m_store(PortCacheStore::create())
         , m_connection(PortCacheStorageConnection::create(m_store.copyRef()))
     {
+        // Publish the live store so the driver's gate line can report its size. Raw pointer, not a Ref:
+        // the provider owns the store for the life of the process and taking a strong ref here would
+        // keep it alive past teardown for no reason.
+        s_liveStoreForDiagnostics = m_store.ptr();
     }
 
     Ref<PortCacheStore> m_store;
@@ -294,6 +322,17 @@ private:
 Ref<CacheStorageProvider> createPortCacheStorageProvider()
 {
     return PortCacheStorageProvider::create();
+}
+
+// Reported on the gate line (see WebCoreDriver.cpp). Zero until a page actually uses window.caches.
+extern "C" void PortCacheStorageTotals(unsigned* caches, unsigned* records, unsigned long long* bytes)
+{
+    unsigned c = 0, r = 0; unsigned long long b = 0;
+    if (s_liveStoreForDiagnostics)
+        s_liveStoreForDiagnostics->totals(c, r, b);
+    if (caches) *caches = c;
+    if (records) *records = r;
+    if (bytes) *bytes = b;
 }
 
 } // namespace WebCorePort

@@ -1,0 +1,22 @@
+diff --git a/crypto/thread_win.cc b/crypto/thread_win.cc
+index d87c296..bc590fd 100644
+--- a/crypto/thread_win.cc
++++ b/crypto/thread_win.cc
+@@ -106,7 +106,7 @@ static void NTAPI thread_local_destructor(PVOID module, DWORD reason,
+ // Note, in the prefixed build, `p_thread_callback_boringssl` may be a macro.
+ #define STRINGIFY(x) #x
+ #define EXPAND_AND_STRINGIFY(x) STRINGIFY(x)
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ __pragma(comment(linker, "/INCLUDE:_tls_used")) __pragma(comment(
+     linker, "/INCLUDE:" EXPAND_AND_STRINGIFY(p_thread_callback_boringssl)))
+ #else
+@@ -130,7 +130,7 @@ __pragma(comment(linker, "/INCLUDE:__tls_used")) __pragma(comment(
+ // reference to this variable with a linker /INCLUDE:symbol pragma to ensure
+ // that.) If this variable is discarded, the OnThreadExit function will never
+ // be called.
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ // .CRT section is merged with .rdata on x64 so it must be constant data.
+ #pragma const_seg(".CRT$XLC")

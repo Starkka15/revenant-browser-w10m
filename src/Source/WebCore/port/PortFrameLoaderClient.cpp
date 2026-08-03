@@ -162,7 +162,9 @@ void PortFrameLoaderClient::dispatchWillSubmitForm(FormState&, CompletionHandler
 
 Ref<DocumentLoader> PortFrameLoaderClient::createDocumentLoader(const ResourceRequest& request, const SubstituteData& substituteData)
 {
-    portLog("client: createDocumentLoader");
+    // crumb: flushed breadcrumb (rule34 vore+video hard crash truncated right at a document-loader/iframe
+    // creation with no FAULT). URL tells us WHICH frame's creation the fast-fail lands on.
+    portLog((std::string("crumb: createDocumentLoader url=") + request.url().string().utf8().data()).c_str());
     return DocumentLoader::create(request, substituteData);
 }
 
@@ -174,12 +176,14 @@ RefPtr<Frame> PortFrameLoaderClient::createFrame(const String& name, HTMLFrameOw
     // create the Frame under the owner element, wire it into the parent's frame tree, and init the
     // loader. WebCore's SubframeLoader then drives the child's src load. Mirrors the WebKitLegacy
     // WebFrameLoaderClient::createFrame pattern.
+    portLog((std::string("crumb: createFrame name=") + name.utf8().data()).c_str());
     if (!m_frame)
         return nullptr;
     auto* page = m_frame->page();
     if (!page)
         return nullptr;
 
+    portLog("crumb: createFrame -> building child frame + init");
     auto subframeClient = makeUniqueRef<PortFrameLoaderClient>();
     auto* subframeClientPtr = subframeClient.ptr();
     auto childFrame = Frame::create(page, &ownerElement, WTFMove(subframeClient));
@@ -188,6 +192,7 @@ RefPtr<Frame> PortFrameLoaderClient::createFrame(const String& name, HTMLFrameOw
     childFrame->tree().setName(name);
     m_frame->tree().appendChild(childFrame.get());
     childFrame->init();
+    portLog("crumb: createFrame -> child init() returned");
 
     // init() can detach the frame (e.g. a navigation policy dropped it) — return null if so.
     if (!childFrame->page()) {
@@ -290,8 +295,23 @@ RetainPtr<CFDictionaryRef> PortFrameLoaderClient::connectionProperties(DocumentL
 
 void PortFrameLoaderClient::dispatchDidReceiveResponse(DocumentLoader*, ResourceLoaderIdentifier, const ResourceResponse& response)
 {
+    // Revenant diag: include the response source so a 304 delivered to a client can be attributed to
+    // Network vs a *AfterValidation memory/disk-cache revalidation (which bypasses the curl 304->200 fix).
+    const char* src = "?";
+    switch (response.source()) {
+    case ResourceResponse::Source::Unknown: src = "unknown"; break;
+    case ResourceResponse::Source::Network: src = "net"; break;
+    case ResourceResponse::Source::DiskCache: src = "disk"; break;
+    case ResourceResponse::Source::DiskCacheAfterValidation: src = "disk-reval"; break;
+    case ResourceResponse::Source::MemoryCache: src = "mem"; break;
+    case ResourceResponse::Source::MemoryCacheAfterValidation: src = "mem-reval"; break;
+    case ResourceResponse::Source::ServiceWorker: src = "sw"; break;
+    case ResourceResponse::Source::ApplicationCache: src = "appcache"; break;
+    case ResourceResponse::Source::DOMCache: src = "domcache"; break;
+    case ResourceResponse::Source::InspectorOverride: src = "inspector"; break;
+    }
     portLog(("client: didReceiveResponse http=" + std::to_string(response.httpStatusCode())
-        + " mime=" + toUtf8(response.mimeType())).c_str());
+        + " mime=" + toUtf8(response.mimeType()) + " src=" + src).c_str());
 }
 
 void PortFrameLoaderClient::dispatchDidReceiveContentLength(DocumentLoader*, ResourceLoaderIdentifier, int)
@@ -730,7 +750,19 @@ void PortFrameLoaderClient::updateGlobalHistoryRedirectLinks()
 
 bool PortFrameLoaderClient::shouldGoToHistoryItem(HistoryItem&) const
 {
-    return false;
+    // MUST be true. HistoryController::goToItem -- the function behind EVERY back/forward navigation --
+    // early-returns when this is false, so returning false silently disables the hardware Back button,
+    // history.back() and history.go(-1) entirely. The false came from copying the EmptyClients default
+    // (EmptyClients.cpp: return false), which is correct for a null client and wrong for a real one;
+    // WebKitLegacy/win returns true here.
+    //
+    // This is what produced the "hardware Back just closes the app" report: mid-session
+    // canGoBackOrForward(-1) is true, so the shell marks BackRequested handled and calls goBack -- which
+    // was then blocked here, so Back appeared dead; at the start of history canGoBack is false, the
+    // event goes unhandled, and the OS closes the app. Both symptoms, one cause.
+    //
+    // Upstream uses this hook for parental-controls style vetoes. We have no such policy, so allow all.
+    return true;
 }
 
 void PortFrameLoaderClient::saveViewStateToItem(HistoryItem&)
@@ -829,7 +861,13 @@ void PortFrameLoaderClient::dispatchDidClearWindowObjectInWorld(DOMWrapperWorld&
   setTimeout(function(){W('RTC: +8s candidates='+cands.length+' gatheringState='+pc.iceGatheringState);
     for(var i=0;i<cands.length&&i<6;i++)W('RTC cand#'+i+'='+cands[i]);},8000);
  }catch(e){W('RTC-ERR '+e)}}
- function run(){nav();gl();cv();rtc();W('END');}
+ // Revenant: rule34 "vore+video" search crashed HARD (log truncates mid-FPDIAG, no FAULT flushed =
+ // fast-fail/stack-overflow bypassing the vectored handler) deterministically as FPDIAG ran. gl()
+ // (a 2nd live WebGL context), cv() (canvas toDataURL) and rtc() (a real RTCPeerConnection+offer, on
+ // the partially-ported WebRTC stack) are all heavy/risky ops injected into EVERY page while the
+ // video-results grid is hammering the GPU. Run ONLY the passive navigator dump (still gives the
+ // inner=/fingerprint values we verify against); the context-creating probes are the crash suspects.
+ function run(){nav();W('END');}
  if(document&&document.readyState!=='loading')run();
  else if(document)document.addEventListener('DOMContentLoaded',run);
  else setTimeout(run,50);

@@ -1,0 +1,242 @@
+diff --git a/pixman/pixman-bits-image.c b/pixman/pixman-bits-image.c
+index f050f35..7642f41 100644
+--- a/pixman/pixman-bits-image.c
++++ b/pixman/pixman-bits-image.c
+@@ -409,6 +409,147 @@ bits_image_fetch_pixel_separable_convolution (bits_image_t  *image,
+     reduce(satot, srtot, sgtot, sbtot, out);
+ }
+ 
++#if defined(_M_ARM) && !defined(PIXMAN_NO_NEON_INTRINSICS)
++#include <arm_neon.h>
++/* ── NEON _32 convolution fetchers (MSVC ARM32 UWP — Revenant) ────────────────
++ * The GOOD/BEST filter path ran scalar accum_32 per source pixel (4 imuls + 4
++ * scalar totals). These hold the accumulator in a NEON register across the whole
++ * kernel loop: one vmlaq_u32 per source pixel, one reduce at the end.
++ * BIT-EXACT vs accum_32/reduce_32: vmlaq_u32 multiplies+accumulates mod 2^32,
++ * identical bit pattern to the scalar (int)channel*f added into an unsigned total
++ * (f reinterpreted to u32 makes negative sharpening weights wrap the same way).
++ * reduce = (acc + 0x8000) >> 16 then min(.,0xff) — matches reduce_32's CLIP(.,0,0xff)
++ * (unsigned, so the low clamp is a no-op). Lane order B,G,R,A == the ARGB byte
++ * layout, so vmovn packs straight back to (A<<24|R<<16|G<<8|B). */
++static force_inline uint32x4_t
++rev_neon_accum_px (uint32x4_t acc, uint32_t p32, pixman_fixed_t f)
++{
++    uint32x4_t px = vmovl_u16 (vget_low_u16 (vmovl_u8 (vreinterpret_u8_u32 (vdup_n_u32 (p32)))));
++    return vmlaq_u32 (acc, px, vdupq_n_u32 ((uint32_t) f));
++}
++static force_inline void
++rev_neon_reduce (uint32x4_t acc, void *out)
++{
++    acc = vshrq_n_u32 (vaddq_u32 (acc, vdupq_n_u32 (0x8000)), 16);
++    acc = vminq_u32 (acc, vdupq_n_u32 (0xff));
++    uint16x4_t n16 = vmovn_u32 (acc);
++    uint8x8_t  n8  = vmovn_u16 (vcombine_u16 (n16, n16));
++    *(uint32_t *) out = vget_lane_u32 (vreinterpret_u32_u8 (n8), 0);
++}
++
++static force_inline void
++bits_image_fetch_pixel_convolution_neon32 (bits_image_t *image, pixman_fixed_t x, pixman_fixed_t y,
++					   get_pixel_t get_pixel, void *out)
++{
++    pixman_fixed_t *params = image->common.filter_params;
++    int x_off = (params[0] - pixman_fixed_1) >> 1;
++    int y_off = (params[1] - pixman_fixed_1) >> 1;
++    int32_t cwidth = pixman_fixed_to_int (params[0]);
++    int32_t cheight = pixman_fixed_to_int (params[1]);
++    int32_t i, j, x1, x2, y1, y2;
++    pixman_repeat_t repeat_mode = image->common.repeat;
++    int width = image->width;
++    int height = image->height;
++    uint32x4_t acc = vdupq_n_u32 (0);
++
++    params += 2;
++    x1 = pixman_fixed_to_int (x - pixman_fixed_e - x_off);
++    y1 = pixman_fixed_to_int (y - pixman_fixed_e - y_off);
++    x2 = x1 + cwidth;
++    y2 = y1 + cheight;
++
++    for (i = y1; i < y2; ++i)
++    {
++	for (j = x1; j < x2; ++j)
++	{
++	    int rx = j, ry = i;
++	    pixman_fixed_t f = *params;
++	    if (f)
++	    {
++		argb_t pixel;
++		if (repeat_mode != PIXMAN_REPEAT_NONE)
++		{
++		    repeat (repeat_mode, &rx, width);
++		    repeat (repeat_mode, &ry, height);
++		    get_pixel (image, rx, ry, FALSE, &pixel);
++		}
++		else
++		    get_pixel (image, rx, ry, TRUE, &pixel);
++		acc = rev_neon_accum_px (acc, *(uint32_t *) &pixel, f);
++	    }
++	    params++;
++	}
++    }
++    rev_neon_reduce (acc, out);
++}
++
++static force_inline void
++bits_image_fetch_pixel_separable_convolution_neon32 (bits_image_t *image, pixman_fixed_t x, pixman_fixed_t y,
++						     get_pixel_t get_pixel, void *out)
++{
++    pixman_fixed_t *params = image->common.filter_params;
++    pixman_repeat_t repeat_mode = image->common.repeat;
++    int width = image->width;
++    int height = image->height;
++    int cwidth = pixman_fixed_to_int (params[0]);
++    int cheight = pixman_fixed_to_int (params[1]);
++    int x_phase_bits = pixman_fixed_to_int (params[2]);
++    int y_phase_bits = pixman_fixed_to_int (params[3]);
++    int x_phase_shift = 16 - x_phase_bits;
++    int y_phase_shift = 16 - y_phase_bits;
++    int x_off = ((cwidth << 16) - pixman_fixed_1) >> 1;
++    int y_off = ((cheight << 16) - pixman_fixed_1) >> 1;
++    pixman_fixed_t *y_params;
++    int32_t x1, x2, y1, y2;
++    int32_t px, py;
++    int i, j;
++    uint32x4_t acc = vdupq_n_u32 (0);
++
++    x = ((x >> x_phase_shift) << x_phase_shift) + ((1 << x_phase_shift) >> 1);
++    y = ((y >> y_phase_shift) << y_phase_shift) + ((1 << y_phase_shift) >> 1);
++
++    px = (x & 0xffff) >> x_phase_shift;
++    py = (y & 0xffff) >> y_phase_shift;
++
++    y_params = params + 4 + (1 << x_phase_bits) * cwidth + py * cheight;
++
++    x1 = pixman_fixed_to_int (x - pixman_fixed_e - x_off);
++    y1 = pixman_fixed_to_int (y - pixman_fixed_e - y_off);
++    x2 = x1 + cwidth;
++    y2 = y1 + cheight;
++
++    for (i = y1; i < y2; ++i)
++    {
++	pixman_fixed_48_16_t fy = *y_params++;
++	pixman_fixed_t *x_params = params + 4 + px * cwidth;
++	if (fy)
++	{
++	    for (j = x1; j < x2; ++j)
++	    {
++		pixman_fixed_t fx = *x_params++;
++		int rx = j, ry = i;
++		if (fx)
++		{
++		    argb_t pixel;
++		    pixman_fixed_t f;
++		    if (repeat_mode != PIXMAN_REPEAT_NONE)
++		    {
++			repeat (repeat_mode, &rx, width);
++			repeat (repeat_mode, &ry, height);
++			get_pixel (image, rx, ry, FALSE, &pixel);
++		    }
++		    else
++			get_pixel (image, rx, ry, TRUE, &pixel);
++		    f = (fy * fx + 0x8000) >> 16;
++		    acc = rev_neon_accum_px (acc, *(uint32_t *) &pixel, f);
++		}
++	    }
++	}
++    }
++    rev_neon_reduce (acc, out);
++}
++#endif /* _M_ARM convolution NEON */
++
+ static force_inline void
+ bits_image_fetch_pixel_filtered (bits_image_t  *image,
+ 				 pixman_bool_t  wide,
+@@ -443,9 +584,13 @@ bits_image_fetch_pixel_filtered (bits_image_t  *image,
+ 	}
+ 	else
+ 	{
++#if defined(_M_ARM) && !defined(PIXMAN_NO_NEON_INTRINSICS)
++	    bits_image_fetch_pixel_convolution_neon32 (image, x, y, get_pixel, out);
++#else
+ 	    bits_image_fetch_pixel_convolution (image, x, y,
+ 						get_pixel, out,
+ 						accum_32, reduce_32);
++#endif
+ 	}
+ 	break;
+ 
+@@ -459,9 +604,13 @@ bits_image_fetch_pixel_filtered (bits_image_t  *image,
+ 	}
+ 	else
+ 	{
++#if defined(_M_ARM) && !defined(PIXMAN_NO_NEON_INTRINSICS)
++	    bits_image_fetch_pixel_separable_convolution_neon32 (image, x, y, get_pixel, out);
++#else
+ 	    bits_image_fetch_pixel_separable_convolution (image, x, y,
+ 							  get_pixel, out,
+ 							  accum_32, reduce_32);
++#endif
+ 	}
+         break;
+ 
+diff --git a/pixman/pixman-inlines.h b/pixman/pixman-inlines.h
+index f785910..e1a9099 100644
+--- a/pixman/pixman-inlines.h
++++ b/pixman/pixman-inlines.h
+@@ -88,6 +88,49 @@ pixman_fixed_to_bilinear_weight (pixman_fixed_t x)
+ 	   ((1 << BILINEAR_INTERPOLATION_BITS) - 1);
+ }
+ 
++#if defined(_M_ARM) && !defined(PIXMAN_NO_NEON_INTRINSICS)
++/* ── NEON bilinear (MSVC ARM32 UWP — Revenant) ────────────────────────────────
++ * MSVC can't build pixman's GAS NEON asm, and this inline is the single choke
++ * point for ALL bilinear scaling (per-pixel affine fetcher + 4 scanline fast
++ * paths). Hand-written arm_neon.h intrinsics, verified to emit real NEON
++ * (vld1/vmull/vshr) under cl 19.29 for ARM. Pixel-EXACT match of the 32-bit
++ * BITS<=8 scalar path below: per channel  c = (tl*w00 + tr*w10 + bl*w01 +
++ * br*w11) >> 16, truncated, weights summing to exactly 65536. Done in u32 lanes
++ * because a weight reaches 65536 (distx==disty==0) and overflows u16.
++ */
++#include <arm_neon.h>
++static force_inline uint32_t
++bilinear_interpolation (uint32_t tl, uint32_t tr,
++			uint32_t bl, uint32_t br,
++			int distx, int disty)
++{
++    distx <<= (8 - BILINEAR_INTERPOLATION_BITS);
++    disty <<= (8 - BILINEAR_INTERPOLATION_BITS);
++
++    /* area weights, same naming as the scalar path (distixiy..distxy) */
++    uint32_t w00 = (uint32_t)((256 - distx) * (256 - disty)); /* tl */
++    uint32_t w10 = (uint32_t)(distx * (256 - disty));	     /* tr */
++    uint32_t w01 = (uint32_t)((256 - distx) * disty);	     /* bl */
++    uint32_t w11 = (uint32_t)(distx * disty);		     /* br */
++
++    /* each pixel: 4 bytes B,G,R,A -> u32x4 lane per channel */
++    uint32x4_t c_tl = vmovl_u16 (vget_low_u16 (vmovl_u8 (vreinterpret_u8_u32 (vdup_n_u32 (tl)))));
++    uint32x4_t c_tr = vmovl_u16 (vget_low_u16 (vmovl_u8 (vreinterpret_u8_u32 (vdup_n_u32 (tr)))));
++    uint32x4_t c_bl = vmovl_u16 (vget_low_u16 (vmovl_u8 (vreinterpret_u8_u32 (vdup_n_u32 (bl)))));
++    uint32x4_t c_br = vmovl_u16 (vget_low_u16 (vmovl_u8 (vreinterpret_u8_u32 (vdup_n_u32 (br)))));
++
++    uint32x4_t acc = vmulq_u32 (c_tl, vdupq_n_u32 (w00));
++    acc = vmlaq_u32 (acc, c_tr, vdupq_n_u32 (w10));
++    acc = vmlaq_u32 (acc, c_bl, vdupq_n_u32 (w01));
++    acc = vmlaq_u32 (acc, c_br, vdupq_n_u32 (w11));
++    acc = vshrq_n_u32 (acc, 16);			     /* truncate, matches scalar */
++
++    /* narrow u32x4 -> u16x4 -> u8x8, repack the 4 bytes into one uint32 */
++    uint16x4_t n16 = vmovn_u32 (acc);
++    uint8x8_t  n8  = vmovn_u16 (vcombine_u16 (n16, n16));
++    return vget_lane_u32 (vreinterpret_u32_u8 (n8), 0);
++}
++#else /* scalar reference paths */
+ #if BILINEAR_INTERPOLATION_BITS <= 4
+ /* Inspired by Filter_32_opaque from Skia */
+ static force_inline uint32_t
+@@ -221,6 +264,7 @@ bilinear_interpolation (uint32_t tl, uint32_t tr,
+ 
+ #endif
+ #endif // BILINEAR_INTERPOLATION_BITS <= 4
++#endif // _M_ARM NEON intrinsics vs scalar
+ 
+ static force_inline argb_t
+ bilinear_interpolation_float (argb_t tl, argb_t tr,

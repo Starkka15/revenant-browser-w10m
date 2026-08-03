@@ -134,28 +134,97 @@ struct MseBuffer {
 static std::mutex s_mseRegistryLock;
 static std::vector<struct MseSource*> s_mseSources;
 
-// Tier-0 ONE-VIDEO-AT-A-TIME (I-16). A 1GB single-core device cannot run a grid of autoplaying <video>
-// previews: rule34's search grid spun up ~10 frame-server players -> an 11,000-iteration fluidplayer
-// seek storm -> main thread pegged -> nothing composited -> frozen. Real iPhones already cap INLINE
-// playback to a single video (starting a second pauses the first), so this is BOTH the tier-0 resource
-// fix AND coherent with our iOS identity. Only this handle may AutoPlay/decode on tier-0; the rest load
-// paused. A later play() takes over (pauses the previous). Cleared when the active handle is torn down.
-// The tier-0 single-decode slot, and the lock that makes check-and-claim ATOMIC.
+// CONCURRENT-DECODE CAP (ALL tiers; was tier-0 ONLY -- the I-16 single-slot). A grid of autoplaying
+// <video> (rule34 search: ~16) each builds a full ~50MB MF pipeline + app-side D3D textures, and the
+// CONCURRENT build storm -- not steady-state decode -- is the heap-corruption/OOM window that crashed the
+// 950. The 950 is tier-2 (3GB), which the old tier-0-only gate never protected: every grid element that
+// reached startFrameServerPlayer built its pipeline, all at once. Real iPhones cap inline playback hard
+// too, so a small cap stays coherent with our iOS identity. Cap the number of SIMULTANEOUSLY-decoding
+// players by memory tier and LRU-evict the oldest when a newcomer claims a slot; eviction reclaims the
+// memory (evictFrameServerPlayer tears the pipeline down, not just Pause), and a later play() rebuilds.
 //
-// This was an unsynchronised global written from three different threads: startFrameServerPlayer runs
-// on a CURL WORKER thread for progressive video, on an MTA/threadpool thread for HLS, and on the main
-// thread for MSE. Device-verified consequence (rule34 post page, 2026-07-20): three <video> elements
-// probed at once, three worker threads all read g_tier0ActivePlayer as null before any of them wrote
-// it, so none saw an incumbent and ALL THREE created MediaPlayer pipelines. The log shows three
-// "frame-server started" lines in four lines of output with no eviction between them, on a device whose
-// whole policy is one decode at a time.
-//
-// Deliberately NOT s_mseRegistryLock: PortMseEmergencyTrim holds that across blocking WinRT calls
-// (Remove()/Buffered), and eviction below also does WinRT work -- sharing one lock invites a deadlock.
-// This lock only ever guards two pointer assignments; nothing blocking happens inside it.
-static struct MseSource* g_tier0ActivePlayer = nullptr;
+// g_activeDecoders is the LRU list (front = oldest). s_tier0SlotLock guards it AND the per-handle
+// player/token snapshot in onVideoFrame/evict/stop (kept its name to minimise churn, but it now guards
+// the whole active-decoder set, not a single slot). Deliberately NOT s_mseRegistryLock: PortMseEmergencyTrim
+// holds that across blocking WinRT calls (Remove()/Buffered) and eviction also does WinRT work -- sharing
+// one lock invites a deadlock. Nothing blocking runs inside this lock (WinRT teardown is dispatched AFTER
+// it is dropped). It was previously unsynchronised across three threads (startFrameServerPlayer runs on a
+// curl worker for progressive, an MTA/threadpool thread for HLS, and the main thread for MSE), which let
+// concurrent starts all read the slot as free and each build a pipeline.
+static std::vector<MseSource*> g_activeDecoders;
 static std::mutex s_tier0SlotLock;
 extern "C" unsigned WebCoreMemBudgetTier();
+
+static unsigned maxConcurrentDecoders()
+{
+    switch (WebCoreMemBudgetTier()) {
+    case 0:  return 1; // 1GB (640XL)
+    case 1:  return 2; // 2GB
+    default: return 3; // 3GB+ (the 950). Still far below the ~16 a media grid would otherwise spin up.
+    }
+}
+
+// Claim a decode slot for h (marks it most-recently-used) and return the players that must be evicted to
+// stay under the cap, as STRONG refs. Returning strong refs is the item-3 UAF fix: the old code captured
+// the incumbent as a RAW MseSource* under the lock and dereferenced it in evictFrameServerPlayer AFTER
+// the lock was dropped, so a concurrent PortMseDestroy could delete it in between (rule34's rapid
+// preview -> post -> fluidplayer churn is exactly that window). MUST be called under s_tier0SlotLock.
+static std::vector<MseSourceRef> claimDecodeSlot_locked(MseSource* h)
+{
+    auto it = std::find(g_activeDecoders.begin(), g_activeDecoders.end(), h);
+    if (it != g_activeDecoders.end())
+        g_activeDecoders.erase(it);
+    g_activeDecoders.push_back(h); // most-recently-used at the back
+    std::vector<MseSourceRef> evictees;
+    unsigned cap = maxConcurrentDecoders();
+    while (g_activeDecoders.size() > cap) {
+        MseSource* victim = g_activeDecoders.front();
+        g_activeDecoders.erase(g_activeDecoders.begin());
+        if (victim && victim != h)
+            evictees.emplace_back(victim); // strong ref taken while STILL under the lock
+    }
+    return evictees;
+}
+
+// Drop h from the active-decoder set (teardown, or a failed build). MUST be called under s_tier0SlotLock.
+static void releaseDecodeSlot_locked(MseSource* h)
+{
+    auto it = std::find(g_activeDecoders.begin(), g_activeDecoders.end(), h);
+    if (it != g_activeDecoders.end())
+        g_activeDecoders.erase(it);
+}
+
+// SHARED readback D3D11 device (item 2). Every frame-server player used to create its OWN ID3D11Device in
+// ensurePlayerTextures purely to CopyResource->Map the decoded frame for CPU readback -- N players = N
+// devices, each with Adreno driver-side command-queue + allocation overhead, multiplying exactly the GPU
+// resource the crash is about. The readback is a stateless scratch operation, so one process-wide device
+// serves every player. Multithread-protected, so concurrent CopyResource/Map from multiple MF worker
+// threads is legal. (The WinRT MediaPlayer's own internal decode device is opaque and cannot be shared;
+// this targets only the app-side readback device, which is fully ours.)
+static Microsoft::WRL::ComPtr<ID3D11Device> g_readbackDevice;
+static Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_readbackCtx;
+static std::mutex s_readbackDeviceLock;
+static bool ensureReadbackDevice()
+{
+    std::lock_guard<std::mutex> lock(s_readbackDeviceLock);
+    if (g_readbackDevice)
+        return true;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    D3D_FEATURE_LEVEL fl;
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
+            D3D11_SDK_VERSION, &dev, &fl, &ctx))) {
+        PortImgLog("mse: shared readback D3D11CreateDevice FAILED");
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
+    if (SUCCEEDED(dev.As(&mt)))
+        mt->SetMultithreadProtected(TRUE);
+    g_readbackDevice = dev;
+    g_readbackCtx = ctx;
+    return true;
+}
 
 // Platform::String^ -> UTF-8 std::string (the C ABI into WebCore's curl fetcher speaks UTF-8).
 static std::string toUtf8(Platform::String^ s)
@@ -198,16 +267,17 @@ static void ensurePlayerTextures(MseSource* h, UINT w, UINT hgt)
     h->rt.Reset();
     h->staging.Reset();
     if (!h->d3d) {
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        D3D_FEATURE_LEVEL fl;
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
-                D3D11_SDK_VERSION, &h->d3d, &fl, &h->d3dCtx))) {
-            PortImgLog("mse: player D3D11CreateDevice FAILED");
+        // Point at the ONE shared readback device (see ensureReadbackDevice) instead of creating a device
+        // per player. rt/staging below are still per-player (they are per-resolution frame buffers) but
+        // they allocate from the shared device, and onVideoFrame's CopyResource/Map run on the shared,
+        // multithread-protected immediate context. ComPtr copy = AddRef, so teardown's Reset() on h->d3d
+        // just drops a ref; the device stays alive process-wide.
+        if (!ensureReadbackDevice()) {
+            PortImgLog("mse: no shared readback device");
             return;
         }
-        Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(h->d3d.As(&mt)))
-            mt->SetMultithreadProtected(TRUE);
+        h->d3d = g_readbackDevice;
+        h->d3dCtx = g_readbackCtx;
     }
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = w; d.Height = hgt; d.MipLevels = 1; d.ArraySize = 1;
@@ -226,11 +296,29 @@ static void ensurePlayerTextures(MseSource* h, UINT w, UINT hgt)
 static void onVideoFrame(MseSource* h)
 {
     try {
-        if (h->closing || !h->player || !h->playerCtx)
-            return;
+        // #17 UAF FIX. This runs on a Media Foundation worker thread; evict/stop run on the UI thread.
+        // (1) The event was registered capturing a RAW MseSource* -- hold a scoped strong ref so `h`
+        //     cannot be deleted out from under us mid-handler.
+        // (2) h->player is a WinRT MediaPlayer^ (NON-atomic refcount). evictFrameServerPlayer/
+        //     PortMsePlayerStop null it on the UI thread; reading it here unlocked raced that write and
+        //     corrupted the WinRT refcount -> premature free -> heap corruption that surfaced far away in
+        //     the compositor tile raster (the rule34 vore+video "closes on search" fastfail at
+        //     c3:updateBacking). Snapshot player^ + ctx ONCE under the slot lock (teardown takes the same
+        //     lock, and now nulls h->player under it); the local ^ keeps the player alive for this frame
+        //     even if it is evicted immediately after. Do the GPU work on the LOCAL, never h->player.
+        MseSourceRef guard(h);
+        MediaPlayer^ player = nullptr;
+        void* ctx = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+            if (h->closing.load(std::memory_order_acquire) || !h->player || !h->playerCtx)
+                return;
+            player = h->player;      // ref^ bump under the lock
+            ctx = h->playerCtx;
+        }
         static bool s_loggedFirst = false;
         if (!s_loggedFirst) { s_loggedFirst = true; PortImgLog("mse: onVideoFrame first frame"); }
-        auto sess = h->player->PlaybackSession;
+        auto sess = player->PlaybackSession;
         UINT w = sess->NaturalVideoWidth, hgt = sess->NaturalVideoHeight;
         if (!w || !hgt)
             return;
@@ -244,22 +332,13 @@ static void onVideoFrame(MseSource* h)
         if (FAILED(CreateDirect3D11SurfaceFromDXGISurface(dxgi.Get(), &insp)) || !insp)
             return;
         auto surf = reinterpret_cast<IDirect3DSurface^>(insp.Get());
-        h->player->CopyFrameToVideoSurface(surf);
+        player->CopyFrameToVideoSurface(surf);
         h->d3dCtx->CopyResource(h->staging.Get(), h->rt.Get());
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (SUCCEEDED(h->d3dCtx->Map(h->staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
-            // TOCTOU: this handler runs on an MF thread. PortMsePlayerStop nulls playerCtx and unhooks
-            // VideoFrameAvailable, but unhooking does NOT wait for a handler already in flight -- one
-            // that passed the check could call into a MediaPlayerPrivate that is being destroyed. Snap
-            // the pointer once under the slot lock and re-check `closing` with it held, so teardown
-            // (which takes the same lock) cannot complete between the test and the call.
-            void* ctx = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-                if (!h->closing.load(std::memory_order_acquire))
-                    ctx = h->playerCtx;
-            }
-            if (ctx)
+            // Re-check closing right before delivering (teardown may have started during the GPU work);
+            // ctx was captured atomically with the player above.
+            if (ctx && !h->closing.load(std::memory_order_acquire))
                 WebCoreMsePlayerFrame(ctx, static_cast<const uint8_t*>(m.pData), static_cast<int>(w), static_cast<int>(hgt), static_cast<int>(m.RowPitch));
             h->d3dCtx->Unmap(h->staging.Get(), 0);
         }
@@ -294,9 +373,9 @@ void PortMseDestroy(void* srcH)
         std::lock_guard<std::mutex> lock(s_mseRegistryLock);
         s_mseSources.erase(std::remove(s_mseSources.begin(), s_mseSources.end(), h), s_mseSources.end());
     }
-    { // free the tier-0 decode slot (locked: teardown can run on a worker thread)
+    { // drop this handle from the active-decoder set (locked: teardown can run on a worker thread)
         std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-        if (g_tier0ActivePlayer == h) g_tier0ActivePlayer = nullptr;
+        releaseDecodeSlot_locked(h);
     }
     { // Under the slot lock so an in-flight onVideoFrame cannot snapshot playerCtx across this point.
         std::lock_guard<std::mutex> lock(s_tier0SlotLock);
@@ -563,18 +642,29 @@ void* PortMseGetMFMediaSource(void* srcH)
 // pipeline (~50MB) resident, so the "cap" grew memory instead of bounding it.
 static void evictFrameServerPlayer(MseSource* h)
 {
-    if (!h || !h->player)
+    if (!h)
         return;
     // Same staged teardown as PortMsePlayerStop: unhook the frame server FIRST (an in-flight
     // CopyFrameToVideoSurface racing Close is a deadlock vector), then Pause -> detach Source -> Close
     // on a threadpool thread, keeping the media source and its backing byte stream alive until after
     // delete so a late RTWorkQ Seek cannot hit a disposed stream (the I-13 crash).
-    MediaPlayer^ player = h->player;
+    // #17: snapshot + null h->player and the token UNDER the slot lock, so an onVideoFrame on the MF
+    // thread (which snapshots h->player under the same lock) can never read h->player while we clear it.
+    // Racing a WinRT ^ read against this write corrupted its refcount -> the heap-corruption fastfail.
+    MediaPlayer^ player = nullptr;
+    Windows::Foundation::EventRegistrationToken token {};
+    {
+        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+        player = h->player;
+        token = h->frameToken;
+        h->player = nullptr;
+        h->frameToken = Windows::Foundation::EventRegistrationToken {};
+    }
+    if (!player)
+        return;
     auto mediaSource = h->mediaSource;
     auto mseSource = h->source;
-    h->player = nullptr;
-    try { if (h->frameToken.Value) player->VideoFrameAvailable -= h->frameToken; } catch (...) { }
-    h->frameToken = Windows::Foundation::EventRegistrationToken {};
+    try { if (token.Value) player->VideoFrameAvailable -= token; } catch (...) { }
     // Tell WebCore the element paused, rather than letting it stall silently waiting for frames that
     // will never arrive. State 4 = Paused (see onFrameServerStateChanged).
     try { if (!h->closing && h->playerCtx) WebCoreMsePlayerStateChanged(h->playerCtx, 4); } catch (...) { }
@@ -619,17 +709,19 @@ static void startFrameServerPlayer(MseSource* h)
         // be a single atomic step or concurrent starts all lose the race together (see s_tier0SlotLock).
         // The eviction itself happens OUTSIDE the lock: it dispatches WinRT teardown to a threadpool
         // thread and must not run with a lock held.
-        bool tier0 = (WebCoreMemBudgetTier() == 0);
-        MseSource* toEvict = nullptr;
-        if (tier0) {
+        // Claim a decode slot (all tiers) and evict the LRU incumbent(s) if that puts us over the cap.
+        // Check-claim-decide is one atomic step under the lock (concurrent starts otherwise all lose the
+        // race together); the eviction runs OUTSIDE the lock (it dispatches WinRT teardown to a threadpool
+        // thread and must not hold a lock). Evictees are strong refs so a concurrent teardown can't free
+        // one between the claim and the evict (item-3 UAF fix).
+        std::vector<MseSourceRef> evictees;
+        {
             std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-            if (g_tier0ActivePlayer && g_tier0ActivePlayer != h)
-                toEvict = g_tier0ActivePlayer;
-            g_tier0ActivePlayer = h; // claim immediately so a racing start sees us as the incumbent
+            evictees = claimDecodeSlot_locked(h); // claims immediately so a racing start sees us active
         }
-        if (toEvict) {
-            PortImgLog("mse: tier-0 single-decode -> evicting incumbent to free the slot");
-            evictFrameServerPlayer(toEvict);
+        for (auto& e : evictees) {
+            PortImgLog("mse: decode cap -> evicting LRU incumbent to free a slot");
+            evictFrameServerPlayer(e);
         }
         h->player = ref new MediaPlayer();
         h->player->IsVideoFrameServerEnabled = true;
@@ -682,12 +774,11 @@ void PortMsePlayerStart(void* srcH, void* playerCtx)
         startFrameServerPlayer(h);
     } catch (Platform::Exception^ ex) {
         char b[128]; snprintf(b, sizeof b, "mse: MediaPlayer start FAILED hr=0x%08lx", (unsigned long)ex->HResult); PortImgLog(b);
-        // Release the slot we claimed above -- otherwise it stays owned by a handle with no player and
-        // permanently blocks every other video on the page.
+        // Release the slot we claimed above -- otherwise a handle with no player keeps counting against
+        // the cap and needlessly evicts a working video.
         {
             std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-            if (g_tier0ActivePlayer == h)
-                g_tier0ActivePlayer = nullptr;
+            releaseDecodeSlot_locked(h);
         }
         WebCoreMsePlayerError(playerCtx, ex->HResult);
     }
@@ -1103,9 +1194,9 @@ void PortProgressivePlayerDestroy(void* srcH)
 void PortMsePlayerStop(void* srcH)
 {
     auto h = static_cast<MseSource*>(srcH);
-    { // free the tier-0 decode slot (locked: teardown can run on a worker thread)
+    { // drop this handle from the active-decoder set (locked: teardown can run on a worker thread)
         std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-        if (g_tier0ActivePlayer == h) g_tier0ActivePlayer = nullptr;
+        releaseDecodeSlot_locked(h);
     }
     { // Under the slot lock so an in-flight onVideoFrame cannot snapshot playerCtx across this point.
         std::lock_guard<std::mutex> lock(s_tier0SlotLock);
@@ -1161,33 +1252,27 @@ void PortMsePlayerPlay(void* srcH)
     // it here. Unlike the old I-16 deferred-build this path is genuinely reachable: eviction reports
     // Paused to WebCore and the element keeps a readyState from its previous life, and elements that
     // were never evicted always got a pipeline at load, so play() is reached normally.
-    // Same locked check-and-claim as startFrameServerPlayer: this runs on the main thread but the slot
-    // is written from curl/threadpool workers too, so an unlocked read can miss or duplicate an evict.
-    if (WebCoreMemBudgetTier() == 0) {
-        MseSource* toEvict = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-            if (g_tier0ActivePlayer && g_tier0ActivePlayer != h) {
-                toEvict = g_tier0ActivePlayer;
-                g_tier0ActivePlayer = nullptr;
-            }
-        }
-        if (toEvict) {
-            evictFrameServerPlayer(toEvict); // outside the lock: dispatches WinRT teardown
-            PortImgLog("mse: tier-0 single-decode -> evicted previous active video (new play takes over)");
-        }
-    }
+    // Rebuild the pipeline first if this element was evicted earlier (handle still valid, player gone);
+    // startFrameServerPlayer claims a decode slot itself (LRU-evicting if that puts us over the cap).
     if (!h->player && h->mediaSource) {
         PortImgLog("mse: rebuilding pipeline for played video (was evicted)");
-        startFrameServerPlayer(h); // claims the slot itself on success
+        startFrameServerPlayer(h); // claims a slot itself on success
     }
     if (!h->player) { PortImgLog("mse: Play() SKIPPED - no player"); return; }
-    // Claim the slot only AFTER we know a pipeline exists (a failed build must not leave the slot owned
-    // by a handle with no player -- that would permanently block every other video on the page), and
-    // take the lock: this global is written from curl/threadpool workers as well as the main thread.
-    if (WebCoreMemBudgetTier() == 0) {
-        std::lock_guard<std::mutex> lock(s_tier0SlotLock);
-        g_tier0ActivePlayer = h;
+    // Mark this the most-recently-used decoder and evict the LRU incumbent(s) if we are now over the cap.
+    // Only meaningful when the pipeline already existed (the rebuild path above already claimed); claim is
+    // idempotent (move-to-back). Locked check-and-claim, evict outside the lock, strong-ref'd evictees
+    // (item-3 UAF fix) -- the slot set is written from curl/threadpool workers as well as the main thread.
+    {
+        std::vector<MseSourceRef> evictees;
+        {
+            std::lock_guard<std::mutex> lock(s_tier0SlotLock);
+            evictees = claimDecodeSlot_locked(h);
+        }
+        for (auto& e : evictees) {
+            evictFrameServerPlayer(e); // outside the lock: dispatches WinRT teardown
+            PortImgLog("mse: decode cap -> evicted LRU video (new play takes over)");
+        }
     }
     try {
         int before = (int)h->player->PlaybackSession->PlaybackState;

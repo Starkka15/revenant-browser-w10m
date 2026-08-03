@@ -36,6 +36,7 @@
 #include "TextureMapper.h"
 #include "TextureMapperGL.h"
 #include "TextureMapperLayer.h"
+#include "BitmapTextureGL.h"
 #include "DocumentLoader.h"
 #include "DocumentWriter.h"
 #include "EmptyClients.h"          // pageConfigurationWithEmptyClients
@@ -221,7 +222,17 @@ void portLog(const char* msg)
             "GLERR", "TEXALLOC", "TEXFBO", "TEXDEL", "SHADER", "GLCAP", "mem:", "mse:", "mf:", "hls:", "prog:", "media:",
             "fullscreen:", "identity:", "browser:", "gate:", "SLOWFRAME", "jitcfg", "watchdog",
             "app:", "mempool:", "tmtile:", "compositing:", "cmplayer:", "CRAWL", "  prof", "  st rva",
-            "  dstk", "bcache:", "  athr" };
+            "  dstk", "bcache:", "  athr",
+            // Revenant: force-flush JS console lines so a hard crash mid-FPDIAG (rule34 vore+video search
+            // fast-fails with no FAULT logged) truncates AT the exact last operation instead of losing the
+            // buffered tail -> the next crash log names precisely which probe/line dies. Diagnostic; drop later.
+            "js: ",
+            // Revenant crash/loop diagnostics (drop later): "rf " = per-render-sub-step trace (trc on) so a
+            // render-thread fast-fail truncates at the exact stage; "pmsg:" = cross-origin postMessage source
+            // trace (Turnstile "unexpected source" loop); "crumb:" = loader/frame-lifecycle breadcrumbs.
+            "rf ", "pmsg:", "crumb:",
+            // "tlsverify:" = per-chain-cert verify result (all HTTPS failing code=60 on the 950). Drop later.
+            "tlsverify:", "curlfail:" };
         for (const char* p : kCritical) {
             if (!std::strncmp(line, p, std::strlen(p)))
                 return true;
@@ -245,6 +256,11 @@ extern "C" void WebCoreBrowserLog(const char* msg) { if (msg) portLog(msg); }
 // Defined in GraphicsLayerTextureMapper.cpp: feeds the compositor the visible content band so it can
 // clip full-page repaints of the huge CSS-px content layer to what's on screen (perf).
 namespace WebCore { void setTexmapVisibleRect(int x, int y, int w, int h); }
+// Defined in PortCacheStorage.cpp: live window.caches totals for the gate diagnostic.
+// (File scope -- an extern "C" declaration inside a function body is C2598.)
+extern "C" void PortCacheStorageTotals(unsigned*, unsigned*, unsigned long long*);
+// Defined in WTF/FastMalloc.cpp: live CRT-heap bytes/count by object size class (diagnostic).
+extern "C" void WTFRevMallocBuckets(long long* bytes, long* count, long* alignedLive);
 // The real viewport, for tile-scheduler raster priority (see TextureMapperTiledBackingStore).
 namespace WebCore { void setTexmapFocusRect(int x, int y, int w, int h); }
 
@@ -1610,6 +1626,81 @@ static void* ntdllBaseViaPeb()
     return nullptr;
 }
 
+// Resolve a module load base to its file name via the PEB loader list. GetModuleFileNameW /
+// GetModuleHandle* are guarded into WINAPI_PARTITION_DESKTOP in this SDK and do not compile for UWP
+// (see ntdllBaseViaPeb above), so reuse the same documented PEB walk: each LDR entry carries both
+// DllBase and BaseDllName. Returns false when the base is not a loaded module (e.g. JIT private pages).
+// Find a loaded module's base by (lowercased) leaf name via the PEB loader list. GetModuleHandle* is
+// partition-guarded for UWP (see ntdllBaseViaPeb), so this is how we locate e.g. kernelbase.dll to
+// GetProcAddress a soft-linked export. wantLower must be lowercase; matching is case-insensitive.
+static void* moduleBaseByName(const wchar_t* wantLower)
+{
+    struct MY_USTR3 { USHORT Length; USHORT MaximumLength; wchar_t* Buffer; };
+    struct MY_LDR_ENTRY3 {
+        LIST_ENTRY InLoadOrderLinks; LIST_ENTRY InMemoryOrderLinks; LIST_ENTRY InInitializationOrderLinks;
+        void* DllBase; void* EntryPoint; ULONG SizeOfImage; MY_USTR3 FullDllName; MY_USTR3 BaseDllName;
+    };
+    unsigned char* teb = reinterpret_cast<unsigned char*>(NtCurrentTeb());
+    if (!teb) return nullptr;
+    void* peb = *reinterpret_cast<void**>(teb + 0x30);
+    if (!peb) return nullptr;
+    void* ldr = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(peb) + 0x0C);
+    if (!ldr) return nullptr;
+    unsigned want = 0; while (wantLower[want]) ++want;
+    LIST_ENTRY* head = reinterpret_cast<LIST_ENTRY*>(reinterpret_cast<unsigned char*>(ldr) + 0x14);
+    for (LIST_ENTRY* node = head->Flink; node && node != head; node = node->Flink) {
+        MY_LDR_ENTRY3* e = reinterpret_cast<MY_LDR_ENTRY3*>(reinterpret_cast<unsigned char*>(node) - 0x08);
+        const wchar_t* nm = e->BaseDllName.Buffer;
+        unsigned len = e->BaseDllName.Length / 2;
+        if (!nm || len != want) continue;
+        bool eq = true;
+        for (unsigned i = 0; i < len; ++i) {
+            wchar_t a = nm[i]; if (a >= L'A' && a <= L'Z') a = wchar_t(a - L'A' + L'a');
+            if (a != wantLower[i]) { eq = false; break; }
+        }
+        if (eq) return e->DllBase;
+    }
+    return nullptr;
+}
+
+static bool moduleNameForBase(unsigned long base, char* out, size_t outSize)
+{
+    if (!out || !outSize) return false;
+    out[0] = 0;
+    if (!base) return false;
+    struct MY_USTR2 { USHORT Length; USHORT MaximumLength; wchar_t* Buffer; };
+    struct MY_LDR_ENTRY2 {
+        LIST_ENTRY InLoadOrderLinks;
+        LIST_ENTRY InMemoryOrderLinks;
+        LIST_ENTRY InInitializationOrderLinks;
+        void* DllBase;
+        void* EntryPoint;
+        ULONG SizeOfImage;
+        MY_USTR2 FullDllName;
+        MY_USTR2 BaseDllName;
+    };
+    unsigned char* teb = reinterpret_cast<unsigned char*>(NtCurrentTeb());
+    if (!teb) return false;
+    void* peb = *reinterpret_cast<void**>(teb + 0x30);
+    if (!peb) return false;
+    void* ldr = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(peb) + 0x0C);
+    if (!ldr) return false;
+    LIST_ENTRY* head = reinterpret_cast<LIST_ENTRY*>(reinterpret_cast<unsigned char*>(ldr) + 0x14);
+    for (LIST_ENTRY* node = head->Flink; node && node != head; node = node->Flink) {
+        MY_LDR_ENTRY2* e = reinterpret_cast<MY_LDR_ENTRY2*>(reinterpret_cast<unsigned char*>(node) - 0x08);
+        if (reinterpret_cast<unsigned long>(e->DllBase) != base)
+            continue;
+        const wchar_t* nm = e->BaseDllName.Buffer;
+        unsigned len = e->BaseDllName.Length / 2;
+        if (!nm) return false;
+        size_t k = 0;
+        while (k < len && k + 1 < outSize) { out[k] = static_cast<char>(nm[k] & 0x7F); ++k; }
+        out[k] = 0;
+        return k > 0;
+    }
+    return false;
+}
+
 static void dumpAllThreadsAtStall()
 {
     void* nt = ntdllBaseViaPeb();
@@ -1800,6 +1891,32 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
     // Dump EVERY out-of-module sample (kind I=DLL image, J=JIT private-exec, o=other), with caller LR
     // and allocBase, so offline resolution against the PDB gets the full ~60-sample/burst distribution
     // instead of a deduped top-6. kind+base disambiguate JSC.dll (base 0x54970000) from ANGLE/ntdll/etc.
+    // MODULE MAP. The base alone is not identifiable: a device stall was profiled at 60/60 samples in
+    // base=0x77260000 with inModule(C++/LLInt)=0 and JITcode=0 -- proving the runaway code was in a DLL
+    // and NOT ours -- and there the trail ended, because nothing resolved the base to a name. Print the
+    // distinct bases seen in this burst with their module file names, once per burst. GetModuleFileNameW
+    // takes an HMODULE, and on Windows a module's HMODULE *is* its load base, so AllocationBase can be
+    // passed directly. Failure is logged rather than skipped: "no name" for a MEM_IMAGE base is itself
+    // information (it would mean the region is mapped but not a loaded module).
+    {
+        unsigned long seen[16]; int nseen = 0;
+        for (int i = 0; i < nOut && nseen < 16; ++i) {
+            if (!allOutBase[i])
+                continue;
+            bool dup = false;
+            for (int j = 0; j < nseen; ++j)
+                if (seen[j] == allOutBase[i]) { dup = true; break; }
+            if (dup)
+                continue;
+            seen[nseen++] = allOutBase[i];
+            char name[128];
+            if (!moduleNameForBase(allOutBase[i], name, sizeof name))
+                snprintf(name, sizeof name, "<not a loaded module>");
+            char ml[192];
+            snprintf(ml, sizeof ml, "  profmod base=0x%08lx kind=%c -> %s", allOutBase[i], allOutKind[i], name);
+            portLog(ml);
+        }
+    }
     for (int i = 0; i < nOut; ++i) {
         char sp2[128]; snprintf(sp2, sizeof sp2, "  profs k=%c pc=0x%08lx lr=0x%08lx base=0x%08lx",
             allOutKind[i], allOutPc[i], allOutLr[i], allOutBase[i]); portLog(sp2);
@@ -1813,6 +1930,31 @@ static void profileBurstMainThread(unsigned long long hb, unsigned long long cpu
         for (int f = 0; f < stkN[s2] && off < static_cast<int>(sizeof db) - 20; ++f)
             off += snprintf(db + off, sizeof db - off, " %08lx:%08lx", stkPc[s2][f], stkBase[s2][f]);
         portLog(db);
+    }
+    // Name the module bases that appear in the STACK frames too -- these are the recursion chain, and on
+    // the device stall the identical frame list repeating across samples was the only evidence of the
+    // loop. Without names the chain is unreadable. Same dedup + HMODULE-is-base trick as above.
+    {
+        unsigned long seenS[16]; int nseenS = 0;
+        for (int s2 = 0; s2 < 60 && nseenS < 16; ++s2) {
+            for (int f = 0; f < stkN[s2] && nseenS < 16; ++f) {
+                unsigned long b = stkBase[s2][f];
+                if (!b)
+                    continue;
+                bool dup = false;
+                for (int j = 0; j < nseenS; ++j)
+                    if (seenS[j] == b) { dup = true; break; }
+                if (dup)
+                    continue;
+                seenS[nseenS++] = b;
+                char name[128];
+                if (!moduleNameForBase(b, name, sizeof name))
+                    snprintf(name, sizeof name, "<not a loaded module>");
+                char ml[192];
+                snprintf(ml, sizeof ml, "  stkmod base=0x%08lx -> %s", b, name);
+                portLog(ml);
+            }
+        }
     }
     for (int k = 0; k < 8; ++k) { int bi=-1,bc=0; for(int i=0;i<nb;++i) if(hist[i].count>bc){bc=hist[i].count;bi=i;} if(bi<0||bc==0)break; char pl[96]; snprintf(pl,sizeof pl,"  prof pcRva=0x%08lx hits=%d",hist[bi].rva,bc); portLog(pl); hist[bi].count=0; }
     for (int k = 0; k < 10; ++k) { int bi=-1,bc=0; for(int i=0;i<ncall;++i) if(callerHist[i].count>bc){bc=callerHist[i].count;bi=i;} if(bi<0||bc==0)break; char pl[96]; snprintf(pl,sizeof pl,"  prof callerRva=0x%08lx hits=%d",callerHist[bi].rva,bc); portLog(pl); callerHist[bi].count=0; }
@@ -2379,17 +2521,219 @@ extern "C" void WebCoreBrowserRenderFrame()
         portLog(b);
 
         // WHAT is growing. appUsage alone can't be acted on; these are the three pools we control.
+        // CacheStorage (window.caches) live totals -- unbounded, never evicted, invisible to
+        // releaseMemory, so a prime suspect for the unattributed memory. See PortCacheStorage.cpp.
+        {
+            unsigned nCaches = 0, nRecords = 0; unsigned long long bodyBytes = 0;
+            PortCacheStorageTotals(&nCaches, &nRecords, &bodyBytes);
+            if (nCaches || nRecords) {
+                char cs[160];
+                snprintf(cs, sizeof cs, "cachestorage: caches=%u records=%u bodies=%lluKB",
+                    nCaches, nRecords, bodyBytes / 1024);
+                portLog(cs);
+            }
+        }
+
+        // ADDRESS-SPACE CENSUS. mempool's other= is a subtraction, so it lumps together everything we do
+        // not track -- and under USE_SYSTEM_MALLOC the whole CRT heap lands there invisibly (see the
+        // malloc= note below). A device OOM showed ~250MB in other= that no cache release could touch,
+        // with no way to tell whether it was OUR private commit or file-backed image/mapped pages.
+        // VirtualQuery answers that directly and IS permitted under AppContainer (already used by
+        // ExecutableAllocator's jitdiag walk; PSAPI is the blocked one, which is why
+        // MemoryFootprintGeneric.cpp is compiled instead of the Win version).
+        // Cost is a few ms for a few thousand regions, so it runs at the gate cadence, never per frame.
+        {
+            unsigned long long imgC = 0, mapC = 0, privC = 0, execC = 0, freeB = 0, largestFree = 0;
+            unsigned long long bucket[6] = { 0, 0, 0, 0, 0, 0 }; // <64K <256K <1M <4M <16M >=16M
+            unsigned regions = 0, privRegions = 0;
+            MEMORY_BASIC_INFORMATION mbi;
+            unsigned char* addr = nullptr;
+            void* curBase = nullptr; unsigned long long curSpan = 0;
+            auto flushSpan = [&]() {
+                if (!curSpan) return;
+                unsigned i = curSpan < 64ULL*1024 ? 0 : curSpan < 256ULL*1024 ? 1 : curSpan < 1024ULL*1024 ? 2
+                           : curSpan < 4ULL*1024*1024 ? 3 : curSpan < 16ULL*1024*1024 ? 4 : 5;
+                bucket[i] += curSpan; curSpan = 0;
+            };
+            while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+                ++regions;
+                if (mbi.State == MEM_COMMIT) {
+                    if (mbi.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))
+                        execC += mbi.RegionSize;
+                    if (mbi.Type == MEM_IMAGE) imgC += mbi.RegionSize;
+                    else if (mbi.Type == MEM_MAPPED) mapC += mbi.RegionSize;
+                    else {
+                        privC += mbi.RegionSize; ++privRegions;
+                        if (mbi.AllocationBase != curBase) { flushSpan(); curBase = mbi.AllocationBase; }
+                        curSpan += mbi.RegionSize;
+                    }
+                } else if (mbi.State == MEM_FREE) {
+                    freeB += mbi.RegionSize;
+                    if (mbi.RegionSize > largestFree) largestFree = mbi.RegionSize;
+                }
+                unsigned char* next = static_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
+                if (next <= addr) break; // no-progress guard (same shape as the jitdiag walk)
+                addr = next;
+            }
+            flushSpan();
+            const unsigned long long MB = 1024ULL * 1024;
+            char vb[320];
+            snprintf(vb, sizeof vb,
+                "vmwalk: priv=%lluMB img=%lluMB mapped=%lluMB exec=%lluMB | privBuckets(64K/256K/1M/4M/16M/big)=%llu/%llu/%llu/%llu/%llu/%lluMB | regions=%u priv=%u largestFree=%lluMB",
+                privC/MB, imgC/MB, mapC/MB, execC/MB,
+                bucket[0]/MB, bucket[1]/MB, bucket[2]/MB, bucket[3]/MB, bucket[4]/MB, bucket[5]/MB,
+                regions, privRegions, largestFree/MB);
+            portLog(vb);
+            // NOTE: exec= counts ALL committed executable pages -- every DLL's .text plus the JIT
+            // reservation -- so it reads ~100MB, NOT ~16MB. (An earlier comment here wrongly expected
+            // ~16MB; that was the JIT pool alone.) The trustworthy cross-check is priv+img+mapped
+            // roughly tracking appUsage.
+        }
+
+        // CRT-HEAP ALLOCATION HISTOGRAM. vmwalk proved the unattributed memory is private commit (our
+        // CRT heap, since USE_SYSTEM_MALLOC); this says WHAT is in it, by object size class -- live
+        // bytes and object count per bucket. Fed from the fastMalloc funnel (WTF/FastMalloc.cpp),
+        // which sees every WebCore/JSC/WTF allocation. Third-party libs (cairo/curl/ICU/ANGLE) and the
+        // /ZW shell call the CRT directly and are NOT counted, so bucket-sum is a LOWER BOUND on the
+        // heap; (HeapSummary allocated) - (bucket-sum) is roughly "third-party + shell heap".
+        {
+            long long bbytes[8]; long bcount[8]; long aligned = 0;
+            WTFRevMallocBuckets(bbytes, bcount, &aligned);
+            long long total = 0; for (int i = 0; i < 8; ++i) total += bbytes[i];
+            char mbk[320];
+            snprintf(mbk, sizeof mbk,
+                "mallocbuckets: liveKB(32/128/512/2K/8K/64K/1M/big)=%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld | count=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld | totalKB=%lld alignedLive=%ld",
+                bbytes[0]/1024, bbytes[1]/1024, bbytes[2]/1024, bbytes[3]/1024,
+                bbytes[4]/1024, bbytes[5]/1024, bbytes[6]/1024, bbytes[7]/1024,
+                bcount[0], bcount[1], bcount[2], bcount[3], bcount[4], bcount[5], bcount[6], bcount[7],
+                total/1024, aligned);
+            portLog(mbk);
+        }
+
+        // CRT HEAP SUMMARY. cbCommitted - cbAllocated is the process-heap fragmentation / free-list
+        // slack number directly -- the thing _heapmin can and cannot return. Soft-linked because
+        // HeapSummary's header is behind WINAPI_PARTITION_DESKTOP (same guard as GetModuleHandle*, so
+        // it will not compile referenced directly); resolve it from kernelbase via the PEB walk. Logs
+        // whether it resolved -- "not available" is itself a result.
+        {
+            typedef struct { DWORD cb; SIZE_T cbAllocated, cbCommitted, cbReserved, cbMaxReserve; } REV_HEAP_SUMMARY;
+            typedef BOOL (WINAPI *PFN_HeapSummary)(HANDLE, DWORD, REV_HEAP_SUMMARY*);
+            static int s_hsState = 0; // 0=unresolved 1=ok 2=missing
+            static PFN_HeapSummary s_hs = nullptr;
+            if (!s_hsState) {
+                void* kb = moduleBaseByName(L"kernelbase.dll");
+                if (kb)
+                    s_hs = reinterpret_cast<PFN_HeapSummary>(GetProcAddress(reinterpret_cast<HMODULE>(kb), "HeapSummary"));
+                s_hsState = s_hs ? 1 : 2;
+                if (s_hsState == 2)
+                    portLog("crtheap: HeapSummary not available (kernelbase resolve failed) -- using mallocbuckets total instead");
+            }
+            if (s_hs) {
+                REV_HEAP_SUMMARY hs; hs.cb = sizeof hs;
+                if (s_hs(GetProcessHeap(), 0, &hs)) {
+                    const unsigned long long KB = 1024;
+                    char ch[200];
+                    snprintf(ch, sizeof ch, "crtheap: allocated=%lluKB committed=%lluKB reserved=%lluKB frag=%lluKB",
+                        (unsigned long long)hs.cbAllocated/KB, (unsigned long long)hs.cbCommitted/KB,
+                        (unsigned long long)hs.cbReserved/KB,
+                        (unsigned long long)(hs.cbCommitted - hs.cbAllocated)/KB);
+                    portLog(ch);
+                }
+            }
+        }
+
+        // FULL HEAP BLOCK CENSUS (HeapWalk). crtheap says 241MB is live-allocated but mallocbuckets sees
+        // only ~75MB of it -- the other ~166MB is allocated OUTSIDE WTF::fastMalloc (plain operator new,
+        // std:: containers, and third-party libs: cairo/ICU/curl/ANGLE/libwebrtc), none of which the
+        // funnel can instrument. HeapWalk enumerates EVERY live block in the process heap regardless of
+        // allocator, so its size distribution minus mallocbuckets' distribution isolates the
+        // non-fastMalloc blocks, and the large-bucket totals point at whatever the 166MB actually is.
+        //
+        // HeapWalk is O(live blocks) -- hundreds of thousands of them, i.e. 100ms-1s -- and takes
+        // HeapLock, so it is NOT periodic-safe. Run it ONCE per session, the first gate window after
+        // appUsage crosses a high-water mark (where the hog is present), then never again. Soft-linked
+        // like HeapSummary (HeapWalk's header is behind the same desktop partition guard).
+        {
+            typedef struct { PVOID lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex, wFlags;
+                union { struct { HANDLE hMem; DWORD dwReserved[3]; } Block;
+                        struct { DWORD dwCommittedSize, dwUnCommittedSize; LPVOID lpFirstBlock, lpLastBlock; } Region; }; } REV_HEAPENTRY;
+            typedef BOOL (WINAPI *PFN_HeapWalk)(HANDLE, REV_HEAPENTRY*);
+            typedef BOOL (WINAPI *PFN_HeapLock)(HANDLE);
+            static bool s_walked = false;
+            static PFN_HeapWalk s_hw = nullptr;
+            static PFN_HeapLock s_hlock = nullptr, s_hunlock = nullptr;
+            static int s_hwState = 0;
+            // Only once, and only when we are genuinely large (>=300MB) so the hog is captured.
+            if (!s_walked && g_memUsedMB >= 300) {
+                if (!s_hwState) {
+                    void* kb = moduleBaseByName(L"kernelbase.dll");
+                    if (kb) {
+                        HMODULE km = reinterpret_cast<HMODULE>(kb);
+                        s_hw = reinterpret_cast<PFN_HeapWalk>(GetProcAddress(km, "HeapWalk"));
+                        // HeapLock/HeapUnlock are partition-guarded too; soft-link them so the walk is
+                        // safe against concurrent allocation from the curl worker / GC marker threads.
+                        s_hlock = reinterpret_cast<PFN_HeapLock>(GetProcAddress(km, "HeapLock"));
+                        s_hunlock = reinterpret_cast<PFN_HeapLock>(GetProcAddress(km, "HeapUnlock"));
+                    }
+                    s_hwState = s_hw ? 1 : 2;
+                }
+                if (s_hw) {
+                    s_walked = true;
+                    portLog("heapwalk: starting one-shot full census (this pauses briefly) ...");
+                    unsigned long long wbytes[8] = { 0 }; unsigned long wcount[8] = { 0 };
+                    unsigned long long usedTotal = 0, freeTotal = 0; unsigned long blocks = 0;
+                    HANDLE h = GetProcessHeap();
+                    if (s_hlock) s_hlock(h);
+                    REV_HEAPENTRY e; memset(&e, 0, sizeof e);
+                    MonotonicTime t0 = MonotonicTime::now();
+                    while (s_hw(h, &e)) {
+                        if (e.wFlags & 0x0004 /*PROCESS_HEAP_ENTRY_BUSY*/) {
+                            size_t n = e.cbData;
+                            unsigned b = n <= 32 ? 0 : n <= 128 ? 1 : n <= 512 ? 2 : n <= 2048 ? 3
+                                       : n <= 8192 ? 4 : n <= 65536 ? 5 : n <= 1048576 ? 6 : 7;
+                            wbytes[b] += n; wcount[b]++; usedTotal += n; ++blocks;
+                        } else if (e.wFlags & 0x0001 /*PROCESS_HEAP_REGION*/) {
+                            // region header, skip
+                        } else
+                            freeTotal += e.cbData;
+                    }
+                    double ms = (MonotonicTime::now() - t0).milliseconds();
+                    if (s_hunlock) s_hunlock(h);
+                    char hw[360];
+                    snprintf(hw, sizeof hw,
+                        "heapwalk: usedKB=%llu freeKB=%llu blocks=%lu took=%.0fms | busyKB(32/128/512/2K/8K/64K/1M/big)=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | count=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
+                        usedTotal/1024, freeTotal/1024, blocks, ms,
+                        wbytes[0]/1024, wbytes[1]/1024, wbytes[2]/1024, wbytes[3]/1024,
+                        wbytes[4]/1024, wbytes[5]/1024, wbytes[6]/1024, wbytes[7]/1024,
+                        wcount[0], wcount[1], wcount[2], wcount[3], wcount[4], wcount[5], wcount[6], wcount[7]);
+                    portLog(hw);
+                } else if (s_hwState == 2 && !s_walked) {
+                    s_walked = true; // don't retry every frame
+                    portLog("heapwalk: HeapWalk not available (kernelbase resolve failed)");
+                }
+            }
+        }
+
         // jsHeap = JSC's GC heap. resCache = WebCore MemoryCache (live+dead resource bytes, i.e.
         // decoded images/CSS/JS we are holding). gpuTiles = compositor textures.
         {
+            // capacity(), not size(). Heap::size() is objectSpace.size() + extraMemorySize(); the
+            // COMMITTED figure is Heap::capacity() (= MarkedSpace::capacity()). MarkedSpace capacity does
+            // not shrink back after a transient spike, so the difference is real committed memory that
+            // was being mis-attributed into other= and inflating the unaccounted number.
             unsigned long long jsHeapKB = 0;
             if (JSC::VM* vm = commonVMOrNull())
-                jsHeapKB = static_cast<unsigned long long>(vm->heap.size()) / 1024;
+                jsHeapKB = static_cast<unsigned long long>(vm->heap.capacity()) / 1024;
             unsigned long long resCacheKB = MemoryCache::singleton().size() / 1024;
             // Killing the filter-triggered layer explosion dropped live tiles from 248MB to 18MB --
             // and the process still climbed to 259MB with only 30MB of it accounted for. So account
             // for the rest: the texture POOL (released textures WebKit retains for reuse) and the
             // fastMalloc heap (cairo surfaces, decoded image buffers, DOM, everything else).
+            // NOTE: fastMallocStatistics() returns a hardcoded {0,0,0} under USE_SYSTEM_MALLOC, which this
+            // port defines (PlatformUse.h: OS(WINDOWS) -> USE_SYSTEM_MALLOC). So malloc= has always read 0
+            // and the ENTIRE CRT heap is folded into other=. It is kept only so the label stays stable
+            // across historical logs; treat it as "not measured", never as "zero". The real CRT number
+            // comes from crtheap:/vmwalk: below.
             auto mallocStats = WTF::fastMallocStatistics();
             unsigned long long mallocKB = static_cast<unsigned long long>(mallocStats.committedVMBytes) / 1024;
             // I-11: cairo image-surface bytes (layer backing stores + ImageBuffers — the software-raster
@@ -2397,6 +2741,10 @@ extern "C" void WebCoreBrowserRenderFrame()
             // explicit UNACCOUNTED remainder so the native-heap hog is finally visible instead of inferred.
             unsigned long long tilesKB = WebCore::g_texmapTileBytes / 1024;
             unsigned long long poolKB  = WebCore::g_texmapPoolBytes / 1024;
+            // cairoSurf tracks ONLY ImageBuffers (trackCairoImageSurface's other call site,
+            // BackingStoreBackendCairoImpl, is not compiled in this single-process build), and those are
+            // transient inside BitmapTexture::updateContents -- so sampling here legitimately reads ~0.
+            // Decoded images and canvas backing are NOT covered. Not evidence of absence.
             unsigned long long cairoKB = WebCore::g_cairoSurfaceBytes.load(std::memory_order_relaxed) / 1024;
             long long otherKB = (long long)g_memUsedMB * 1024
                 - (long long)(jsHeapKB + resCacheKB + tilesKB + poolKB + cairoKB + mallocKB);
@@ -2443,8 +2791,10 @@ extern "C" void WebCoreBrowserRenderFrame()
         g_msPaintBegin = 0; g_msPaintTree = 0; g_msPaintEnd = 0;
     }
     g_mainHeartbeat.fetch_add(1, std::memory_order_relaxed); // stall detector watches this
-    bool trc = false; // per-frame stage trace DISABLED for perf; g_renderStage is still set (cheap)
-                      // so the SEH crash handler can still report the faulting sub-step.
+    bool trc = true;  // DIAGNOSTIC (rule34 vore+video hard crash: no FAULT flushed = fast-fail bypassing
+                      // the SEH/VEH handlers). Per-frame stage trace ON + "rf " force-flushed, so if the
+                      // fast-fail is inside the render frame the log truncates at the exact sub-step.
+                      // Revert to false once the crash is located.
     // Always record the current sub-step (cheap) so the SEH crash wrapper can report where an
     // access violation happened; additionally log it during the diagnostic window.
     auto stage = [&](const char* s){ g_renderStage = s; if (trc) { char b[64]; snprintf(b, sizeof b, "rf %u %s", g_rfFrame, s); WebCorePort::portLog(b); } };
@@ -2735,11 +3085,49 @@ extern "C" void WebCoreBrowserRenderFrame()
                 int keepH = bytesPerCssRow > 0 ? static_cast<int>(budgetBytes / bytesPerCssRow) : g_cssH * 3;
                 if (keepH < g_cssH * 2)
                     keepH = g_cssH * 2; // always keep at least a screen either side
+                // STABILITY CAP (rule34 search "closes on search" -> W10M watchdog kill). The band above
+                // doubles as the compositor's raster-CLIP and tile-GATE band (setTexmapVisibleRect ->
+                // GraphicsLayerTextureMapper + TextureMapperTiledBackingStore). On a memory-rich tier the
+                // budget makes keepH ~= a WHOLE tall page (a rule34 results page is ~44700 CSS px -> keepH
+                // ~44739 at the 256MB tier), so BOTH the clip and the gate become no-ops and every layer
+                // rasters/tiles full-page. That is survivable while static, but rule34's page reflows its
+                // content width (~375<->~750 px as thumbnails/ads load), so WebKit's fit-to-width flips
+                // pageScaleFactor 0.5<->1.0 every few frames; each flip NUKES the whole retained tile grid
+                // (bstatw scaleNuke=10[1..2]) and re-rasters it SYNCHRONOUSLY in updateRendering -> measured
+                // MAIN-STALL ~3-4s -> the OS watchdog terminates the app. Bounding the band to a few
+                // viewports makes a scale-nuke re-raster only that band (~150ms), not the whole page. The
+                // tile scheduler re-creates newly-exposed bands on scroll, so the only cost is that a far
+                // jump-scroll can land on not-yet-rastered tiles instead of pre-rastered ones.
+                // Tier-aware ceiling (the flat g_cssH*7 let the 256MB tier retain ~a whole tall page,
+                // which defeats the clip+gate as the comment above describes), THEN shrink under live
+                // memory pressure using the SAME thresholds the MemoryPressureHandler uses (g_memLevel /
+                // g_memPct, published every frame). So the retained band collapses toward the viewport as
+                // the app approaches the OS cap, instead of staying pinned at a static per-tier size.
+                int maxScreens = (tier == 0) ? 4 : (tier == 1) ? 6 : 8;
+                int kMaxKeepH = g_cssH * maxScreens;
+                if (g_memLevel >= 1 || g_memPct >= 65) kMaxKeepH = g_cssH * 3;
+                if (g_memLevel >= 2 || g_memPct >= 75) kMaxKeepH = g_cssH * 2;
+                if (keepH > kMaxKeepH)
+                    keepH = kMaxKeepH;
+                if (keepH < g_cssH * 2)
+                    keepH = g_cssH * 2; // never drop below a screen either side (matches the floor above)
                 int margin = (keepH - g_cssH) / 2;
                 g_lastKeepH = keepH;
                 g_lastScrollY = vis.y();
                 int top = vis.y() - margin;
                 if (top < 0) top = 0;
+                // QUANTIZE the vertical band to a tile row (~256 CSS px = one 512 device-px tile at
+                // rasterScale 2). setTexmapVisibleRect feeds the tile gate's retile early-out, which
+                // re-tiles whenever the band moves at all -- so an un-quantized band forced a full
+                // tile-diff pass on EVERY scroll frame and every async-media layer-height bump. Snapping
+                // origin down and height up to a tile multiple means the gated band only changes when the
+                // viewport crosses a tile boundary, turning per-frame retiles into per-tile-row retiles.
+                // The raster PRIORITY (focus rect below) stays un-quantized so it still tracks the exact
+                // viewport.
+                const int kBandQuantum = 256;
+                int bandH = vis.height() + margin * 2;
+                top = (top / kBandQuantum) * kBandQuantum;
+                bandH = ((bandH + kBandQuantum - 1) / kBandQuantum) * kBandQuantum;
                 // Horizontal band too. This used to hand over x=0, width=g_cssW unconditionally, which
                 // was harmless while every page laid out at ~viewport width -- but a DESKTOP-width
                 // layout (pornhub's video page: a 1922 CSS px wide layer) then got clipped vertically
@@ -2748,7 +3136,7 @@ extern "C" void WebCoreBrowserRenderFrame()
                 int marginX = g_cssW / 4;
                 int left = vis.x() - marginX;
                 if (left < 0) left = 0;
-                WebCore::setTexmapVisibleRect(left, top, g_cssW + marginX * 2, vis.height() + margin * 2);
+                WebCore::setTexmapVisibleRect(left, top, g_cssW + marginX * 2, bandH);
                 // The REAL viewport, used only to order raster (nearest-first). Distinct from the
                 // keep-rect above: that says what we RETAIN, this says what to paint FIRST. Handing the
                 // scheduler the keep-rect instead put its focus mid-page and rastered bottom-before-top.
@@ -2796,7 +3184,12 @@ extern "C" void WebCoreBrowserRenderFrame()
         }
         WebCore::g_texmapPendingTiles = 0;
         WebCore::g_texmapTilesRasteredLastFrame = 0;
+        // Whole-frame raster deadline shared across every store (the tile scheduler measures the budget
+        // against this, not a per-store clock, so total raster this frame is bounded no matter how many
+        // stores the page has). g_texmapFrameProgress guarantees one tile of forward progress per frame.
         MonotonicTime tBacking0 = MonotonicTime::now();
+        WebCore::g_texmapFrameStart = tBacking0;
+        WebCore::g_texmapFrameProgress = false;
         tmRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);
         // Tiles still owing raster -> keep frames coming so the page converges to fully-painted while
         // idle. That convergence is what makes a later jump land on already-rastered content.
@@ -3099,7 +3492,13 @@ static void tapImpl(int x, int y)
     // fires elementDidFocus on a focus CHANGE, so re-tapping an already-focused field (e.g. after
     // the keyboard was dismissed on Enter/navigation) wouldn't bring the SIP back without this.
     // Tapping a non-editable spot hides it.
-    if (RefPtr doc = frame.document()) {
+    // NOTE: must read the focused element from the FOCUSED frame, not the main frame. Inputs inside a
+    // subframe (e.g. the reCAPTCHA audio-challenge text box, which lives in the cross-origin google.com
+    // bframe iframe) leave the MAIN document's focusedElement pointing at the <iframe> HOST element,
+    // which is not a text field -> this post-check would clobber the correct elementDidFocus(subframe
+    // input) notification and hide the keyboard. focusedOrMainFrame() descends into the focused subframe.
+    Frame& focusFrame = g_page->focusController().focusedOrMainFrame();
+    if (RefPtr doc = focusFrame.document()) {
         RefPtr fe = doc->focusedElement();
         bool editable = fe && (fe->isTextField() || fe->isContentEditable() || fe->hasEditableStyle());
         PortShowKeyboard(editable ? 1 : 0);
@@ -3156,6 +3555,14 @@ extern "C" void WebCoreBrowserTouch(int identifier, int phase, int x, int y)
     Frame& frame = g_page->mainFrame();
 
     static std::map<unsigned, std::pair<IntPoint, PlatformTouchPoint::State>> s_active;
+
+    // Convert panel DIPs -> CSS px. This was the ONE input entry point missing the conversion
+    // (WebCoreBrowserTap and WebCoreBrowserScrollBy both do it), so touch events reported coordinates
+    // ~9.7% too large on the 640 XL: a touch near the bottom of a 568-CSS-px-tall page reported y=623,
+    // and the SAME physical tap produced different coordinates via click vs touchstart. Breaks
+    // touch-driven hit-testing, canvas drawing coordinates and swipe-threshold maths.
+    x = dipToCss(x);
+    y = dipToCss(y);
 
     unsigned id = static_cast<unsigned>(identifier);
     IntPoint pos(x, y);
@@ -3377,6 +3784,13 @@ extern "C" void WebCoreBrowserResize(int pxW, int pxH, double deviceScale)
     g_forcedWinH = pxH;
     g_winW = pxW;
     g_winH = pxH;
+    // Track the panel's DIP scale on resize. This function accepted deviceScale and ignored it, while
+    // g_panelDipScale was written only at init -- so dipToCss (input coordinate conversion) kept using
+    // the startup value. Harmless under plain rotation, wrong the moment RawPixelsPerViewPixel actually
+    // changes (Continuum / external display / system text-scale change), where it shows up as taps
+    // landing progressively off-target.
+    if (deviceScale > 0)
+        g_panelDipScale = deviceScale;
     // I-15: keep the iPhone-SE mapping coherent across resize/rotation (375 CSS wide, geometry scale
     // fills the new surface, reported dpr stays 2). Matches the init derivation above.
     static const double kSeCssW = 375.0;
