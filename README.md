@@ -221,6 +221,32 @@ in [BUILD.md](BUILD.md), each under its own license. Our patches and new files f
 the file they modify (WebKit's BSD/LGPL) unless otherwise noted. This is an independent hobbyist port,
 not affiliated with Apple, the WebKit project, or Microsoft.
 
+### Forking & redistribution — please read
+
+Revenant links **copyleft** components, so **if you fork it, build your own version, and hand that
+build to anyone, you have to publish the corresponding source.** The copyleft pieces are:
+
+- **WebKit's WebCore, JavaScriptCore and WTF** — **LGPL-2.1**
+- **Cairo** (the 2D graphics library) — **LGPL-2.1 / MPL**
+
+Under the LGPL, the obligation triggers when you **distribute a binary** containing these: you must
+make the **complete corresponding source of those components — including your changes — available to
+whoever you gave the binary to**, under the LGPL (ship the source with the download, or include a
+written offer that points to it). Because Revenant **statically links** them, LGPL-2.1 §6 also
+requires you to provide enough for someone to **relink** a modified library — full source, or the
+object files. Publishing a recipe like this one (the WebKit/Cairo patches + build scripts) covers it.
+
+The other dependencies (curl, pixman, harfbuzz, zlib, BoringSSL, WAMR, nghttp2, libxml2, …) are
+**permissive** (MIT/BSD/Apache-style): keep their license/copyright notices, but you are **not**
+required to publish your changes to them.
+
+Either way, **keep the `LICENSE` file and the per-file copyright headers intact — do not strip them.**
+Private/experimental changes you never distribute carry no obligation; the moment you publish a build,
+the source-availability duty above applies.
+
+*(Plain-language summary of the obligations, not legal advice — read the LGPL-2.1 text in `LICENSE`,
+or ask a lawyer, if you're unsure.)*
+
 App icon by **thiagoaraujoxd** (created with Gemini). Thanks!
 
 ## AI Disclosure
