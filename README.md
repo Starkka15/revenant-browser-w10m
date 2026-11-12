@@ -1,3 +1,10 @@
+> ## 📦 This project is archived and no longer updated
+> For a modern browser on Windows 10 Mobile, use **[Gecko-w10m](https://github.com/Computershik73/gecko-w10m)**
+> (the Firefox engine for Windows 10 Mobile), which is actively developed:
+> [latest release](https://github.com/Computershik73/gecko-w10m/releases/latest).
+>
+> The Revenant code and releases stay here for reference.
+
 # Revenant — a modern WebKit browser engine for Windows 10 Mobile (ARM32 UWP)
 
 > ## ⚠️ VERY EARLY ALPHA
